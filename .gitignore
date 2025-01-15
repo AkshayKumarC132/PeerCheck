@@ -1,0 +1,65 @@
+# Byte-compiled files
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# Virtual environment
+venv/
+env/
+*.env
+
+# Distribution files
+build/
+dist/
+*.egg-info/
+
+# Logs and debug files
+*.log
+*.out
+*.err
+*.pid
+*.swp
+*.swo
+*.bak
+*.orig
+*.rej
+
+# System files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.vscode/
+.idea/
+*.iml
+
+# Configuration files
+*.sqlite3
+*.db
+*.cfg
+*.ini
+*.yaml
+*.yml
+
+# Audio files
+*.wav
+*.mp3
+*.flac
+
+# Generated files
+output/
+generated/
+*.base64
+
+
+# Docker files
+*.dockerfile
+docker-compose.override.yml
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Edge device tools (Jetson, Raspberry Pi, etc.)
+nvidia_sdk/
+.raspberrypi/

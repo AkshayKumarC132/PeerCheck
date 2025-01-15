@@ -1,0 +1,28 @@
+# Speech-to-Text
+vosk
+openai-whisper
+torch
+torchaudio
+torchvision
+
+# Text Analysis/NLP
+spacy
+transformers
+
+# Text-to-Speech
+TTS
+
+# API Development
+fastapi
+uvicorn
+flask
+graphene
+
+# Database
+psycopg2
+
+# General Utilities
+numpy
+pandas
+pydub
+base64
