@@ -1,6 +1,5 @@
 # PeerCheck
-<!-- 
-This is an Incident Management Platform designed for MSPs and MSSPs, featuring SSO integration, user management, and incident tracking.  -->
+
 This project is an offline-capable, edge-deployed system designed to process audio prompts, analyze them, and respond in a multimodal manner through an API
 
 ## Table of Contents

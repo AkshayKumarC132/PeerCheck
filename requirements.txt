@@ -8,6 +8,7 @@ torchvision
 # Text Analysis/NLP
 spacy
 transformers
+spacy-transformers
 
 # Text-to-Speech
 TTS
@@ -19,10 +20,10 @@ flask
 graphene
 
 # Database
-psycopg2
+psycopg2 # PostgreSQL
 
 # General Utilities
 numpy
 pandas
 pydub
-base64
+# base64
