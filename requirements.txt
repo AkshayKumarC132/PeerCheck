@@ -20,10 +20,12 @@ flask
 graphene
 
 # Database
-psycopg2 # PostgreSQL
+django 
+djangorestframework
 
 # General Utilities
 numpy
 pandas
 pydub
+ffmpeg-python
 # base64
