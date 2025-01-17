@@ -19,7 +19,7 @@ uvicorn
 flask
 graphene
 
-# Database
+django-cors-headers
 django 
 djangorestframework
 
