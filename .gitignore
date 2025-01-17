@@ -64,3 +64,6 @@ docker-compose.override.yml
 # Edge device tools (Jetson, Raspberry Pi, etc.)
 nvidia_sdk/
 .raspberrypi/
+
+vosk-model-small-en-us-0.15
+vosk-model-en-us-0.22
