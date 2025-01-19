@@ -147,23 +147,46 @@ def process_chunks_concurrently(chunks, model_path):
     return transcription
 
 
+# def preprocess_audio(file_path: str, target_sample_rate: int = 16000) -> str:
+#     """
+#     Preprocess the audio file: resample and set to mono if necessary.
+#     Converts invalid files to the required WAV format.
+#     """
+#     try:
+#         audio = AudioSegment.from_file(file_path)
+
+#         # Resample and set to mono if necessary
+#         if audio.frame_rate != target_sample_rate or audio.channels != 1:
+#             audio = audio.set_frame_rate(target_sample_rate).set_channels(1)
+
+#         # Export the preprocessed audio file
+#         output_path = file_path.replace(".wav", "_processed.wav")
+#         audio.export(output_path, format="wav")
+#         return output_path
+#     except Exception as e:    
+#         logging.error(f"Error preprocessing audio: {str(e)}")
+#         raise ValueError("Invalid audio file format or unsupported file.")
+
 def preprocess_audio(file_path: str, target_sample_rate: int = 16000) -> str:
     """
     Preprocess the audio file: resample and set to mono if necessary.
+    Converts invalid files to the required WAV format.
     """
-    audio = AudioSegment.from_file(file_path)
+    try:
+        # Load the audio file
+        audio = AudioSegment.from_file(file_path)
 
-    if audio.frame_rate == target_sample_rate and audio.channels == 1:
-        # Skip preprocessing if the file is already in the correct format
-        return file_path
+        # Resample to 16 kHz and set to mono
+        if audio.frame_rate != target_sample_rate or audio.channels != 1:
+            audio = audio.set_frame_rate(target_sample_rate).set_channels(1)
 
-    # Resample and set to mono
-    audio = audio.set_frame_rate(target_sample_rate).set_channels(1)
-
-    # Export the preprocessed audio file
-    output_path = file_path.replace(".wav", "_processed.wav")
-    audio.export(output_path, format="wav")
-    return output_path
+        # Export the preprocessed audio file
+        output_path = file_path.replace(".wav", "_processed.wav")
+        audio.export(output_path, format="wav")
+        return output_path
+    except Exception as e:
+        logging.error(f"Error preprocessing audio: {str(e)}")
+        raise ValueError("Invalid audio file format or unsupported file.")
 
 def process_audio_pipeline(file_path: str, model_path: str) -> str:
     """

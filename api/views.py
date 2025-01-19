@@ -6,7 +6,8 @@ from rest_framework import status
 from .models import AudioFile
 from .serializers import AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer
 from .utils import detect_keywords, segment_transcription,process_audio_pipeline
-
+import uuid
+import logging
 
 UPLOAD_DIR = "./uploads/"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -25,9 +26,11 @@ class ProcessAudioView(CreateAPIView):
         if not audio_file:
             return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
 
-        file_path = os.path.join(UPLOAD_DIR, audio_file.name)
+        # Save the file
+        file_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4()}_{audio_file.name}")
         with open(file_path, "wb") as f:
-            f.write(audio_file.read())
+            for chunk in audio_file.chunks():
+                f.write(chunk)
 
 
         # Transcription
@@ -36,7 +39,7 @@ class ProcessAudioView(CreateAPIView):
         #     transcription = process_audio_pipeline_optimized(file_path, model_path)
         # except Exception as e:
         #     return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-        import logging
+        
 
         logging.basicConfig(level=logging.INFO)
 
