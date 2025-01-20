@@ -29,3 +29,5 @@ pandas
 pydub
 ffmpeg-python
 # base64
+fuzzywuzzy
+python-Levenshtein
