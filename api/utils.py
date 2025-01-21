@@ -85,16 +85,13 @@ def transcribe_audio(file_path: str) -> str:
 
 nlp = spacy.load("en_core_web_sm")
 
-def detect_keywords(text: str, keywords: list) -> list:
-    # Normalize the text by processing it with your NLP model
-    doc = nlp(text)
-    
-    # Convert keywords to lowercase to match case-insensitive
-    keywords_lower = [keyword.lower() for keyword in keywords]
-
-    # Detect keywords by matching the token's text (in lowercase) with the lowercase keywords
-    detected = [token.text for token in doc if token.text.lower() in keywords_lower]
-    
+def detect_keywords(transcription, keywords):
+    detected = []
+    for keyword in keywords:
+        keyword_lower = keyword.lower()
+        if keyword_lower in transcription.lower():
+            timestamp = transcription.lower().find(keyword_lower)
+            detected.append({"word": keyword, "timestamp": timestamp})
     return detected
 
 # Segmentation

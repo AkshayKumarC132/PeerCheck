@@ -26,6 +26,9 @@ class ProcessAudioView(CreateAPIView):
         end_prompt = request.data.get('end_prompt')
         keywords = request.data.get('keywords', '')  # Comma-separated keywords
 
+        if not audio_file or not start_prompt or not end_prompt:
+            return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
+
         # audio_file = request.FILES.get('file')
         if not audio_file:
             return Response({"error": "No file uploaded"}, status=status.HTTP_400_BAD_REQUEST)
@@ -87,7 +90,28 @@ class ProcessAudioView(CreateAPIView):
         #     "Virtual Reality", "Cloud Storage", "Big Data", "Business Intelligence", "Digital Transformation"
         # ]
 
-        detected_keywords = detect_keywords(transcription, keywords)
+        keyword_list = [k.strip() for k in keywords.split(',')]
+        # detected_keywords = [kw for kw in keyword_list if kw.lower() in transcription.lower()]
+
+        # print(keywords)
+        # print(keyword_list)
+        # print(detected_keywords)
+
+        # detected_prompts = []
+        # for pos in start_index:
+        #     detected_prompts.append({"word": start_prompt, "timestamp": pos})
+        # for pos in end_index:
+        #     detected_prompts.append({"word": end_prompt, "timestamp": pos})
+
+        # Capture detected prompts
+        # detected_prompts = [
+        #     {"word": start_prompt, "timestamp": start_index},
+        #     {"word": end_prompt, "timestamp": end_index},
+        # ]
+
+        detected_keywords = detect_keywords(transcription, keyword_list)
+        print(detected_keywords)
+        # detected_keywords = detect_keywords(transcription, keywords)
 
         # Segmentation
         # segments = segment_transcription(transcription)
@@ -96,7 +120,7 @@ class ProcessAudioView(CreateAPIView):
         audio_instance = AudioFile.objects.create(
             file_path=file_path,
             transcription=transcription,
-            keywords_detected=", ".join(detected_keywords),
+            keywords_detected=detected_keywords,
             status="processed",
             duration=len(transcription.split())  # Example: word count as duration
         )
@@ -105,8 +129,10 @@ class ProcessAudioView(CreateAPIView):
         return Response({
             "audio_file": serializer.data,
             # "segments": segments,
-            "extracted_text": extracted_text,
+            "transcription": extracted_text,
+            # "detected_prompts": detected_prompts,
             "detected_keywords": detected_keywords,
+            "status": "processed"
         }, status=status.HTTP_200_OK)
     
 
@@ -176,3 +202,28 @@ def find_approximate_match(transcription, prompt):
             best_match_index = transcription.lower().find(segment)
 
     return best_match_index if min_distance < len(prompt) * 0.3 else -1
+
+
+class ReAnalyzeAudioView(APIView):
+    def post(self, request):
+        file_path = request.data.get('file_path')
+        new_keywords = request.data.get('new_keywords', '')
+
+        if not file_path or not new_keywords:
+            return Response({"error": "File path and keywords are required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not os.path.exists(file_path):
+            return Response({"error": "Audio file not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Assuming a function that transcribes and detects keywords
+        model_path = "vosk-model-en-us-0.22"
+        transcription = process_audio_pipeline(file_path, model_path)
+        keywords_list = [kw.strip() for kw in new_keywords.split(',')]
+
+        detected_keywords = detect_keywords(transcription, keywords_list)
+
+        return Response({
+            "file_path": file_path,
+            "transcription": transcription,
+            "detected_keywords": detected_keywords
+        }, status=status.HTTP_200_OK)
