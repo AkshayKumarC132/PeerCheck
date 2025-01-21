@@ -15,6 +15,7 @@ from pathlib import Path
 
 # Assuming BASE_DIR is defined in your settings.py
 UPLOAD_DIR = os.path.join(settings.BASE_DIR, "uploads")
+MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-en-us-0.22")
 
 class ProcessAudioView(CreateAPIView):
     serializer_class = ProcessAudioViewSerializer
@@ -44,8 +45,7 @@ class ProcessAudioView(CreateAPIView):
 
         # Transcription
         try:
-            model_path = "vosk-model-en-us-0.22"
-            transcription = process_audio_pipeline(file_path, model_path)
+            transcription = process_audio_pipeline(file_path, MODEL_PATH)
         except Exception as e:
             if file_path and os.path.exists(file_path):
                     os.remove(file_path)

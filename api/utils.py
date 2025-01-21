@@ -11,8 +11,9 @@ from pydub.utils import make_chunks
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import json
+from peercheck import settings
 
-MODEL_PATH = "vosk-model-en-us-0.22"
+MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-en-us-0.22")
 # vosk-model-small-en-us-0.15
 
 # Limit OpenBLAS threads
