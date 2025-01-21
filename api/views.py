@@ -11,8 +11,18 @@ import logging
 from fuzzywuzzy import fuzz, process
 from Levenshtein import distance
 
+from pathlib import Path
+print(Path)
+
 UPLOAD_DIR = "./uploads/"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+dir_path = Path(UPLOAD_DIR)
+print(dir_path)
+
+try:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+except PermissionError:
+    os.chmod("/var/www/InsightApps", 0o755)  # Change the permissions of the parent directory
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 class ProcessAudioView(CreateAPIView):
     serializer_class = ProcessAudioViewSerializer
