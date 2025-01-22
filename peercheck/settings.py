@@ -25,7 +25,7 @@ SECRET_KEY = 'django-insecure-a29z8fjb^1pcdcx9^qo=@ikm_kpsxu8kmxh&(1xv7*)r70&cd+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','54.215.55.114','13.52.99.241','54.193.137.246']
+ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','54.215.55.114','13.52.99.241','54.193.137.246','https://13.52.235.128','https://54.193.137.246','https://api.hask.app/']
 
 
 # Application definition
@@ -142,12 +142,16 @@ CORS_ALLOWED_ORIGINS = [
     'http://13.52.99.241:80',
     'http://54.215.55.114:80',
     "https://54.193.137.246",
+    'https://13.52.235.128',
+    'https://api.hask.app/'
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:4200',
     'http://13.52.99.241:80/'
     'http://54.215.55.114:80',
-    "https://54.193.137.246'",
+    'https://54.193.137.246',
+    'https://13.52.235.128',
+    'https://api.hask.app/'
 ]
 CORS_ALLOW_METHODS = ['DELETE', 'OPTIONS', 'PATCH', 'GET', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [
