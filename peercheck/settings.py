@@ -11,6 +11,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 """
 
 from pathlib import Path
+import os
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -25,7 +26,7 @@ SECRET_KEY = 'django-insecure-a29z8fjb^1pcdcx9^qo=@ikm_kpsxu8kmxh&(1xv7*)r70&cd+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','54.215.55.114','13.52.99.241','54.193.137.246','https://13.52.235.128','https://54.193.137.246','https://api.hask.app']
+ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','https://api.hask.app']
 
 
 # Application definition
@@ -52,7 +53,6 @@ MIDDLEWARE = [
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'corsheaders.middleware.CorsMiddleware',  # Enable CORS
-    'django.middleware.common.CommonMiddleware',
     'django.middleware.gzip.GZipMiddleware',
 ]
 
@@ -139,22 +139,39 @@ CORS_ALLOW_ALL_ORIGINS = True  # Enable all origins for development
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
     "http://127.0.0.1:8000",
-    'http://13.52.99.241:80',
-    'http://54.215.55.114:80',
-    "https://54.193.137.246",
-    'https://13.52.235.128',
-    'https://api.hask.app'
+    'https://api.hask.app',
+    'https://peercheck.hask.app'
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:4200',
     'http://13.52.99.241:80'
-    'http://54.215.55.114:80',
-    'https://54.193.137.246',
-    'https://13.52.235.128',
-    'https://api.hask.app'
+    'https://api.hask.app',
+    'https://peercheck.hask.app'
 ]
 CORS_ALLOW_METHODS = ['DELETE', 'OPTIONS', 'PATCH', 'GET', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [
     'accept', 'accept-encoding', 'authorization', 'content-type', 'dnt', 
     'origin', 'user-agent', 'x-csrftoken', 'x-requested-with'
 ]
+
+# Determine if running in production
+import os
+print('----------->>><<<<<',os.getenv('DJANGO_ENV'))
+IS_PRODUCTION = os.getenv('DJANGO_ENV') == 'production'
+
+# Security settings for production
+if IS_PRODUCTION:
+    CSRF_COOKIE_SECURE = True
+    SESSION_COOKIE_SECURE = True
+    SECURE_SSL_REDIRECT = True  # Redirect all HTTP to HTTPS
+    SECURE_HSTS_SECONDS = 31536000  # Enforce HTTPS in browsers
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+else:
+    # Local development (disable HTTPS enforcement)
+    CSRF_COOKIE_SECURE = False
+    SESSION_COOKIE_SECURE = False
+    SECURE_SSL_REDIRECT = False
+    SECURE_HSTS_SECONDS = 0  # Disable HSTS
+    SECURE_PROXY_SSL_HEADER = None
