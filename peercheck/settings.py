@@ -84,7 +84,15 @@ DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
-    }
+    },
+    'default1': {
+        'ENGINE': 'django.db.backends.postgresql_psycopg2',
+        'NAME': 'peercheck',
+        'USER': 'postgres',
+        'PASSWORD': 'QP3HeJel62BPzPaq07uETezy',
+        'HOST': 'e-commerce.cj3oddyv0bsk.us-west-1.rds.amazonaws.com',
+        'PORT': '5432',
+    },
 }
 
 
@@ -153,25 +161,3 @@ CORS_ALLOW_HEADERS = [
     'accept', 'accept-encoding', 'authorization', 'content-type', 'dnt', 
     'origin', 'user-agent', 'x-csrftoken', 'x-requested-with'
 ]
-
-# Determine if running in production
-import os
-print('----------->>><<<<<',os.getenv('DJANGO_ENV'))
-IS_PRODUCTION = os.getenv('DJANGO_ENV') == 'production'
-
-# Security settings for production
-if IS_PRODUCTION:
-    CSRF_COOKIE_SECURE = True
-    SESSION_COOKIE_SECURE = True
-    SECURE_SSL_REDIRECT = True  # Redirect all HTTP to HTTPS
-    SECURE_HSTS_SECONDS = 31536000  # Enforce HTTPS in browsers
-    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-    SECURE_HSTS_PRELOAD = True
-    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
-else:
-    # Local development (disable HTTPS enforcement)
-    CSRF_COOKIE_SECURE = False
-    SESSION_COOKIE_SECURE = False
-    SECURE_SSL_REDIRECT = False
-    SECURE_HSTS_SECONDS = 0  # Disable HSTS
-    SECURE_PROXY_SSL_HEADER = None

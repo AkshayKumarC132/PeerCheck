@@ -31,3 +31,4 @@ ffmpeg-python
 # base64
 fuzzywuzzy
 python-Levenshtein
+boto3
