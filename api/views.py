@@ -65,11 +65,11 @@ class ProcessAudioView(CreateAPIView):
         end_prompt = request.data.get("end_prompt")
         keywords = request.data.get("keywords", "")
 
-        if not audio_file or not start_prompt or not end_prompt:
-            return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
+        # if not audio_file or not start_prompt or not end_prompt:
+        #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
 
         # Generate unique file name for S3
-        file_name = f"datasource/{uuid.uuid4()}_{audio_file.name}"
+        file_name = f"peercheck_files/{uuid.uuid4()}_{audio_file.name}"
 
         print(file_name)
 
@@ -158,23 +158,30 @@ class ReAnalyzeAudioView(APIView):
     def post(self, request):
         file_path = request.data.get("file_path")
         new_keywords = request.data.get("new_keywords", "")
+        # id = request.data.get("id")
 
         if not file_path or not new_keywords:
             return Response({"error": "File path and keywords are required"}, status=status.HTTP_400_BAD_REQUEST)
 
         # Download file from S3
-        try:
-            local_file_path = download_file_from_s3(file_path, S3_BUCKET_NAME)
-        except Exception as e:
-            return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
+        # try:
+        #     local_file_path = download_file_from_s3(file_path, S3_BUCKET_NAME)
+        # except Exception as e:
+        #     return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
 
         # Process transcription
-        transcription = process_audio_pipeline(local_file_path, MODEL_PATH)
-        os.remove(local_file_path)  # Clean up local file after processing
+        transcription = process_audio_pipeline(file_path, MODEL_PATH)
+        # os.remove(local_file_path)  # Clean up local file after processing
 
         keywords_list = [kw.strip() for kw in new_keywords.split(",")]
         detected_keywords = detect_keywords(transcription, keywords_list)
 
+        AudioFile.objects.filter(file_path=file_path).update(
+            transcription=transcription,
+            keywords_detected=detected_keywords,
+            status="reanalyzed",
+            duration=len(transcription.split()),  # Example: word count as duration
+        )
         return Response(
             {
                 "file_path": file_path,
