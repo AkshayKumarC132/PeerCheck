@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import AudioFile, Feedback
+from .models import *
 
 class AudioFileSerializer(serializers.ModelSerializer):
     class Meta:
@@ -13,3 +13,12 @@ class FeedbackSerializer(serializers.ModelSerializer):
 
 class ProcessAudioViewSerializer(serializers.Serializer):
     file = serializers.FileField()
+
+class UserProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserProfile
+        fields = ['id', 'username', 'email', 'name','theme']
+
+class LoginSerialzier(serializers.Serializer):
+    username = serializers.CharField()
+    password = serializers.CharField()

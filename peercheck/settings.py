@@ -12,6 +12,7 @@ https://docs.djangoproject.com/en/5.1/ref/settings/
 
 from pathlib import Path
 import os
+from datetime import timedelta
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -28,6 +29,8 @@ DEBUG = True
 
 ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','https://api.hask.app']
 
+# Custom user model
+AUTH_USER_MODEL = "api.UserProfile"
 
 # Application definition
 
@@ -40,8 +43,36 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
-    'api',
+    'rest_framework.authtoken',
     'corsheaders',
+    'knox',
+
+    'api',
+]
+
+# REST framework configuration
+REST_FRAMEWORK = {
+    'DEFAULT_AUTHENTICATION_CLASSES': (
+        'knox.auth.TokenAuthentication',  # Knox token-based authentication
+        'rest_framework.authentication.SessionAuthentication',  # For sessions
+        'rest_framework.authentication.BasicAuthentication',  # For basic auth
+    )
+}
+
+# Knox-specific settings
+REST_KNOX = {
+    # # 'SECURE_HASH_ALGORITHM': 'cryptography.hazmat.primitives.hashes.SHA256',
+    # 'SECURE_HASH_ALGORITHM': 'hashlib.sha512',
+    'AUTH_TOKEN_CHARACTER_LENGTH': 8,
+    'TOKEN_TTL': timedelta(minutes=120),
+    'USER_SERIALIZER': 'knox.serializers.UserSerializer',
+    'TOKEN_LIMIT_PER_USER': None,
+    'AUTO_REFRESH': False,
+}
+
+# Authentication backends
+AUTHENTICATION_BACKENDS = [
+    'django.contrib.auth.backends.ModelBackend',
 ]
 
 MIDDLEWARE = [
@@ -83,7 +114,7 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+        'NAME': BASE_DIR / 'main.sqlite3',
     },
     'default1': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
@@ -114,6 +145,14 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
+
+# Password hashers
+PASSWORD_HASHERS = [
+    'django.contrib.auth.hashers.PBKDF2PasswordHasher',
+    'django.contrib.auth.hashers.PBKDF2SHA1PasswordHasher',
+    'django.contrib.auth.hashers.Argon2PasswordHasher',
+    'django.contrib.auth.hashers.BCryptSHA256PasswordHasher',
+]
 
 # Internationalization
 # https://docs.djangoproject.com/en/5.1/topics/i18n/

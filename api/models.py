@@ -1,4 +1,6 @@
 from django.db import models
+from django.contrib.auth.models import AbstractUser
+
 
 # Create your models here.
 class AudioFile(models.Model):
@@ -20,3 +22,24 @@ class Feedback(models.Model):
 
     def __str__(self):
         return f"Feedback for {self.audio_file.id}"
+
+class UserProfile(AbstractUser):
+    id = models.AutoField(primary_key=True, db_column='user_id')
+    name = models.CharField(max_length=100, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    theme = models.CharField(max_length=50, default="light")
+
+    class Meta:
+        db_table = "user_profile"
+
+class KnoxAuthtoken(models.Model):
+    digest = models.CharField(primary_key=True, max_length=128)
+    created = models.DateTimeField()
+    user = models.ForeignKey(UserProfile, models.CASCADE, null=True, blank=True, db_column='user_id')
+    expiry = models.DateTimeField(blank=True, null=True)
+    token_key = models.CharField(max_length=8, null=True, blank=True)
+
+    class Meta:
+        managed = False
+        db_table = 'knox_authtoken'

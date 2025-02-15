@@ -11,20 +11,24 @@ from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
 from Levenshtein import distance
+from .authentication import token_verification
 
-# AWS S3 Configuration
-S3_BUCKET_NAME = settings.AWS_STORAGE_BUCKET_NAME
-S3_REGION = settings.AWS_S3_REGION_NAME
-S3_ACCESS_KEY = settings.AWS_S3_ACCESS_KEY_ID
-S3_SECRET_KEY = settings.AWS_S3_SECRET_ACCESS_KEY
+try:
+    # AWS S3 Configuration
+    S3_BUCKET_NAME = settings.AWS_STORAGE_BUCKET_NAME
+    S3_REGION = settings.AWS_S3_REGION_NAME
+    S3_ACCESS_KEY = settings.AWS_S3_ACCESS_KEY_ID
+    S3_SECRET_KEY = settings.AWS_S3_SECRET_ACCESS_KEY
 
-# Initialize S3 client
-s3_client = boto3.client(
-    "s3",
-    region_name=S3_REGION,
-    aws_access_key_id=S3_ACCESS_KEY,
-    aws_secret_access_key=S3_SECRET_KEY
-)
+    # Initialize S3 client
+    s3_client = boto3.client(
+        "s3",
+        region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY
+    )
+except :
+    pass
 
 MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-small-en-us-0.15")
 
@@ -142,7 +146,14 @@ class GetAudioRecordsView(APIView):
     API to fetch all existing audio records.
     """
 
-    def get(self, request, format=None):
+    def get(self, request, token,format=None):
+        if not token:
+            return Response({"error": "Token is required"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Validate user from token
+        user = token_verification(token)
+        if user['status'] != 200:
+            return Response({'message': user['error']}, status=status.HTTP_400_BAD_REQUEST)
         try:
             audio_records = AudioFile.objects.all().order_by("-id")
             serializer = AudioFileSerializer(audio_records, many=True)
