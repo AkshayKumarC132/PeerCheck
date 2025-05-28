@@ -429,28 +429,49 @@ def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker
     from .models import SessionUser
     import tempfile
     logger.info(f"Starting transcription with diarization for URL: {audio_url}")
-    response = requests.get(audio_url)
-    if response.status_code != 200:
-        logger.error(f"Failed to download file: {response.status_code}")
-        raise ValueError(f"Failed to download file: {response.status_code}")
     
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-        temp_audio.write(response.content)
-        temp_audio_path = temp_audio.name
+    # Download and preprocess audio
+    try:
+        response = requests.get(audio_url)
+        if response.status_code != 200:
+            logger.error(f"Failed to download file: {response.status_code}")
+            raise ValueError(f"Failed to download file: {response.status_code}")
+        
+        audio_data = BytesIO(response.content)
+        audio = AudioSegment.from_file(audio_data)
+        if audio.frame_rate != 16000 or audio.channels != 1:
+            audio = audio.set_frame_rate(16000).set_channels(1)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            audio.export(temp_audio, format="wav")
+            temp_audio_path = temp_audio.name
+        logger.info(f"Audio properties: sample_rate={audio.frame_rate}, channels={audio.channels}, duration={len(audio)/1000}s")
+    except Exception as e:
+        logger.error(f"Audio preprocessing failed: {str(e)}")
+        raise ValueError(f"Audio preprocessing failed: {str(e)}")
 
     try:
         model = vosk.Model(model_path)
         spk_model = vosk.SpkModel(speaker_model_path)
         with wave.open(temp_audio_path, "rb") as wf:
+            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+                logger.error("Invalid audio format for Vosk")
+                raise ValueError("Audio must be mono, 16-bit PCM, 16 kHz")
+            
             recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
             recognizer.SetWords(True)
             recognizer.SetSpkModel(spk_model)
             transcription = []
+            detected_speakers = set()
+            
+            # Load session users for mapping
             speaker_map = {}
             if session_id:
                 session_users = SessionUser.objects.filter(session_id=session_id).order_by('created_at')
                 for idx, su in enumerate(session_users):
-                    speaker_map[f"Speaker_{idx + 1}"] = su.user.username
+                    speaker_tag = f"Speaker_{idx + 1}"
+                    speaker_map[speaker_tag] = su.user.username
+                    logger.info(f"Mapping {speaker_tag} to {su.user.username}")
+            
             while True:
                 data = wf.readframes(4000)
                 if len(data) == 0:
@@ -464,9 +485,11 @@ def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker
                         elif isinstance(result["spk"], (int, float)):
                             speaker_id = result["spk"]
                     speaker_tag = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+                    detected_speakers.add(speaker_tag)
                     speaker = speaker_map.get(speaker_tag, speaker_tag)
                     if "text" in result and result["text"]:
                         transcription.append({"speaker": speaker, "text": result["text"]})
+            
             final_result = json.loads(recognizer.FinalResult())
             if "text" in final_result and final_result["text"]:
                 speaker_id = None
@@ -476,9 +499,16 @@ def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker
                     elif isinstance(final_result["spk"], (int, float)):
                         speaker_id = final_result["spk"]
                 speaker_tag = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+                detected_speakers.add(speaker_tag)
                 speaker = speaker_map.get(speaker_tag, speaker_tag)
                 transcription.append({"speaker": speaker, "text": final_result["text"]})
-        logger.info("Transcription with diarization completed")
+            
+            logger.info(f"Detected speakers: {detected_speakers}")
+            if len(detected_speakers) <= 1 and session_id:
+                logger.warning("Only one speaker detected; diarization may have failed")
         return transcription
+    except Exception as e:
+        logger.error(f"Transcription with diarization failed: {str(e)}")
+        raise ValueError(f"Transcription failed: {str(e)}")
     finally:
         os.remove(temp_audio_path)

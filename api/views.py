@@ -89,31 +89,22 @@ class ProcessAudioView(CreateAPIView):
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Generate unique file name for S3
         file_name = f"peercheck_files/{uuid.uuid4()}_{audio_file.name}"
-
-        print(file_name)
-
-        # Upload file to S3
         try:
             file_url = upload_file_to_s3(audio_file, S3_BUCKET_NAME, file_name)
         except Exception as e:
+            logger.error(f"S3 upload failed: {str(e)}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-
-        # Transcription with speaker diarization
-        try:
-            extracted_text = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH)
-            transcription_text = " ".join([segment["text"] for segment in extracted_text])
-        except Exception as e:
-            return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-        
         if session_id and session_user_ids:
             try:
                 session = Session.objects.get(id=session_id, user=request.validated_user)
                 for user_id in session_user_ids:
-                    SessionUser.objects.get_or_create(session=session, user_id=user_id)
-                logger.info(f"Added session users: {session_user_ids}")
+                    su, created = SessionUser.objects.get_or_create(session=session, user_id=user_id)
+                    if created:
+                        logger.info(f"Created SessionUser: user_id={user_id}, session_id={session_id}")
+                    else:
+                        logger.info(f"SessionUser already exists: user_id={user_id}, session_id={session_id}")
             except Session.DoesNotExist:
                 logger.error(f"Session not found: ID {session_id}")
                 return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -124,7 +115,7 @@ class ProcessAudioView(CreateAPIView):
         try:
             transcription = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH, session_id)
             transcription_text = " ".join([segment["text"] for segment in transcription])
-            logger.info(f"Transcription successful: {transcription_text[:50]}...")
+            logger.info(f"Transcription segments: {transcription}")
         except Exception as e:
             logger.error(f"Transcription failed: {str(e)}")
             return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
