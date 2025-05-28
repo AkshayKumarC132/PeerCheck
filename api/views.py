@@ -5,13 +5,17 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile, SOP, SOPStep
-from .serializers import AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, SOPSerializer
+from .models import AudioFile, SOP, SOPStep, Session
+from .serializers import AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, SOPSerializer, SessionSerializer
 from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
 from Levenshtein import distance
 from .authentication import token_verification
+from .permissions import RoleBasedPermission
+import logging
+
+logger = logging.getLogger(__name__)
 
 try:
     # AWS S3 Configuration
@@ -60,6 +64,7 @@ def download_file_from_s3(file_name, bucket_name):
 class ProcessAudioView(CreateAPIView):
     
     serializer_class = ProcessAudioViewSerializer
+    permission_classes = [RoleBasedPermission]
 
     def post(self, request, token,format=None):
         # Validate token
@@ -75,7 +80,8 @@ class ProcessAudioView(CreateAPIView):
         start_prompt = request.data.get("start_prompt")
         end_prompt = request.data.get("end_prompt")
         keywords = request.data.get("keywords", "")
-        sop_id = request.data.get("sop_id")  # Optional SOP ID
+        sop_id = request.data.get("sop_id") 
+        session_id = serializer.validated_data.get("session_id")
 
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
@@ -102,6 +108,7 @@ class ProcessAudioView(CreateAPIView):
         response_data = {
             "transcription": extracted_text,
             "status": "processed",
+            "audio_file": AudioFileSerializer(audio_instance).data
         }
 
         # Save to Database (moved outside sop_id block)
@@ -127,6 +134,18 @@ class ProcessAudioView(CreateAPIView):
                 response_data["sop_error"] = "SOP not found"
             except Exception as e:
                 response_data["sop_error"] = f"SOP matching failed: {str(e)}"
+        
+        if session_id:
+            try:
+                session = Session.objects.get(id=session_id, user=user_data['user'])
+                session.audio_files.add(audio_instance)
+                logger.info(f"Audio file {audio_instance.id} added to session {session_id}")
+            except Session.DoesNotExist:
+                logger.error(f"Session not found or unauthorized: ID {session_id}")
+                response_data["session_error"] = "Session not found or unauthorized"
+            except Exception as e:
+                logger.error(f"Session linking failed: {str(e)}")
+                response_data["session_error"] = f"Session linking failed: {str(e)}"
 
         return Response(response_data, status=status.HTTP_200_OK)
     
@@ -178,6 +197,7 @@ class ProcessAudioView(CreateAPIView):
 
 
 class FeedbackView(APIView):
+    permission_classes = [RoleBasedPermission]
     def post(self, request, format=None):
         serializer = FeedbackSerializer(data=request.data)
         if serializer.is_valid():
@@ -187,6 +207,7 @@ class FeedbackView(APIView):
 
 
 class GetAudioRecordsView(APIView):
+    permission_classes = [RoleBasedPermission]
     """
     API to fetch all existing audio records.
     """
@@ -196,11 +217,16 @@ class GetAudioRecordsView(APIView):
             return Response({"error": "Token is required"}, status=status.HTTP_400_BAD_REQUEST)
 
         # Validate user from token
-        user = token_verification(token)
-        if user['status'] != 200:
-            return Response({'message': user['error']}, status=status.HTTP_400_BAD_REQUEST)
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'message': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
         try:
-            audio_records = AudioFile.objects.all().order_by("-id")
+            # audio_records = AudioFile.objects.all().order_by("-id")
+            if user_data['user'].role == 'admin':
+                audio_records = AudioFile.objects.all()
+            else:
+                audio_records = AudioFile.objects.filter(sessions__user=user_data['user'])
+            audio_records = audio_records.order_by("-id")
             serializer = AudioFileSerializer(audio_records, many=True)
             return Response({"audio_records": serializer.data}, status=status.HTTP_200_OK)
         except Exception as e:
@@ -211,6 +237,7 @@ class GetAudioRecordsView(APIView):
 
 
 class ReAnalyzeAudioView(APIView):
+    permission_classes = [RoleBasedPermission]
     def post(self, request):
         file_path = request.data.get("file_path")
         new_keywords = request.data.get("new_keywords", "")
@@ -370,6 +397,7 @@ def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker
 
 class SOPCreateView(CreateAPIView):
     serializer_class = SOPSerializer
+    permission_classes = [RoleBasedPermission]
     def post(self, request, token):
         # Validate token
         user_data = token_verification(token)
@@ -383,6 +411,7 @@ class SOPCreateView(CreateAPIView):
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class SOPListView(APIView):
+    permission_classes = [RoleBasedPermission]
     def get(self, request, token):
         # Validate token
         user_data = token_verification(token)
@@ -392,3 +421,38 @@ class SOPListView(APIView):
         sops = SOP.objects.all()
         serializer = SOPSerializer(sops, many=True)
         return Response({'sops': serializer.data}, status=status.HTTP_200_OK)
+    
+class SessionCreateView(CreateAPIView):
+    serializer_class = SessionSerializer
+    permission_classes = [RoleBasedPermission]
+
+    def post(self, request, token, format=None):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.serializer_class(data=request.data)
+        if serializer.is_valid():
+            serializer.save(user=user_data['user'])
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class SessionListView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get(self, request, token, format=None):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            if user_data['user'].role == 'admin':
+                sessions = Session.objects.all()
+            else:
+                sessions = Session.objects.filter(user=user_data['user'])
+            sessions = sessions.order_by("-created_at")
+            serializer = SessionSerializer(sessions, many=True)
+            return Response({'sessions': serializer.data}, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Error fetching sessions: {str(e)}")
+            return Response({"error": f"Error fetching sessions: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

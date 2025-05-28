@@ -4,7 +4,7 @@ from .models import *
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserProfile
-        fields = ['id', 'username', 'email', 'name','theme','password']
+        fields = ['id', 'username', 'email', 'name','theme','password', 'role']
 
 class LoginSerialzier(serializers.Serializer):
     username = serializers.CharField()
@@ -56,3 +56,26 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     end_prompt = serializers.CharField(required=False, allow_blank=True)
     keywords = serializers.CharField(required=False, allow_blank=True)
 
+class SessionSerializer(serializers.ModelSerializer):
+    audio_files = AudioFileSerializer(many=True, read_only=True)
+    sop = SOPSerializer(read_only=True)
+    audio_file_ids = serializers.ListField(
+        child=serializers.IntegerField(), write_only=True, required=False
+    )
+
+    class Meta:
+        model = Session
+        fields = ['id', 'name', 'user', 'sop', 'audio_files', 'audio_file_ids', 'created_at', 'updated_at']
+
+    def create(self, validated_data):
+        audio_file_ids = validated_data.pop('audio_file_ids', [])
+        session = Session.objects.create(**validated_data)
+        if audio_file_ids:
+            audio_files = AudioFile.objects.filter(id__in=audio_file_ids)
+            session.audio_files.set(audio_files)
+        return session
+
+    def validate(self, data):
+        if not data.get('name'):
+            raise serializers.ValidationError({"name": "This field is required."})
+        return data

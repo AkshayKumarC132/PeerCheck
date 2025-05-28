@@ -63,7 +63,7 @@ class RegisterView(generics.CreateAPIView):
             )
 
 @method_decorator(csrf_exempt, name='dispatch')
-class LoginViewAPI(APIView):
+class LoginViewAPI(generics.CreateAPIView):
     serializer_class = LoginSerialzier
     # permission_classes = [AllowAny]  # Allow anyone to access this view
 
