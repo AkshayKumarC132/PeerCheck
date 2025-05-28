@@ -55,6 +55,7 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     start_prompt = serializers.CharField(required=False, allow_blank=True)
     end_prompt = serializers.CharField(required=False, allow_blank=True)
     keywords = serializers.CharField(required=False, allow_blank=True)
+    session_id = serializers.IntegerField(required=False, allow_null=True)
 
 class SessionSerializer(serializers.ModelSerializer):
     audio_files = AudioFileSerializer(many=True, read_only=True)

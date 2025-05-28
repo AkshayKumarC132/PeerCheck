@@ -33,6 +33,10 @@ class RegisterView(generics.CreateAPIView):
         username = data['username']
         email = data['email']
         password = data['password']
+        role = data.get('role', 'user')  # Default to 'user'
+
+        if role not in dict(UserProfile.ROLE_CHOICES):
+            raise serializers.ValidationError({"error": f"Invalid role: {role}"})
 
         # Check if email already exists
         if UserProfile.objects.filter(email=email).exists():
@@ -47,6 +51,7 @@ class RegisterView(generics.CreateAPIView):
                 email=email,
                 password=password,
                 name=username,
+                role=role
             )
             serializer.instance = user
         except IntegrityError as e:
@@ -62,7 +67,7 @@ class RegisterView(generics.CreateAPIView):
                 {"error": "An error occurred during registration."}
             )
 
-@method_decorator(csrf_exempt, name='dispatch')
+# @method_decorator(csrf_exempt, name='dispatch')
 class LoginViewAPI(generics.CreateAPIView):
     serializer_class = LoginSerialzier
     # permission_classes = [AllowAny]  # Allow anyone to access this view
@@ -97,6 +102,7 @@ class LoginViewAPI(generics.CreateAPIView):
                     "created_at": profile.created_at,
                     "updated_at": profile.updated_at,
                     "theme": profile.theme,
+                    "role": profile.role
                 }
 
                 return Response(

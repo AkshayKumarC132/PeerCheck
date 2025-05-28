@@ -2,6 +2,7 @@ from rest_framework import permissions
 
 class RoleBasedPermission(permissions.BasePermission):
     def has_permission(self, request, view):
+        print(f"Checking permissions for user: {request.user} on view: {view.__class__.__name__}")
         if not request.user or not request.user.is_authenticated:
             return False
 

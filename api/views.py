@@ -31,7 +31,8 @@ try:
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY
     )
-except :
+except Exception as e:
+    logger.error(f"Failed to initialize S3 client: {str(e)}")
     pass
 
 MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-small-en-us-0.15")
@@ -77,8 +78,8 @@ class ProcessAudioView(CreateAPIView):
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
         audio_file = serializer.validated_data.get("file")
-        start_prompt = request.data.get("start_prompt")
-        end_prompt = request.data.get("end_prompt")
+        # start_prompt = request.data.get("start_prompt")
+        # end_prompt = request.data.get("end_prompt")
         keywords = request.data.get("keywords", "")
         sop_id = request.data.get("sop_id") 
         session_id = serializer.validated_data.get("session_id")
@@ -101,17 +102,11 @@ class ProcessAudioView(CreateAPIView):
         # Transcription with speaker diarization
         try:
             extracted_text = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH)
-            transcription_text = " ".join([segment["text"] for segment in extracted_text["transcription"]])
+            transcription_text = " ".join([segment["text"] for segment in extracted_text])
         except Exception as e:
             return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
         
-        response_data = {
-            "transcription": extracted_text,
-            "status": "processed",
-            "audio_file": AudioFileSerializer(audio_instance).data
-        }
-
-        # Save to Database (moved outside sop_id block)
+        # Save to Database
         audio_instance = AudioFile.objects.create(
             file_path=file_url,
             transcription=transcription_text,
@@ -119,6 +114,14 @@ class ProcessAudioView(CreateAPIView):
             duration=len(transcription_text.split()),  # Word count as duration
             sop=None  # Will be updated if sop_id is provided
         )
+
+        response_data = {
+            "transcription": extracted_text,
+            "status": "processed",
+            "audio_file": AudioFileSerializer(audio_instance).data
+        }
+
+        
 
         # SOP Step Matching
         if sop_id:
@@ -208,18 +211,11 @@ class FeedbackView(APIView):
 
 class GetAudioRecordsView(APIView):
     permission_classes = [RoleBasedPermission]
-    """
-    API to fetch all existing audio records.
-    """
 
-    def get(self, request, token,format=None):
-        if not token:
-            return Response({"error": "Token is required"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Validate user from token
+    def get(self, request, token, format=None):
         user_data = token_verification(token)
         if user_data['status'] != 200:
-            return Response({'message': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
         try:
             # audio_records = AudioFile.objects.all().order_by("-id")
             if user_data['user'].role == 'admin':
@@ -314,86 +310,6 @@ def find_approximate_match(transcription, prompt):
     return best_match_index if min_distance < len(prompt) * 0.3 else -1
 
 
-import vosk
-import wave
-import json
-import requests
-import tempfile
-import os
-
-def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
-    """
-    Transcribes audio with Vosk and includes speaker diarization.
-
-    Args:
-        audio_url (str): URL of the audio file.
-        model_path (str): Path to the Vosk ASR model.
-        speaker_model_path (str): Path to the Vosk speaker diarization model.
-
-    Returns:
-        dict: Formatted transcription with speaker labels.
-    """
-    # Download the file
-    response = requests.get(audio_url)
-    if response.status_code != 200:
-        raise ValueError(f"Failed to download file: {response.status_code}")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-        temp_audio.write(response.content)
-        temp_audio_path = temp_audio.name
-
-    try:
-        model = vosk.Model(model_path)
-        spk_model = vosk.SpkModel(speaker_model_path)  # Load Speaker Model
-
-        with wave.open(temp_audio_path, "rb") as wf:
-            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
-            recognizer.SetWords(True)
-            recognizer.SetSpkModel(spk_model)  # Enable speaker diarization
-
-            transcription = []
-
-            while True:
-                data = wf.readframes(4000)
-                if len(data) == 0:
-                    break
-
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-
-                    # Extract speaker ID
-                    speaker_id = None
-                    if "spk" in result:
-                        if isinstance(result["spk"], list) and result["spk"]:  # Ensure it's a non-empty list
-                            speaker_id = result["spk"][0]  # Take the first speaker ID
-                        elif isinstance(result["spk"], (int, float)):  # Handle single value
-                            speaker_id = result["spk"]
-
-                    # Ensure valid speaker ID
-                    speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
-
-                    # Append transcription
-                    if "text" in result and result["text"]:
-                        transcription.append({"speaker": speaker, "text": result["text"]})
-
-            # Process the final result
-            final_result = json.loads(recognizer.FinalResult())
-            if "text" in final_result and final_result["text"]:
-                speaker_id = None
-                if "spk" in final_result:
-                    if isinstance(final_result["spk"], list) and final_result["spk"]:
-                        speaker_id = final_result["spk"][0]
-                    elif isinstance(final_result["spk"], (int, float)):
-                        speaker_id = final_result["spk"]
-
-                speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
-                transcription.append({"speaker": speaker, "text": final_result["text"]})
-
-    finally:
-        os.remove(temp_audio_path)  # Delete temp file after processing
-
-    return {"transcription": transcription}
-
 
 class SOPCreateView(CreateAPIView):
     serializer_class = SOPSerializer
@@ -456,3 +372,77 @@ class SessionListView(APIView):
         except Exception as e:
             logger.error(f"Error fetching sessions: {str(e)}")
             return Response({"error": f"Error fetching sessions: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+
+def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
+    """
+    Transcribes audio with Vosk and includes speaker diarization.
+
+    Args:
+        audio_url (str): URL of the audio file.
+        model_path (str): Path to the Vosk ASR model.
+        speaker_model_path (str): Path to the Vosk speaker diarization model.
+
+    Returns:
+        dict: Formatted transcription with speaker labels.
+    """
+    # Download the file
+    response = requests.get(audio_url)
+    if response.status_code != 200:
+        raise ValueError(f"Failed to download file: {response.status_code}")
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+        temp_audio.write(response.content)
+        temp_audio_path = temp_audio.name
+
+    try:
+        model = vosk.Model(model_path)
+        spk_model = vosk.SpkModel(speaker_model_path)  # Load Speaker Model
+
+        with wave.open(temp_audio_path, "rb") as wf:
+            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
+            recognizer.SetWords(True)
+            recognizer.SetSpkModel(spk_model)  # Enable speaker diarization
+
+            transcription = []
+
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+
+                    # Extract speaker ID
+                    speaker_id = None
+                    if "spk" in result:
+                        if isinstance(result["spk"], list) and result["spk"]:  # Ensure it's a non-empty list
+                            speaker_id = result["spk"][0]  # Take the first speaker ID
+                        elif isinstance(result["spk"], (int, float)):  # Handle single value
+                            speaker_id = result["spk"]
+
+                    # Ensure valid speaker ID
+                    speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+
+                    # Append transcription
+                    if "text" in result and result["text"]:
+                        transcription.append({"speaker": speaker, "text": result["text"]})
+
+            # Process the final result
+            final_result = json.loads(recognizer.FinalResult())
+            if "text" in final_result and final_result["text"]:
+                speaker_id = None
+                if "spk" in final_result:
+                    if isinstance(final_result["spk"], list) and final_result["spk"]:
+                        speaker_id = final_result["spk"][0]
+                    elif isinstance(final_result["spk"], (int, float)):
+                        speaker_id = final_result["spk"]
+
+                speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+                transcription.append({"speaker": speaker, "text": final_result["text"]})
+
+    finally:
+        os.remove(temp_audio_path)  # Delete temp file after processing
+
+    return transcription
