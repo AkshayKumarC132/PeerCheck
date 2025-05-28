@@ -5,8 +5,9 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile, SOP, SOPStep, Session
-from .serializers import AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, SOPSerializer, SessionSerializer
+from .models import AudioFile, SOP, SOPStep, Session, SessionUser
+from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
+        SOPSerializer, SessionSerializer,FeedbackReviewSerializer)
 from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
@@ -83,6 +84,7 @@ class ProcessAudioView(CreateAPIView):
         keywords = request.data.get("keywords", "")
         sop_id = request.data.get("sop_id") 
         session_id = serializer.validated_data.get("session_id")
+        session_user_ids = request.data.get("session_user_ids", [])  # List of user IDs
 
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
@@ -106,41 +108,60 @@ class ProcessAudioView(CreateAPIView):
         except Exception as e:
             return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
         
-        # Save to Database
+        if session_id and session_user_ids:
+            try:
+                session = Session.objects.get(id=session_id, user=request.validated_user)
+                for user_id in session_user_ids:
+                    SessionUser.objects.get_or_create(session=session, user_id=user_id)
+                logger.info(f"Added session users: {session_user_ids}")
+            except Session.DoesNotExist:
+                logger.error(f"Session not found: ID {session_id}")
+                return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
+            except Exception as e:
+                logger.error(f"Session user creation failed: {str(e)}")
+                return Response({"error": f"Session user creation failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            transcription = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH, session_id)
+            transcription_text = " ".join([segment["text"] for segment in transcription])
+            logger.info(f"Transcription successful: {transcription_text[:50]}...")
+        except Exception as e:
+            logger.error(f"Transcription failed: {str(e)}")
+            return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
         audio_instance = AudioFile.objects.create(
             file_path=file_url,
-            transcription=transcription_text,
+            transcription=transcription,
             status="processed",
-            duration=len(transcription_text.split()),  # Word count as duration
-            sop=None  # Will be updated if sop_id is provided
+            duration=len(transcription_text.split()),
+            sop=None
         )
+        logger.info(f"Created AudioFile instance: {audio_instance.id}")
 
         response_data = {
-            "transcription": extracted_text,
+            "transcription": transcription,
             "status": "processed",
             "audio_file": AudioFileSerializer(audio_instance).data
         }
 
-        
-
-        # SOP Step Matching
         if sop_id:
             try:
                 sop = SOP.objects.get(id=sop_id)
                 sop_matches = match_sop_steps(transcription_text, sop)
                 response_data["sop_matches"] = sop_matches
-
-                # Update AudioFile with SOP
                 audio_instance.sop = sop
                 audio_instance.save()
+                logger.info(f"SOP matching completed for SOP ID {sop_id}")
             except SOP.DoesNotExist:
+                logger.error(f"SOP not found: ID {sop_id}")
                 response_data["sop_error"] = "SOP not found"
             except Exception as e:
+                logger.error(f"SOP matching failed: {str(e)}")
                 response_data["sop_error"] = f"SOP matching failed: {str(e)}"
-        
+
         if session_id:
             try:
-                session = Session.objects.get(id=session_id, user=user_data['user'])
+                session = Session.objects.get(id=session_id, user=request.validated_user)
                 session.audio_files.add(audio_instance)
                 logger.info(f"Audio file {audio_instance.id} added to session {session_id}")
             except Session.DoesNotExist:
@@ -150,53 +171,8 @@ class ProcessAudioView(CreateAPIView):
                 logger.error(f"Session linking failed: {str(e)}")
                 response_data["session_error"] = f"Session linking failed: {str(e)}"
 
+        logger.info("Audio processing completed successfully")
         return Response(response_data, status=status.HTTP_200_OK)
-    
-        # # Transcription
-        # try:
-        #     # local_file_path = download_file_from_s3(file_name, S3_BUCKET_NAME)
-        #     # print(local_file_path)
-        #     transcription = process_audio_pipeline(file_url, MODEL_PATH)
-        #     # os.remove(local_file_path)  # Clean up local file after processing
-        # except Exception as e:
-        #     return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
-
-        # # Find prompts and extract text
-        # start_index = find_prompt_index(transcription.lower(), start_prompt.lower())
-        # end_index = find_prompt_index(transcription.lower(), end_prompt.lower())
-
-        # # if start_index == -1 or end_index == -1 or start_index >= end_index:
-        # #     return Response(
-        # #         {"error": "Start or End Prompt not found in the audio."},
-        # #         status=status.HTTP_400_BAD_REQUEST,
-        # #     )
-
-        # extracted_text = transcription[start_index:end_index]
-
-        # # Detect Keywords
-        # keyword_list = [k.strip() for k in keywords.split(",")]
-        # detected_keywords = detect_keywords(transcription, keyword_list)
-
-        # # Save to Database
-        # audio_instance = AudioFile.objects.create(
-        #     file_path=file_url,
-        #     transcription=transcription,
-        #     keywords_detected=detected_keywords,
-        #     status="processed",
-        #     duration=len(transcription.split()),  # Example: word count as duration
-        # )
-
-        # # Return Response
-        # serializer = AudioFileSerializer(audio_instance)
-        # return Response(
-        #     {
-        #         # "audio_file": serializer.data,
-        #         "transcription": extracted_text,
-        #         # "detected_keywords": detected_keywords,
-        #         "status": "processed",
-        #     },
-        #     status=status.HTTP_200_OK,
-        # )
 
 
 class FeedbackView(APIView):
@@ -374,75 +350,113 @@ class SessionListView(APIView):
             return Response({"error": f"Error fetching sessions: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
 
-def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
-    """
-    Transcribes audio with Vosk and includes speaker diarization.
+class SessionReviewView(APIView):
+    permission_classes = [RoleBasedPermission]
 
-    Args:
-        audio_url (str): URL of the audio file.
-        model_path (str): Path to the Vosk ASR model.
-        speaker_model_path (str): Path to the Vosk speaker diarization model.
+    def get(self, request, session_id, token, format=None):
+        logger.info(f"Fetching review data for session ID: {session_id}, user: {request.validated_user.username}")
+        try:
+            session = Session.objects.get(id=session_id)
+            serializer = SessionSerializer(session)
+            logger.info(f"Retrieved review data for session: {session.name}")
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Session.DoesNotExist:
+            logger.error(f"Session not found: ID {session_id}")
+            return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error fetching session review: {str(e)}")
+            return Response({"error": f"Error fetching session review: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    Returns:
-        dict: Formatted transcription with speaker labels.
-    """
-    # Download the file
-    response = requests.get(audio_url)
-    if response.status_code != 200:
-        raise ValueError(f"Failed to download file: {response.status_code}")
-    import tempfile
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-        temp_audio.write(response.content)
-        temp_audio_path = temp_audio.name
+    def post(self, request, session_id, token, format=None):
+        logger.info(f"Submitting review for session ID: {session_id}, user: {request.validated_user.username}")
+        try:
+            session = Session.objects.get(id=session_id)
+            data = request.data.copy()
+            data['reviewer_id'] = request.validated_user.id
+            data['session'] = session.id
+            serializer = FeedbackReviewSerializer(data=data)
+            if serializer.is_valid():
+                serializer.save()
+                logger.info("Feedback review submitted successfully")
+                return Response(serializer.data, status=status.HTTP_201_CREATED)
+            logger.error(f"Feedback review submission failed: {serializer.errors}")
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        except Session.DoesNotExist:
+            logger.error(f"Session not found: ID {session_id}")
+            return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error submitting feedback review: {str(e)}")
+            return Response({"error": f"Error submitting feedback review: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    try:
-        model = vosk.Model(model_path)
-        spk_model = vosk.SpkModel(speaker_model_path)  # Load Speaker Model
+# def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
+#     """
+#     Transcribes audio with Vosk and includes speaker diarization.
 
-        with wave.open(temp_audio_path, "rb") as wf:
-            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
-            recognizer.SetWords(True)
-            recognizer.SetSpkModel(spk_model)  # Enable speaker diarization
+#     Args:
+#         audio_url (str): URL of the audio file.
+#         model_path (str): Path to the Vosk ASR model.
+#         speaker_model_path (str): Path to the Vosk speaker diarization model.
 
-            transcription = []
+#     Returns:
+#         dict: Formatted transcription with speaker labels.
+#     """
+#     # Download the file
+#     response = requests.get(audio_url)
+#     if response.status_code != 200:
+#         raise ValueError(f"Failed to download file: {response.status_code}")
+#     import tempfile
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+#         temp_audio.write(response.content)
+#         temp_audio_path = temp_audio.name
 
-            while True:
-                data = wf.readframes(4000)
-                if len(data) == 0:
-                    break
+#     try:
+#         model = vosk.Model(model_path)
+#         spk_model = vosk.SpkModel(speaker_model_path)  # Load Speaker Model
 
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
+#         with wave.open(temp_audio_path, "rb") as wf:
+#             recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
+#             recognizer.SetWords(True)
+#             recognizer.SetSpkModel(spk_model)  # Enable speaker diarization
 
-                    # Extract speaker ID
-                    speaker_id = None
-                    if "spk" in result:
-                        if isinstance(result["spk"], list) and result["spk"]:  # Ensure it's a non-empty list
-                            speaker_id = result["spk"][0]  # Take the first speaker ID
-                        elif isinstance(result["spk"], (int, float)):  # Handle single value
-                            speaker_id = result["spk"]
+#             transcription = []
 
-                    # Ensure valid speaker ID
-                    speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+#             while True:
+#                 data = wf.readframes(4000)
+#                 if len(data) == 0:
+#                     break
 
-                    # Append transcription
-                    if "text" in result and result["text"]:
-                        transcription.append({"speaker": speaker, "text": result["text"]})
+#                 if recognizer.AcceptWaveform(data):
+#                     result = json.loads(recognizer.Result())
 
-            # Process the final result
-            final_result = json.loads(recognizer.FinalResult())
-            if "text" in final_result and final_result["text"]:
-                speaker_id = None
-                if "spk" in final_result:
-                    if isinstance(final_result["spk"], list) and final_result["spk"]:
-                        speaker_id = final_result["spk"][0]
-                    elif isinstance(final_result["spk"], (int, float)):
-                        speaker_id = final_result["spk"]
+#                     # Extract speaker ID
+#                     speaker_id = None
+#                     if "spk" in result:
+#                         if isinstance(result["spk"], list) and result["spk"]:  # Ensure it's a non-empty list
+#                             speaker_id = result["spk"][0]  # Take the first speaker ID
+#                         elif isinstance(result["spk"], (int, float)):  # Handle single value
+#                             speaker_id = result["spk"]
 
-                speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
-                transcription.append({"speaker": speaker, "text": final_result["text"]})
+#                     # Ensure valid speaker ID
+#                     speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
 
-    finally:
-        os.remove(temp_audio_path)  # Delete temp file after processing
+#                     # Append transcription
+#                     if "text" in result and result["text"]:
+#                         transcription.append({"speaker": speaker, "text": result["text"]})
 
-    return transcription
+#             # Process the final result
+#             final_result = json.loads(recognizer.FinalResult())
+#             if "text" in final_result and final_result["text"]:
+#                 speaker_id = None
+#                 if "spk" in final_result:
+#                     if isinstance(final_result["spk"], list) and final_result["spk"]:
+#                         speaker_id = final_result["spk"][0]
+#                     elif isinstance(final_result["spk"], (int, float)):
+#                         speaker_id = final_result["spk"]
+
+#                 speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+#                 transcription.append({"speaker": speaker, "text": final_result["text"]})
+
+#     finally:
+#         os.remove(temp_audio_path)  # Delete temp file after processing
+
+#     return transcription

@@ -1,6 +1,6 @@
 from django.urls import path
 from .views import (ProcessAudioView, FeedbackView, GetAudioRecordsView, ReAnalyzeAudioView,
-                    SOPCreateView, SOPListView, SessionCreateView, SessionListView)
+                    SOPCreateView, SOPListView, SessionCreateView, SessionListView, SessionReviewView)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
 
 urlpatterns = [
@@ -21,4 +21,5 @@ urlpatterns = [
 
     path('sessions/create/<str:token>/', SessionCreateView.as_view(), name='session-create'),
     path('sessions/list/<str:token>/', SessionListView.as_view(), name='session-list'),
+    path('session/<int:session_id>/review/<str:token>/', SessionReviewView.as_view(), name='session-review'),
 ]

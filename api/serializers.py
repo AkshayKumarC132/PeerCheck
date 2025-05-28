@@ -4,9 +4,21 @@ from .models import *
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserProfile
-        fields = ['id', 'username', 'email', 'name','theme','password', 'role']
+        fields = ['id', 'username', 'email', 'name', 'theme', 'password', 'role']
+        extra_kwargs = {
+            'password': {'write_only': True}
+        }
 
-class LoginSerialzier(serializers.Serializer):
+    def create(self, validated_data):
+        # Hash password before saving if needed
+        password = validated_data.pop('password', None)
+        user = UserProfile(**validated_data)
+        if password:
+            user.set_password(password)
+        user.save()
+        return user
+
+class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
     password = serializers.CharField()
 
@@ -28,7 +40,7 @@ class SOPSerializer(serializers.ModelSerializer):
         for step_data in steps_data:
             SOPStep.objects.create(sop=sop, **step_data)
         return sop
-    
+
     def validate(self, data):
         if not data.get('name'):
             raise serializers.ValidationError({"name": "This field is required."})
@@ -40,9 +52,10 @@ class SOPSerializer(serializers.ModelSerializer):
 
 class AudioFileSerializer(serializers.ModelSerializer):
     sop = SOPSerializer(read_only=True)
+
     class Meta:
         model = AudioFile
-        fields = '__all__'
+        fields = ['id', 'file_path', 'transcription', 'status', 'keywords_detected', 'duration', 'sop']
 
 class FeedbackSerializer(serializers.ModelSerializer):
     class Meta:
@@ -80,3 +93,32 @@ class SessionSerializer(serializers.ModelSerializer):
         if not data.get('name'):
             raise serializers.ValidationError({"name": "This field is required."})
         return data
+
+class SessionUserSerializer(serializers.ModelSerializer):
+    user = UserProfileSerializer(read_only=True)
+    user_id = serializers.IntegerField()
+
+    class Meta:
+        model = SessionUser
+        fields = ['id', 'user', 'user_id', 'speaker_tag', 'created_at']
+
+    def create(self, validated_data):
+        user_id = validated_data.pop('user_id')
+        validated_data['user'] = UserProfile.objects.get(id=user_id)
+        return super().create(validated_data)
+
+class FeedbackReviewSerializer(serializers.ModelSerializer):
+    reviewer = UserProfileSerializer(read_only=True)
+    reviewer_id = serializers.IntegerField(write_only=True)
+
+    class Meta:
+        model = FeedbackReview
+        fields = [
+            'id', 'reviewer', 'reviewer_id', 'session', 'comments',
+            'resolved_flag', 'created_at', 'updated_at'
+        ]
+
+    def create(self, validated_data):
+        reviewer_id = validated_data.pop('reviewer_id')
+        validated_data['reviewer'] = UserProfile.objects.get(id=reviewer_id)
+        return super().create(validated_data)

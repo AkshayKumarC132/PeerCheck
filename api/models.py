@@ -84,3 +84,26 @@ class Session(models.Model):
 
     def __str__(self):
         return f"{self.name} by {self.user.username}"
+    
+class SessionUser(models.Model):
+    session = models.ForeignKey(Session, on_delete=models.CASCADE, related_name='session_users')
+    user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='session_participations')
+    speaker_tag = models.CharField(max_length=50, null=True, blank=True)  # e.g., Speaker_1
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('session', 'user')
+
+    def __str__(self):
+        return f"{self.user.username} in {self.session.name}"
+    
+class FeedbackReview(models.Model):
+    reviewer = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='feedback_reviews')
+    session = models.ForeignKey(Session, on_delete=models.CASCADE, related_name='feedback_reviews')
+    comments = models.TextField(null=True, blank=True)
+    resolved_flag = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Review by {self.reviewer.username} for {self.session.name}"

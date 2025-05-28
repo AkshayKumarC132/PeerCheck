@@ -49,6 +49,7 @@ class RoleBasedPermission(permissions.BasePermission):
                 'soplistview': ['get'],
                 'getaudiorecordsview': ['get'],
                 'sessionlistview': ['get'],
+                'sessionreviewview': ['get', 'post'],
             }
         }
 

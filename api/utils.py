@@ -82,9 +82,10 @@ import spacy # python -m spacy download en_core_web_sm
     
 # #     return output_path
 
+import os
+import logging
 
-
-
+logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
 
 def detect_keywords(transcription, keywords):
@@ -423,3 +424,61 @@ def match_sop_steps(transcription, sop):
         })
 
     return results
+
+def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str, session_id: int = None):
+    from .models import SessionUser
+    import tempfile
+    logger.info(f"Starting transcription with diarization for URL: {audio_url}")
+    response = requests.get(audio_url)
+    if response.status_code != 200:
+        logger.error(f"Failed to download file: {response.status_code}")
+        raise ValueError(f"Failed to download file: {response.status_code}")
+    
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+        temp_audio.write(response.content)
+        temp_audio_path = temp_audio.name
+
+    try:
+        model = vosk.Model(model_path)
+        spk_model = vosk.SpkModel(speaker_model_path)
+        with wave.open(temp_audio_path, "rb") as wf:
+            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
+            recognizer.SetWords(True)
+            recognizer.SetSpkModel(spk_model)
+            transcription = []
+            speaker_map = {}
+            if session_id:
+                session_users = SessionUser.objects.filter(session_id=session_id).order_by('created_at')
+                for idx, su in enumerate(session_users):
+                    speaker_map[f"Speaker_{idx + 1}"] = su.user.username
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+                    speaker_id = None
+                    if "spk" in result:
+                        if isinstance(result["spk"], list) and result["spk"]:
+                            speaker_id = result["spk"][0]
+                        elif isinstance(result["spk"], (int, float)):
+                            speaker_id = result["spk"]
+                    speaker_tag = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+                    speaker = speaker_map.get(speaker_tag, speaker_tag)
+                    if "text" in result and result["text"]:
+                        transcription.append({"speaker": speaker, "text": result["text"]})
+            final_result = json.loads(recognizer.FinalResult())
+            if "text" in final_result and final_result["text"]:
+                speaker_id = None
+                if "spk" in final_result:
+                    if isinstance(final_result["spk"], list) and final_result["spk"]:
+                        speaker_id = final_result["spk"][0]
+                    elif isinstance(final_result["spk"], (int, float)):
+                        speaker_id = final_result["spk"]
+                speaker_tag = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+                speaker = speaker_map.get(speaker_tag, speaker_tag)
+                transcription.append({"speaker": speaker, "text": final_result["text"]})
+        logger.info("Transcription with diarization completed")
+        return transcription
+    finally:
+        os.remove(temp_audio_path)

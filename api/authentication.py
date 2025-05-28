@@ -69,7 +69,7 @@ class RegisterView(generics.CreateAPIView):
 
 # @method_decorator(csrf_exempt, name='dispatch')
 class LoginViewAPI(generics.CreateAPIView):
-    serializer_class = LoginSerialzier
+    serializer_class = LoginSerializer
     # permission_classes = [AllowAny]  # Allow anyone to access this view
 
     def post(self, request):
