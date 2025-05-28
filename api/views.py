@@ -5,8 +5,8 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile
-from .serializers import AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer
+from .models import AudioFile, SOP, SOPStep
+from .serializers import AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, SOPSerializer
 from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
@@ -32,6 +32,7 @@ except :
 
 MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-small-en-us-0.15")
 
+SPEAKER_MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-spk-0.4")
 
 def upload_file_to_s3(file, bucket_name, file_name):
     """
@@ -57,9 +58,15 @@ def download_file_from_s3(file_name, bucket_name):
 
 
 class ProcessAudioView(CreateAPIView):
+    
     serializer_class = ProcessAudioViewSerializer
 
-    def post(self, request, format=None):
+    def post(self, request, token,format=None):
+        # Validate token
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+        
         serializer = ProcessAudioViewSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -68,6 +75,7 @@ class ProcessAudioView(CreateAPIView):
         start_prompt = request.data.get("start_prompt")
         end_prompt = request.data.get("end_prompt")
         keywords = request.data.get("keywords", "")
+        sop_id = request.data.get("sop_id")  # Optional SOP ID
 
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
@@ -83,53 +91,90 @@ class ProcessAudioView(CreateAPIView):
         except Exception as e:
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-        print(file_url)
 
-        # Transcription
+        # Transcription with speaker diarization
         try:
-            # local_file_path = download_file_from_s3(file_name, S3_BUCKET_NAME)
-            # print(local_file_path)
-            transcription = process_audio_pipeline(file_url, MODEL_PATH)
-            # os.remove(local_file_path)  # Clean up local file after processing
+            extracted_text = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH)
+            transcription_text = " ".join([segment["text"] for segment in extracted_text["transcription"]])
         except Exception as e:
             return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+        
+        response_data = {
+            "transcription": extracted_text,
+            "status": "processed",
+        }
 
-        # Find prompts and extract text
-        start_index = find_prompt_index(transcription.lower(), start_prompt.lower())
-        end_index = find_prompt_index(transcription.lower(), end_prompt.lower())
-
-        # if start_index == -1 or end_index == -1 or start_index >= end_index:
-        #     return Response(
-        #         {"error": "Start or End Prompt not found in the audio."},
-        #         status=status.HTTP_400_BAD_REQUEST,
-        #     )
-
-        extracted_text = transcription[start_index:end_index]
-
-        # Detect Keywords
-        keyword_list = [k.strip() for k in keywords.split(",")]
-        detected_keywords = detect_keywords(transcription, keyword_list)
-
-        # Save to Database
+        # Save to Database (moved outside sop_id block)
         audio_instance = AudioFile.objects.create(
             file_path=file_url,
-            transcription=transcription,
-            keywords_detected=detected_keywords,
+            transcription=transcription_text,
             status="processed",
-            duration=len(transcription.split()),  # Example: word count as duration
+            duration=len(transcription_text.split()),  # Word count as duration
+            sop=None  # Will be updated if sop_id is provided
         )
 
-        # Return Response
-        serializer = AudioFileSerializer(audio_instance)
-        return Response(
-            {
-                "audio_file": serializer.data,
-                "transcription": extracted_text,
-                "detected_keywords": detected_keywords,
-                "status": "processed",
-            },
-            status=status.HTTP_200_OK,
-        )
+        # SOP Step Matching
+        if sop_id:
+            try:
+                sop = SOP.objects.get(id=sop_id)
+                sop_matches = match_sop_steps(transcription_text, sop)
+                response_data["sop_matches"] = sop_matches
+
+                # Update AudioFile with SOP
+                audio_instance.sop = sop
+                audio_instance.save()
+            except SOP.DoesNotExist:
+                response_data["sop_error"] = "SOP not found"
+            except Exception as e:
+                response_data["sop_error"] = f"SOP matching failed: {str(e)}"
+
+        return Response(response_data, status=status.HTTP_200_OK)
+    
+        # # Transcription
+        # try:
+        #     # local_file_path = download_file_from_s3(file_name, S3_BUCKET_NAME)
+        #     # print(local_file_path)
+        #     transcription = process_audio_pipeline(file_url, MODEL_PATH)
+        #     # os.remove(local_file_path)  # Clean up local file after processing
+        # except Exception as e:
+        #     return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        # # Find prompts and extract text
+        # start_index = find_prompt_index(transcription.lower(), start_prompt.lower())
+        # end_index = find_prompt_index(transcription.lower(), end_prompt.lower())
+
+        # # if start_index == -1 or end_index == -1 or start_index >= end_index:
+        # #     return Response(
+        # #         {"error": "Start or End Prompt not found in the audio."},
+        # #         status=status.HTTP_400_BAD_REQUEST,
+        # #     )
+
+        # extracted_text = transcription[start_index:end_index]
+
+        # # Detect Keywords
+        # keyword_list = [k.strip() for k in keywords.split(",")]
+        # detected_keywords = detect_keywords(transcription, keyword_list)
+
+        # # Save to Database
+        # audio_instance = AudioFile.objects.create(
+        #     file_path=file_url,
+        #     transcription=transcription,
+        #     keywords_detected=detected_keywords,
+        #     status="processed",
+        #     duration=len(transcription.split()),  # Example: word count as duration
+        # )
+
+        # # Return Response
+        # serializer = AudioFileSerializer(audio_instance)
+        # return Response(
+        #     {
+        #         # "audio_file": serializer.data,
+        #         "transcription": extracted_text,
+        #         # "detected_keywords": detected_keywords,
+        #         "status": "processed",
+        #     },
+        #     status=status.HTTP_200_OK,
+        # )
 
 
 class FeedbackView(APIView):
@@ -240,3 +285,110 @@ def find_approximate_match(transcription, prompt):
             best_match_index = transcription.lower().find(segment)
 
     return best_match_index if min_distance < len(prompt) * 0.3 else -1
+
+
+import vosk
+import wave
+import json
+import requests
+import tempfile
+import os
+
+def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
+    """
+    Transcribes audio with Vosk and includes speaker diarization.
+
+    Args:
+        audio_url (str): URL of the audio file.
+        model_path (str): Path to the Vosk ASR model.
+        speaker_model_path (str): Path to the Vosk speaker diarization model.
+
+    Returns:
+        dict: Formatted transcription with speaker labels.
+    """
+    # Download the file
+    response = requests.get(audio_url)
+    if response.status_code != 200:
+        raise ValueError(f"Failed to download file: {response.status_code}")
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+        temp_audio.write(response.content)
+        temp_audio_path = temp_audio.name
+
+    try:
+        model = vosk.Model(model_path)
+        spk_model = vosk.SpkModel(speaker_model_path)  # Load Speaker Model
+
+        with wave.open(temp_audio_path, "rb") as wf:
+            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
+            recognizer.SetWords(True)
+            recognizer.SetSpkModel(spk_model)  # Enable speaker diarization
+
+            transcription = []
+
+            while True:
+                data = wf.readframes(4000)
+                if len(data) == 0:
+                    break
+
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+
+                    # Extract speaker ID
+                    speaker_id = None
+                    if "spk" in result:
+                        if isinstance(result["spk"], list) and result["spk"]:  # Ensure it's a non-empty list
+                            speaker_id = result["spk"][0]  # Take the first speaker ID
+                        elif isinstance(result["spk"], (int, float)):  # Handle single value
+                            speaker_id = result["spk"]
+
+                    # Ensure valid speaker ID
+                    speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+
+                    # Append transcription
+                    if "text" in result and result["text"]:
+                        transcription.append({"speaker": speaker, "text": result["text"]})
+
+            # Process the final result
+            final_result = json.loads(recognizer.FinalResult())
+            if "text" in final_result and final_result["text"]:
+                speaker_id = None
+                if "spk" in final_result:
+                    if isinstance(final_result["spk"], list) and final_result["spk"]:
+                        speaker_id = final_result["spk"][0]
+                    elif isinstance(final_result["spk"], (int, float)):
+                        speaker_id = final_result["spk"]
+
+                speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+                transcription.append({"speaker": speaker, "text": final_result["text"]})
+
+    finally:
+        os.remove(temp_audio_path)  # Delete temp file after processing
+
+    return {"transcription": transcription}
+
+
+class SOPCreateView(CreateAPIView):
+    serializer_class = SOPSerializer
+    def post(self, request, token):
+        # Validate token
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.serializer_class(data=request.data)
+        if serializer.is_valid():
+            serializer.save(created_by=user_data['user'])
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class SOPListView(APIView):
+    def get(self, request, token):
+        # Validate token
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        sops = SOP.objects.all()
+        serializer = SOPSerializer(sops, many=True)
+        return Response({'sops': serializer.data}, status=status.HTTP_200_OK)

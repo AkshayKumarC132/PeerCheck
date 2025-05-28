@@ -369,3 +369,57 @@ def process_audio_pipeline(file_url: str, model_path: str) -> str:
     except Exception as e:
         logging.error(f"Audio processing pipeline failed: {str(e)}")
         raise ValueError("Audio processing pipeline failed.")
+
+
+from fuzzywuzzy import fuzz
+
+def match_sop_steps(transcription, sop):
+    """
+    Match transcription against SOP steps and calculate confidence scores.
+    
+    Args:
+        transcription (str): Transcribed audio text.
+        sop (SOP): SOP instance to match against.
+    
+    Returns:
+        list: List of dicts with step details and confidence scores.
+    """
+    results = []
+    transcription_lower = transcription.lower()
+
+    for step in sop.steps.all():
+        expected_keywords = [kw.strip().lower() for kw in step.expected_keywords.split(',')]
+        matches = []
+        total_confidence = 0
+        matched_count = 0
+
+        for keyword in expected_keywords:
+            if keyword in transcription_lower:
+                # Exact match
+                confidence = 100
+                matched_count += 1
+            else:
+                # Fuzzy match for partial similarity
+                best_score = 0
+                for word in transcription_lower.split():
+                    score = fuzz.ratio(word, keyword)
+                    if score > best_score:
+                        best_score = score
+                confidence = best_score if best_score >= 80 else 0
+                if confidence > 0:
+                    matched_count += 1
+            matches.append({"keyword": keyword, "confidence": confidence})
+            total_confidence += confidence
+
+        # Calculate average confidence for the step
+        step_confidence = total_confidence / len(expected_keywords) if expected_keywords else 0
+        results.append({
+            "step_number": step.step_number,
+            "instruction_text": step.instruction_text,
+            "expected_keywords": expected_keywords,
+            "matches": matches,
+            "confidence_score": round(step_confidence, 2),
+            "matched": matched_count > 0
+        })
+
+    return results

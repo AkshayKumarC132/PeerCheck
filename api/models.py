@@ -2,13 +2,47 @@ from django.db import models
 from django.contrib.auth.models import AbstractUser
 
 
-# Create your models here.
+class UserProfile(AbstractUser):
+    id = models.AutoField(primary_key=True, db_column='user_id')
+    name = models.CharField(max_length=100, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    theme = models.CharField(max_length=50, default="light")
+
+    class Meta:
+        db_table = "user_profile"
+
+class SOP(models.Model):
+    name = models.CharField(max_length=255)
+    version = models.CharField(max_length=50)
+    created_by = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='sops_created')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.name} (v{self.version})"
+
+class SOPStep(models.Model):
+    sop = models.ForeignKey(SOP, on_delete=models.CASCADE, related_name='steps')
+    step_number = models.PositiveIntegerField()
+    instruction_text = models.TextField()
+    expected_keywords = models.TextField()  # Comma-separated keywords
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = ('sop', 'step_number')  # Ensure step numbers are unique per SOP
+
+    def __str__(self):
+        return f"Step {self.step_number}: {self.instruction_text[:50]}..."
+
+
 class AudioFile(models.Model):
     file_path = models.CharField(max_length=255)
     transcription = models.TextField(null=True, blank=True)
     status = models.CharField(max_length=50, default="pending")  # pending, processed
     keywords_detected = models.TextField(null=True, blank=True)
     duration = models.FloatField(null=True, blank=True)  # Duration in seconds
+    sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files')
 
     def __str__(self):
         return self.file_path
@@ -22,16 +56,6 @@ class Feedback(models.Model):
 
     def __str__(self):
         return f"Feedback for {self.audio_file.id}"
-
-class UserProfile(AbstractUser):
-    id = models.AutoField(primary_key=True, db_column='user_id')
-    name = models.CharField(max_length=100, null=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    theme = models.CharField(max_length=50, default="light")
-
-    class Meta:
-        db_table = "user_profile"
 
 class KnoxAuthtoken(models.Model):
     digest = models.CharField(primary_key=True, max_length=128)
