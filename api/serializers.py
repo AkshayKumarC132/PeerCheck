@@ -158,10 +158,11 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     start_prompt = serializers.CharField(required=False, allow_blank=True)
     end_prompt = serializers.CharField(required=False, allow_blank=True)
     keywords = serializers.CharField(required=False, allow_blank=True)
-    session_user_ids = serializers.CharField(required=False, allow_blank=True)
+    session_user_ids = serializers.CharField(required=False, allow_blank=True, default=[])
 
     def validate_session_user_ids(self, value):
-        print(value)
+        if value in [None, '', [], {}]:
+            return []
         # Handle form-data: value might be ["[2,5]"]
         if isinstance(value, list) and value and isinstance(value[0], str):
             try:

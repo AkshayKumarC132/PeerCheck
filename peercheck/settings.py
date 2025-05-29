@@ -127,9 +127,9 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'main.sqlite3',
     },
-    'default1': {
+    'default1y': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'peercheck',
+        'NAME': 'Peer Check',
         'USER': 'postgres',
         'PASSWORD': 'QP3HeJel62BPzPaq07uETezy',
         'HOST': 'e-commerce.cj3oddyv0bsk.us-west-1.rds.amazonaws.com',
@@ -220,23 +220,46 @@ CORS_ALLOW_HEADERS = [
 
 
 
-LOGGING = {
-    'version': 1,
-    'disable_existing_loggers': False,
-    'handlers': {
-        'console': {
-            'class': 'logging.StreamHandler',
+if os.name == 'nt':  # Windows-specific settings
+    LOGGING = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'handlers': {
+            'console': {
+                'class': 'logging.StreamHandler',
+            },
+            'file': {
+                'class': 'logging.FileHandler',
+                'filename': 'debug.log',
+            },
         },
-        'file': {
-            'class': 'logging.FileHandler',
-            'filename': 'debug.log',
+        'loggers': {
+            'api.views': {
+                'handlers': ['console', 'file'],
+                'level': 'DEBUG',
+                'propagate': True,
+            },
         },
-    },
-    'loggers': {
-        'api.views': {
-            'handlers': ['console', 'file'],
-            'level': 'DEBUG',
-            'propagate': True,
+    }
+else: # Assuming Linux/Unix
+    LOGGING = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'handlers': {
+            'console': {
+                'class': 'logging.StreamHandler',
+            },
+            'file': {
+                'level': 'DEBUG',
+                'class': 'logging.FileHandler',
+                'filename': '/var/www/PeerCheck/logs/debug.log',  # Updated path for Linux
+            },
         },
-    },
-}
+        'loggers': {
+            'api.views': {
+                'handlers': ['console', 'file'],
+                'level': 'DEBUG',
+                'propagate': True,
+            },
+        },
+    }
