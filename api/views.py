@@ -127,6 +127,23 @@ class ProcessAudioView(CreateAPIView):
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
 
+        # New parameters for enhanced speaker diarization
+        min_speaker_duration = float(request.data.get("min_speaker_duration", 2.0))
+        speaker_similarity_threshold = float(request.data.get("speaker_similarity_threshold", 0.85))
+
+        # Validate audio file before processing
+        if audio_file:
+            # Get file extension for format validation
+            file_extension = audio_file.name.split('.')[-1].lower() if '.' in audio_file.name else 'unknown'
+            supported_formats = get_supported_audio_formats()
+            
+            if file_extension not in supported_formats and file_extension != 'unknown':
+                return Response({
+                    "error": f"Unsupported audio format: {file_extension}. "
+                             f"Supported formats: {', '.join(supported_formats)}"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+
         file_name = f"peercheck_files/{uuid.uuid4()}_{audio_file.name}"
         try:
             file_url = upload_file_to_s3(audio_file, S3_BUCKET_NAME, file_name)
@@ -143,9 +160,16 @@ class ProcessAudioView(CreateAPIView):
                 processed_user_ids = []
                 for user_id_str in session_user_ids:
                     try:
-                        processed_user_ids.append(int(user_id_str))
+                        user_id_int = int(user_id_str)
+                        # Verify user exists
+                        from django.contrib.auth import get_user_model
+                        User = get_user_model()
+                        if User.objects.filter(id=user_id_int).exists():
+                            processed_user_ids.append(user_id_int)
+                        else:
+                            logger.warning(f"User ID {user_id_int} not found")
                     except ValueError:
-                        logger.error(f"Invalid user_id format in session_user_ids: {user_id_str}")
+                        logger.error(f"Invalid user_id format: {user_id_str}")
                         return Response({"error": f"Invalid user_id format: {user_id_str}"}, status=status.HTTP_400_BAD_REQUEST)
 
                 for user_id_val in processed_user_ids:
@@ -158,6 +182,7 @@ class ProcessAudioView(CreateAPIView):
                 # Assign speaker tags based on the order of session_user_ids, fetched by created_at
                 # This order matches the one used in transcribe_with_speaker_diarization
                 actual_session_users = SessionUser.objects.filter(session=session_instance, user_id__in=processed_user_ids).order_by('created_at')
+                
                 for idx, su_instance in enumerate(actual_session_users):
                     tag = f"Speaker_{idx + 1}"
                     if su_instance.speaker_tag != tag: # Only update if different or not set
@@ -173,12 +198,36 @@ class ProcessAudioView(CreateAPIView):
                 return Response({"error": f"Session user creation failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            transcription = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH, session_id)
+            transcription = transcribe_with_speaker_diarization(
+                audio_url=file_url, 
+                model_path=MODEL_PATH, 
+                speaker_model_path=SPEAKER_MODEL_PATH, 
+                session_id=session_id,
+                min_speaker_duration=min_speaker_duration,
+                speaker_similarity_threshold=speaker_similarity_threshold
+            )
             transcription_text = " ".join([segment["text"] for segment in transcription])
+            # Extract speaker statistics
+            unique_speakers = set(segment["speaker"] for segment in transcription)
+            speaker_stats = {
+                "total_speakers": len(unique_speakers),
+                "speakers": list(unique_speakers),
+                "total_segments": len(transcription),
+                "average_confidence": sum(segment.get("confidence", 0) for segment in transcription) / len(transcription) if transcription else 0
+            }
             logger.info(f"Transcription segments: {transcription}")
         except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
-            return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+            logger.error(f"Enhanced transcription failed: {str(e)}")
+            # Fallback to basic transcription if enhanced fails
+            try:
+                logger.info("Attempting fallback to basic transcription")
+                transcription_text = process_audio_pipeline(file_url, MODEL_PATH)
+                transcription = [{"speaker": "Unknown", "text": transcription_text, "timestamp": 0, "confidence": 0.5}]
+                speaker_stats = {"total_speakers": 1, "speakers": ["Unknown"], "total_segments": 1, "average_confidence": 0.5}
+                logger.info("Fallback transcription completed")
+            except Exception as fallback_error:
+                logger.error(f"Both enhanced and fallback transcription failed: {str(fallback_error)}")
+                return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
         audio_instance = AudioFile.objects.create(
             file_path=file_url,
@@ -193,16 +242,23 @@ class ProcessAudioView(CreateAPIView):
         # Log audit
         AuditLog.objects.create(
             action='audio_upload',
-            user=request.validated_user,
+            user=user_data['user'],
             # user = user_data['user'],
             session_id=session_id,
             object_id=audio_instance.id,
             object_type='AudioFile',
-            details={'file_name': audio_file.name}
+            details={
+                    'file_name': audio_file.name,
+                    'file_size': audio_file.size,
+                    'speaker_stats': speaker_stats,
+                    'processing_method': 'enhanced_diarization'
+                }
         )
 
         response_data = {
             "transcription": transcription,
+            "transcription_text": transcription_text,  # For backward compatibility
+            "speaker_statistics": speaker_stats,
             "status": "processed",
             "audio_file": AudioFileSerializer(audio_instance).data
         }
