@@ -255,6 +255,17 @@ class SessionSerializer(serializers.ModelSerializer):
         # If status is provided, it should be one of the valid choices (handled by model)
         return data
 
+class ErrorResponseSerializer(serializers.Serializer):
+    error = serializers.CharField(help_text="A description of the error that occurred.")
+    # Example for multiple errors (e.g. validation errors)
+    # errors = serializers.DictField(
+    #     child=serializers.ListField(child=serializers.CharField()),
+    #     required=False,
+    #     help_text="A dictionary of field-specific errors."
+    # )
+    detail = serializers.CharField(required=False, help_text="Sometimes used by DRF for single string error messages.")
+
+
 class SessionUserSerializer(serializers.ModelSerializer):
     user = UserProfileSerializer(read_only=True)
     user_id = serializers.IntegerField()

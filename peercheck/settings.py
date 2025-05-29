@@ -48,7 +48,15 @@ INSTALLED_APPS = [
     'knox',
 
     'api',
+    'drf_spectacular', # Added for OpenAPI schema generation
 ]
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'PeerCheck API',
+    'DESCRIPTION': 'API for the PeerCheck application, providing operations for SOPs, audio processing, sessions, feedback, and user management.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False, # Usually False for Swagger UI/ReDoc
+}
 
 # REST framework configuration
 REST_FRAMEWORK = {
@@ -59,6 +67,7 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 10,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
 # Knox-specific settings
