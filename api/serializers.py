@@ -1,5 +1,7 @@
 from rest_framework import serializers
 from .models import *
+import json
+import ast
 
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
@@ -17,6 +19,24 @@ class UserProfileSerializer(serializers.ModelSerializer):
             user.set_password(password)
         user.save()
         return user
+
+class UserSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserSettings
+        fields = ['language', 'notification_prefs', 'created_at', 'updated_at']
+
+class SystemSettingsSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SystemSettings
+        fields = ['default_sop_version', 'timeout_threshold', 'created_at', 'updated_at']
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    user = UserProfileSerializer(read_only=True)
+    session = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    class Meta:
+        model = AuditLog
+        fields = ['id', 'action', 'user', 'timestamp', 'session', 'object_id', 'object_type', 'details']
 
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
@@ -63,16 +83,51 @@ class FeedbackSerializer(serializers.ModelSerializer):
         fields = '__all__'
 
 class ProcessAudioViewSerializer(serializers.Serializer):
-    file = serializers.FileField()
+    file = serializers.FileField(required=True)
     sop_id = serializers.IntegerField(required=False, allow_null=True)
+    session_id = serializers.IntegerField(required=False, allow_null=True)
     start_prompt = serializers.CharField(required=False, allow_blank=True)
     end_prompt = serializers.CharField(required=False, allow_blank=True)
     keywords = serializers.CharField(required=False, allow_blank=True)
-    session_id = serializers.IntegerField(required=False, allow_null=True)
+    session_user_ids = serializers.CharField(required=False, allow_blank=True)
+
+    def validate_session_user_ids(self, value):
+        print(value)
+        # Handle form-data: value might be ["[2,5]"]
+        if isinstance(value, list) and value and isinstance(value[0], str):
+            try:
+                parsed_value = json.loads(value[0])
+                if not isinstance(parsed_value, list):
+                    raise serializers.ValidationError("session_user_ids must be a list of integers.")
+                value = [int(x) for x in parsed_value]
+            except json.JSONDecodeError:
+                try:
+                    parsed_value = ast.literal_eval(value[0])
+                    if not isinstance(parsed_value, list):
+                        raise serializers.ValidationError("session_user_ids must be a list of integers.")
+                    value = [int(x) for x in parsed_value]
+                except (ValueError, SyntaxError):
+                    raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
+        elif isinstance(value, str):
+            try:
+                parsed_value = json.loads(value)
+                if not isinstance(parsed_value, list):
+                    raise serializers.ValidationError("session_user_ids must be a list of integers.")
+                value = [int(x) for x in parsed_value]
+            except json.JSONDecodeError:
+                try:
+                    parsed_value = ast.literal_eval(value)
+                    if not isinstance(parsed_value, list):
+                        raise serializers.ValidationError("session_user_ids must be a list of integers.")
+                    value = [int(x) for x in parsed_value]
+                except (ValueError, SyntaxError):
+                    raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
+        return value
 
 class SessionSerializer(serializers.ModelSerializer):
     audio_files = AudioFileSerializer(many=True, read_only=True)
     sop = SOPSerializer(read_only=True)
+    user = UserProfileSerializer(read_only=True)  # Add read_only serializer for user
     audio_file_ids = serializers.ListField(
         child=serializers.IntegerField(), write_only=True, required=False
     )

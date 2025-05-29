@@ -44,12 +44,14 @@ class RoleBasedPermission(permissions.BasePermission):
                 'reanalyzeaudioview': ['post'],
                 'sessioncreateview': ['post'],
                 'sessionlistview': ['get'],
+                'usersettingsview': ['get', 'patch'],
             },
             'auditor': {
                 'soplistview': ['get'],
                 'getaudiorecordsview': ['get'],
                 'sessionlistview': ['get'],
                 'sessionreviewview': ['get', 'post'],
+                'auditlogview': ['get'],
             }
         }
 

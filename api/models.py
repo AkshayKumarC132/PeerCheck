@@ -107,3 +107,44 @@ class FeedbackReview(models.Model):
 
     def __str__(self):
         return f"Review by {self.reviewer.username} for {self.session.name}"
+    
+class UserSettings(models.Model):
+    user = models.OneToOneField(UserProfile, on_delete=models.CASCADE, related_name='settings')
+    language = models.CharField(max_length=10, default='en')
+    notification_prefs = models.JSONField(default=dict)  # e.g., {"email": true, "push": false}
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"Settings for {self.user.username}"
+
+class SystemSettings(models.Model):
+    default_sop_version = models.CharField(max_length=50, default='1.0')
+    timeout_threshold = models.IntegerField(default=300)  # seconds
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return "System Settings"
+
+    class Meta:
+        verbose_name_plural = "System Settings"
+
+class AuditLog(models.Model):
+    ACTION_CHOICES = (
+        ('audio_upload', 'Audio Upload'),
+        ('feedback_submit', 'Feedback Submit'),
+        ('sop_create', 'SOP Create'),
+        ('sop_update', 'SOP Update'),
+        ('review_submit', 'Review Submit'),
+    )
+    action = models.CharField(max_length=50, choices=ACTION_CHOICES)
+    user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
+    timestamp = models.DateTimeField(auto_now_add=True)
+    session = models.ForeignKey(Session, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
+    object_id = models.IntegerField()
+    object_type = models.CharField(max_length=50)  # e.g., AudioFile, SOP, FeedbackReview
+    details = models.JSONField(default=dict)  # Additional context
+
+    def __str__(self):
+        return f"{self.action} by {self.user.username if self.user else 'Unknown'} at {self.timestamp}"

@@ -27,7 +27,7 @@ SECRET_KEY = 'django-insecure-a29z8fjb^1pcdcx9^qo=@ikm_kpsxu8kmxh&(1xv7*)r70&cd+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','https://api.hask.app']
+ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','https://api.hask.app','http://192.168.56.1:8000',' 172.16.16.126']
 
 # Custom user model
 AUTH_USER_MODEL = "api.UserProfile"
@@ -185,15 +185,21 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = True  # Enable all origins for development
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
+    "http://localhost:4400",
     "http://127.0.0.1:8000",
     'https://api.hask.app',
-    'https://peercheck.hask.app'
+    'https://peercheck.hask.app',
+    'http://192.168.56.1:8000',
+    'http://172.16.16.126:8000'
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:4200',
+    "http://localhost:4400",
     'http://13.52.99.241:80'
     'https://api.hask.app',
-    'https://peercheck.hask.app'
+    'https://peercheck.hask.app',
+    'http://192.168.56.1:8000',
+    'http://172.16.16.126:8000'
 ]
 CORS_ALLOW_METHODS = ['DELETE', 'OPTIONS', 'PATCH', 'GET', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [
