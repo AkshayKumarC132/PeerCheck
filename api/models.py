@@ -44,7 +44,7 @@ class SOPStep(models.Model):
 
 class AudioFile(models.Model):
     file_path = models.CharField(max_length=255)
-    transcription = models.TextField(null=True, blank=True)
+    transcription = models.JSONField(null=True, blank=True)
     status = models.CharField(max_length=50, default="pending")  # pending, processed
     keywords_detected = models.TextField(null=True, blank=True)
     duration = models.FloatField(null=True, blank=True)  # Duration in seconds
