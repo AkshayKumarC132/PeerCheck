@@ -1,9 +1,5 @@
 from django.urls import path
 from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDetailView, 
-                    FeedbackReviewListView, FeedbackReviewDetailView, # Added FeedbackReview views
-                    GetAudioRecordsView, AudioFileDetailView, ReAnalyzeAudioView,
-                    SOPCreateView, SOPListView, SOPDetailView, # Added SOPDetailView
-from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDetailView, 
                     FeedbackReviewListView, FeedbackReviewDetailView, 
                     GetAudioRecordsView, AudioFileDetailView, ReAnalyzeAudioView,
                     SOPCreateView, SOPListView, SOPDetailView, 
