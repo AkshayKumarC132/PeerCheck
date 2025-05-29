@@ -49,7 +49,7 @@ class AudioFile(models.Model):
     keywords_detected = models.TextField(null=True, blank=True)
     duration = models.FloatField(null=True, blank=True)  # Duration in seconds
     sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files')
-
+    user = models.ForeignKey('UserProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files_uploaded')  # New field
     def __str__(self):
         return self.file_path
 

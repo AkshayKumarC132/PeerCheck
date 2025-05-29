@@ -33,7 +33,7 @@ class RegisterView(generics.CreateAPIView):
         username = data['username']
         email = data['email']
         password = data['password']
-        role = data.get('role', 'user')  # Default to 'user'
+        role = data.get('role', 'operator')  # Default to 'user'
 
         if role not in dict(UserProfile.ROLE_CHOICES):
             raise serializers.ValidationError({"error": f"Invalid role: {role}"})
