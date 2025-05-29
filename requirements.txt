@@ -22,6 +22,7 @@ graphene
 django-cors-headers
 django 
 djangorestframework
+django-rest-knox
 
 # General Utilities
 numpy
@@ -32,3 +33,6 @@ ffmpeg-python
 fuzzywuzzy
 python-Levenshtein
 boto3
+
+drf-spectacular
+drf-yasg

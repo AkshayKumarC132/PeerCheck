@@ -8,70 +8,68 @@ from .models import *
 from django.db import IntegrityError, transaction
 from rest_framework.views import APIView
 from knox.models import AuthToken
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from rest_framework import generics, status
 
 
-@api_view(['POST'])
-@transaction.atomic()
-def register(request):
-    required_fields = ['username', 'email', 'password']
+# @method_decorator(csrf_exempt, name='dispatch')
+class RegisterView(generics.CreateAPIView):
+    serializer_class = UserProfileSerializer
 
-    # Check if required fields are present and not empty
-    missing_or_empty_fields = [
-        field for field in required_fields
-        if field not in request.data or not request.data[field].strip()
-    ]
+    def perform_create(self, serializer):
+        data = self.request.data
+        required_fields = ['username', 'email', 'password']
+        missing_or_empty_fields = [
+            field for field in required_fields
+            if field not in data or not data[field].strip()
+        ]
 
-    if missing_or_empty_fields:
-        return Response(
-            {"error": f"Fields cannot be null or empty: {', '.join(missing_or_empty_fields)}"},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    # Extracting fields
-    username = request.data['username']
-    email = request.data['email']
-    password = request.data['password']
-    # name = request.data['name']
-
-    if UserProfile.objects.filter(email=email).exists():
-        return Response(
-            {"error": "Email already exists. Please choose a different email."},
-            status=status.HTTP_400_BAD_REQUEST
-        )
-
-    try:
-        # Creating the user profile
-        user = UserProfile.objects.create_user(
-            username=username,
-            email=email,
-            password=password,
-            name=username,
-        )
-        user.save()
-
-    except IntegrityError as e:
-        if 'user_profile.username' in str(e):
-            return Response(
-                {"error": "Username already exists. Please choose a different username."},
-                status=status.HTTP_400_BAD_REQUEST
+        if missing_or_empty_fields:
+            raise serializers.ValidationError(
+                {"error": f"Fields cannot be null or empty: {', '.join(missing_or_empty_fields)}"}
             )
-        if 'user_profile.email' in str(e):
-            return Response(
-                {"error": "Email already exists. Please choose a different email."},
-                status=status.HTTP_400_BAD_REQUEST
+
+        username = data['username']
+        email = data['email']
+        password = data['password']
+        role = data.get('role', 'operator')  # Default to 'user'
+
+        if role not in dict(UserProfile.ROLE_CHOICES):
+            raise serializers.ValidationError({"error": f"Invalid role: {role}"})
+
+        # Check if email already exists
+        if UserProfile.objects.filter(email=email).exists():
+            raise serializers.ValidationError(
+                {"error": "Email already exists. Please choose a different email."}
             )
-        return Response(
-            {"error": "An error occurred during registration."},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
-        )
 
-    # Serialize and return the newly created user profile
-    serializer = UserProfileSerializer(user)
-    return Response(serializer.data, status=status.HTTP_201_CREATED)
+        # Create user with custom logic
+        try:
+            user = UserProfile.objects.create_user(
+                username=username,
+                email=email,
+                password=password,
+                name=username,
+                role=role
+            )
+            serializer.instance = user
+        except IntegrityError as e:
+            if 'user_profile.username' in str(e):
+                raise serializers.ValidationError(
+                    {"error": "Username already exists. Please choose a different username."}
+                )
+            if 'user_profile.email' in str(e):
+                raise serializers.ValidationError(
+                    {"error": "Email already exists. Please choose a different email."}
+                )
+            raise serializers.ValidationError(
+                {"error": "An error occurred during registration."}
+            )
 
-
-class LoginViewAPI(APIView):
-    serializer_class = LoginSerialzier
+# @method_decorator(csrf_exempt, name='dispatch')
+class LoginViewAPI(generics.CreateAPIView):
+    serializer_class = LoginSerializer
     # permission_classes = [AllowAny]  # Allow anyone to access this view
 
     def post(self, request):
@@ -90,12 +88,27 @@ class LoginViewAPI(APIView):
                     return Response({'message': "Failed to create token"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
                 # Retrieve user profile
-                profile = UserProfile.objects.filter(username=username).values()
+                profile = UserProfile.objects.get(username=username)
+
+                profile_info = {
+                    "last_login": profile.last_login,
+                    "username": profile.username,
+                    "first_name": profile.first_name,
+                    "last_name": profile.last_name,
+                    "email": profile.email,
+                    "date_joined": profile.date_joined,
+                    "id": profile.id,
+                    "name": profile.name,
+                    "created_at": profile.created_at,
+                    "updated_at": profile.updated_at,
+                    "theme": profile.theme,
+                    "role": profile.role
+                }
 
                 return Response(
                     {
                         'message': "Login Successful",
-                        "data": profile,
+                        "data": profile_info,
                         'token': token,  # Return the token
                     },
                     status=status.HTTP_200_OK,
@@ -103,7 +116,7 @@ class LoginViewAPI(APIView):
             else:
                 return Response({'message': "Invalid username or password"}, status=status.HTTP_401_UNAUTHORIZED)
             
-
+@method_decorator(csrf_exempt, name='dispatch')
 class LogoutViewAPI(APIView):
     
     # permission_classes = [IsAuthenticated]  # Only authenticated users can log out
@@ -112,7 +125,7 @@ class LogoutViewAPI(APIView):
         print('aa')
         # Retrieve the user's token instance from the request
         try:
-            auth_token_instance = KnoxAuthtoken.objects.get(token_key=token)
+            auth_token_instance = KnoxAuthtoken.objects.get(token_key=token[:8])
         except :
             return Response({"message": "Invalid Token"}, status=status.HTTP_400_BAD_REQUEST)
 

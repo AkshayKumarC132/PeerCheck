@@ -27,7 +27,7 @@ SECRET_KEY = 'django-insecure-a29z8fjb^1pcdcx9^qo=@ikm_kpsxu8kmxh&(1xv7*)r70&cd+
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
 
-ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','https://api.hask.app']
+ALLOWED_HOSTS = ['*', '127.0.0.1', 'localhost','https://api.hask.app','http://192.168.56.1:8000',' 172.16.16.126']
 
 # Custom user model
 AUTH_USER_MODEL = "api.UserProfile"
@@ -48,7 +48,15 @@ INSTALLED_APPS = [
     'knox',
 
     'api',
+    'drf_spectacular', # Added for OpenAPI schema generation
 ]
+
+SPECTACULAR_SETTINGS = {
+    'TITLE': 'PeerCheck API',
+    'DESCRIPTION': 'API for the PeerCheck application, providing operations for SOPs, audio processing, sessions, feedback, and user management.',
+    'VERSION': '1.0.0',
+    'SERVE_INCLUDE_SCHEMA': False, # Usually False for Swagger UI/ReDoc
+}
 
 # REST framework configuration
 REST_FRAMEWORK = {
@@ -56,7 +64,10 @@ REST_FRAMEWORK = {
         'knox.auth.TokenAuthentication',  # Knox token-based authentication
         'rest_framework.authentication.SessionAuthentication',  # For sessions
         'rest_framework.authentication.BasicAuthentication',  # For basic auth
-    )
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 10,
+    'DEFAULT_SCHEMA_CLASS': 'drf_spectacular.openapi.AutoSchema',
 }
 
 # Knox-specific settings
@@ -116,9 +127,9 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'main.sqlite3',
     },
-    'default1': {
+    'default1y': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'peercheck',
+        'NAME': 'Peer Check',
         'USER': 'postgres',
         'PASSWORD': 'QP3HeJel62BPzPaq07uETezy',
         'HOST': 'e-commerce.cj3oddyv0bsk.us-west-1.rds.amazonaws.com',
@@ -185,18 +196,70 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = True  # Enable all origins for development
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
+    "http://localhost:4400",
     "http://127.0.0.1:8000",
     'https://api.hask.app',
-    'https://peercheck.hask.app'
+    'https://peercheck.hask.app',
+    'http://192.168.56.1:8000',
+    'http://172.16.16.126:8000'
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:4200',
+    "http://localhost:4400",
     'http://13.52.99.241:80'
     'https://api.hask.app',
-    'https://peercheck.hask.app'
+    'https://peercheck.hask.app',
+    'http://192.168.56.1:8000',
+    'http://172.16.16.126:8000'
 ]
 CORS_ALLOW_METHODS = ['DELETE', 'OPTIONS', 'PATCH', 'GET', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [
     'accept', 'accept-encoding', 'authorization', 'content-type', 'dnt', 
     'origin', 'user-agent', 'x-csrftoken', 'x-requested-with'
 ]
+
+
+
+if os.name == 'nt':  # Windows-specific settings
+    LOGGING = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'handlers': {
+            'console': {
+                'class': 'logging.StreamHandler',
+            },
+            'file': {
+                'class': 'logging.FileHandler',
+                'filename': 'debug.log',
+            },
+        },
+        'loggers': {
+            'api.views': {
+                'handlers': ['console', 'file'],
+                'level': 'DEBUG',
+                'propagate': True,
+            },
+        },
+    }
+else: # Assuming Linux/Unix
+    LOGGING = {
+        'version': 1,
+        'disable_existing_loggers': False,
+        'handlers': {
+            'console': {
+                'class': 'logging.StreamHandler',
+            },
+            'file': {
+                'level': 'DEBUG',
+                'class': 'logging.FileHandler',
+                'filename': '/var/www/PeerCheck/logs/debug.log',  # Updated path for Linux
+            },
+        },
+        'loggers': {
+            'api.views': {
+                'handlers': ['console', 'file'],
+                'level': 'DEBUG',
+                'propagate': True,
+            },
+        },
+    }
