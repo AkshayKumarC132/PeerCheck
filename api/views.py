@@ -211,23 +211,261 @@ class FeedbackView(APIView):
         user_data = token_verification(token)
         if user_data['status'] != 200:
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Set validated user for permission class (if needed)
-        request.validated_user = user_data['user']
+        
+        current_user = user_data['user']
+        # Set validated user on request IF RoleBasedPermission is expected to use it,
+        # but rely on current_user from token_verification for this method's logic.
+        request.validated_user = current_user 
 
         serializer = FeedbackSerializer(data=request.data)
         if serializer.is_valid():
-            feedback = serializer.save()
+            # Save the feedback instance, providing the validated user for created_by
+            feedback_obj = serializer.save(created_by=current_user)
+            
             # Log audit
             AuditLog.objects.create(
                 action='feedback_submit',
-                user=user_data['user'],
-                object_id=feedback.id,
+                user=current_user,
+                object_id=feedback_obj.id,
                 object_type='Feedback',
-                details={'audio_file_id': feedback.audio_file.id}
+                details={'audio_file_id': feedback_obj.audio_file.id} 
             )
-            return Response({"message": "Feedback submitted successfully"}, status=status.HTTP_201_CREATED)
+            logger.info(f"Feedback {feedback_obj.id} submitted by user {current_user.username}")
+            # Return the serialized feedback object
+            return Response(FeedbackSerializer(feedback_obj).data, status=status.HTTP_201_CREATED)
+        logger.error(f"Error submitting feedback: {serializer.errors}")
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+class FeedbackListView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get(self, request, token):
+        # request.validated_user is set by RoleBasedPermission
+        user = request.validated_user
+        queryset = Feedback.objects.all().order_by('-created_at')
+
+        audio_file_id = request.query_params.get('audio_file_id')
+        if audio_file_id:
+            queryset = queryset.filter(audio_file_id=audio_file_id)
+
+        # Permission filtering
+        if user.role == 'admin':
+            # Admin can see all feedback (already filtered by audio_file_id if provided)
+            pass
+        elif user.role == 'operator':
+            # Operators can see:
+            # 1. Feedback they submitted (created_by=user)
+            # 2. Feedback on audio files they uploaded (audio_file__user=user)
+            # 3. Feedback on audio files in sessions they are part of/own (audio_file__sessions__user=user)
+            queryset = queryset.filter(
+                models.Q(created_by=user) | 
+                models.Q(audio_file__user=user) |
+                models.Q(audio_file__sessions__user=user)
+            ).distinct()
+        elif user.role == 'reviewer':
+            # Reviewers can see feedback on audio files in sessions they are assigned to review
+            # (audio_file__sessions__session_users__user=user where SessionUser links to the reviewer)
+            queryset = queryset.filter(audio_file__sessions__session_users__user=user).distinct()
+        else:
+            logger.warning(f"User {user.username} with unhandled role '{user.role}' attempted to list feedback.")
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+            
+        serializer = FeedbackSerializer(queryset, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+class FeedbackDetailView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get_object(self, feedback_id, user):
+        try:
+            feedback_obj = Feedback.objects.select_related('audio_file__user', 'created_by').get(pk=feedback_id)
+        except Feedback.DoesNotExist:
+            logger.info(f"Feedback with id {feedback_id} not found.")
+            return None
+
+        # Permission check for individual object read access
+        if user.role == 'admin':
+            return feedback_obj
+        
+        can_access = False
+        if user.role == 'operator':
+            # Operator can access:
+            # 1. Feedback they submitted
+            # 2. Feedback on audio files they uploaded
+            # 3. Feedback on audio files in sessions they own/are part of
+            if feedback_obj.created_by == user or \
+               (feedback_obj.audio_file and feedback_obj.audio_file.user == user) or \
+               (feedback_obj.audio_file and feedback_obj.audio_file.sessions.filter(user=user).exists()):
+                can_access = True
+        elif user.role == 'reviewer':
+            # Reviewer can access feedback if it's on an audio file in a session they are reviewing
+            if feedback_obj.audio_file and feedback_obj.audio_file.sessions.filter(session_users__user=user).exists():
+                can_access = True
+        
+        if not can_access:
+            logger.warning(f"User {user.username} (role: {user.role}) permission denied for Feedback {feedback_id}")
+            return None
+            
+        return feedback_obj
+
+    def get(self, request, feedback_id, token):
+        # request.validated_user is set by RoleBasedPermission
+        feedback_obj = self.get_object(feedback_id, request.validated_user)
+        if feedback_obj is None:
+            return Response({"error": "Feedback not found or permission denied."}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = FeedbackSerializer(feedback_obj)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, feedback_id, token): # Handles full updates
+        return self._update_handler(request, feedback_id, token, partial=False)
+
+    def patch(self, request, feedback_id, token): # Handles partial updates
+        return self._update_handler(request, feedback_id, token, partial=True)
+
+    def _update_handler(self, request, feedback_id, token, partial):
+        user = request.validated_user # Set by RoleBasedPermission
+        feedback_obj_for_check = self.get_object(feedback_id, user) 
+
+        if feedback_obj_for_check is None: # Check if user had initial read access
+            return Response({"error": "Feedback not found or permission denied for access."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Specific permission check for update/patch: admin or owner (created_by)
+        if not (user.role == 'admin' or feedback_obj_for_check.created_by == user):
+            logger.warning(f"Permission denied for user {user.username} to update Feedback {feedback_id}")
+            return Response({"error": "You do not have permission to update this feedback."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Ensure audio_file_id is not part of the update data.
+        # The serializer should handle this via read_only_fields / write_only fields,
+        # but an explicit check here is safer.
+        if 'audio_file_id' in request.data or 'audio_file' in request.data:
+             logger.warning(f"Attempt to modify 'audio_file' or 'audio_file_id' during Feedback update by {user.username} denied.")
+             return Response({"error": "Cannot change the associated audio file of a feedback record."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Fetch the actual object again for update, without re-running all permission checks if already passed
+        try:
+            feedback_to_update = Feedback.objects.get(pk=feedback_id)
+        except Feedback.DoesNotExist:
+             return Response({"error": "Feedback not found."}, status=status.HTTP_404_NOT_FOUND) # Should be caught by get_object earlier
+
+        serializer = FeedbackSerializer(feedback_to_update, data=request.data, partial=partial)
+        if serializer.is_valid():
+            updated_feedback = serializer.save() # created_by is not changed here due to read_only in serializer
+            AuditLog.objects.create(
+                action='feedback_update',
+                user=user,
+                object_id=updated_feedback.id,
+                object_type='Feedback',
+                details={'updated_fields': list(request.data.keys())}
+            )
+            logger.info(f"Feedback {updated_feedback.id} updated by user {user.username}")
+            return Response(FeedbackSerializer(updated_feedback).data, status=status.HTTP_200_OK)
+        logger.error(f"Error updating feedback {feedback_id}: {serializer.errors}")
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, feedback_id, token):
+        user = request.validated_user # Set by RoleBasedPermission
+        feedback_obj_for_check = self.get_object(feedback_id, user)
+
+        if feedback_obj_for_check is None: # Check if user had initial read access
+            return Response({"error": "Feedback not found or permission denied for access."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Specific permission check for delete: admin or owner (created_by)
+        if not (user.role == 'admin' or feedback_obj_for_check.created_by == user):
+            logger.warning(f"Permission denied for user {user.username} to delete Feedback {feedback_id}")
+            return Response({"error": "You do not have permission to delete this feedback."}, status=status.HTTP_403_FORBIDDEN)
+        
+        # Fetch the actual object again for delete
+        try:
+            feedback_to_delete = Feedback.objects.get(pk=feedback_id)
+        except Feedback.DoesNotExist:
+            return Response({"error": "Feedback not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        audio_file_id_for_log = feedback_to_delete.audio_file.id if feedback_to_delete.audio_file else None
+        feedback_to_delete.delete()
+
+        AuditLog.objects.create(
+            action='feedback_delete',
+            user=user,
+            object_id=feedback_id, 
+            object_type='Feedback',
+            details={'audio_file_id': audio_file_id_for_log}
+        )
+        logger.info(f"Feedback {feedback_id} deleted by user {user.username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+class AudioFileDetailView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get_object(self, audio_id):
+        try:
+            return AudioFile.objects.get(pk=audio_id)
+        except AudioFile.DoesNotExist:
+            return None
+
+    def get(self, request, audio_id, token):
+        # request.validated_user is set by RoleBasedPermission
+        audio_file = self.get_object(audio_id)
+        if audio_file is None:
+            return Response({"error": "AudioFile not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Permission check for GET
+        user = request.validated_user
+        is_owner = audio_file.user == user
+        is_in_session = audio_file.sessions.filter(session_users__user=user).exists()
+        
+        if not (user.role == 'admin' or is_owner or is_in_session):
+            logger.warning(f"Permission denied for user {user.username} to access AudioFile {audio_id}")
+            return Response({"error": "You do not have permission to access this audio file."}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = AudioFileSerializer(audio_file)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def delete(self, request, audio_id, token):
+        # request.validated_user is set by RoleBasedPermission
+        audio_file = self.get_object(audio_id)
+        if audio_file is None:
+            return Response({"error": "AudioFile not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.validated_user
+        is_owner = audio_file.user == user
+
+        # Permission check for DELETE (admin or owner)
+        if not (user.role == 'admin' or is_owner):
+            logger.warning(f"Permission denied for user {user.username} to delete AudioFile {audio_id}")
+            return Response({"error": "You do not have permission to delete this audio file."}, status=status.HTTP_403_FORBIDDEN)
+
+        file_path = audio_file.file_path
+        audio_file_name_for_log = os.path.basename(file_path) # For logging
+
+        # Attempt to delete from S3
+        if file_path.startswith(f"https://{S3_BUCKET_NAME}.s3"):
+            try:
+                # Example: https://my-bucket.s3.amazonaws.com/path/to/file.wav
+                # Key should be "path/to/file.wav"
+                object_key = file_path.split(f"https://{S3_BUCKET_NAME}.s3.amazonaws.com/")[1]
+                s3_client.delete_object(Bucket=S3_BUCKET_NAME, Key=object_key)
+                logger.info(f"Successfully deleted {object_key} from S3 bucket {S3_BUCKET_NAME}")
+            except Exception as e:
+                logger.error(f"Error deleting file {file_path} from S3: {str(e)}")
+                # Optionally, decide if this error should prevent DB deletion.
+                # For now, we log and proceed to delete the DB record.
+        else:
+            logger.warning(f"File path {file_path} does not seem to be a valid S3 URL for bucket {S3_BUCKET_NAME}. Skipping S3 deletion.")
+
+
+        audio_file.delete()
+        
+        # Log audit
+        AuditLog.objects.create(
+            action='audiofile_delete',
+            user=user,
+            object_id=audio_id, # audio_file.id is no longer available
+            object_type='AudioFile',
+            details={'file_name': audio_file_name_for_log, 'file_path': file_path}
+        )
+        logger.info(f"AudioFile {audio_id} deleted by user {user.username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class GetAudioRecordsView(APIView):
@@ -371,12 +609,93 @@ class SOPListView(APIView):
         if user_data['status'] != 200:
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
 
-        if user_data['user'].role == 'admin':
-                sops = SOP.objects.all()
+        # request.validated_user is set by RoleBasedPermission
+        if request.validated_user.role == 'admin':
+            sops = SOP.objects.all()
+        elif request.validated_user.role == 'operator':
+            sops = SOP.objects.filter(created_by=request.validated_user)
+        elif request.validated_user.role == 'reviewer':
+            # Reviewers can see all SOPs for now, or define specific logic if needed
+            sops = SOP.objects.all()
         else:
-            sops = SOP.objects.filter(created_by=user_data['user'])
+            return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
+
         serializer = SOPSerializer(sops, many=True)
         return Response({'sops': serializer.data}, status=status.HTTP_200_OK)
+
+class SOPDetailView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get_object(self, sop_id):
+        try:
+            return SOP.objects.get(pk=sop_id)
+        except SOP.DoesNotExist:
+            return None
+
+    def get(self, request, sop_id, token):
+        # Token validation is handled by RoleBasedPermission
+        # request.validated_user is set by RoleBasedPermission
+        sop = self.get_object(sop_id)
+        if sop is None:
+            return Response({"error": "SOP not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Permission check for GET (admin, operator, reviewer)
+        # This is largely handled by RoleBasedPermission, but specific object access can be checked here if needed
+        # For now, if RoleBasedPermission allows the view, GET is allowed.
+
+        serializer = SOPSerializer(sop)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, sop_id, token):
+        # request.validated_user is set by RoleBasedPermission
+        sop = self.get_object(sop_id)
+        if sop is None:
+            return Response({"error": "SOP not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Permission check for PUT (admin or owner)
+        if not (request.validated_user.role == 'admin' or sop.created_by == request.validated_user):
+            logger.warning(f"Permission denied for user {request.validated_user.username} to update SOP {sop_id}")
+            return Response({"error": "You do not have permission to perform this action."}, status=status.HTTP_403_FORBIDDEN)
+
+        serializer = SOPSerializer(sop, data=request.data, partial=False) # Use partial=False for PUT
+        if serializer.is_valid():
+            updated_sop = serializer.save()
+            # Log audit
+            AuditLog.objects.create(
+                action='sop_update',
+                user=request.validated_user,
+                object_id=updated_sop.id,
+                object_type='SOP',
+                details={'name': updated_sop.name, 'version': updated_sop.version, 'updated_fields': list(request.data.keys())}
+            )
+            logger.info(f"SOP {sop_id} updated by user {request.validated_user.username}")
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        logger.error(f"Error updating SOP {sop_id}: {serializer.errors}")
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, sop_id, token):
+        # request.validated_user is set by RoleBasedPermission
+        sop = self.get_object(sop_id)
+        if sop is None:
+            return Response({"error": "SOP not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        # Permission check for DELETE (admin or owner)
+        if not (request.validated_user.role == 'admin' or sop.created_by == request.validated_user):
+            logger.warning(f"Permission denied for user {request.validated_user.username} to delete SOP {sop_id}")
+            return Response({"error": "You do not have permission to perform this action."}, status=status.HTTP_403_FORBIDDEN)
+
+        sop_name = sop.name # For logging before deletion
+        sop.delete()
+        # Log audit
+        AuditLog.objects.create(
+            action='sop_delete', # Ensure this action type exists in AuditLog.ACTION_CHOICES
+            user=request.validated_user,
+            object_id=sop_id, # sop.id is no longer available
+            object_type='SOP',
+            details={'name': sop_name}
+        )
+        logger.info(f"SOP {sop_id} deleted by user {request.validated_user.username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
     
 class SessionCreateView(CreateAPIView):
     serializer_class = SessionSerializer
@@ -463,9 +782,335 @@ class SessionReviewView(APIView):
             logger.error(f"Error submitting feedback review: {str(e)}")
             return Response({"error": f"Error submitting feedback review: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+class FeedbackReviewListView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get(self, request, token):
+        user = request.validated_user # Set by RoleBasedPermission
+        queryset = FeedbackReview.objects.select_related('reviewer', 'session__user').order_by('-created_at')
+
+        session_id = request.query_params.get('session_id')
+        if session_id:
+            queryset = queryset.filter(session_id=session_id)
+
+        reviewer_id = request.query_params.get('reviewer_id')
+        if reviewer_id:
+            queryset = queryset.filter(reviewer_id=reviewer_id)
+        
+        # Permission filtering
+        if user.role == 'admin':
+            # Admin can see all reviews (already filtered if params provided)
+            pass
+        elif user.role == 'operator':
+            # Operator can list reviews for their sessions (sessions owned by them)
+            queryset = queryset.filter(session__user=user)
+        elif user.role == 'reviewer':
+            # Reviewer can list reviews they submitted OR reviews for sessions they are a participant in
+            queryset = queryset.filter(
+                models.Q(reviewer=user) | 
+                models.Q(session__session_users__user=user) 
+            ).distinct()
+        else:
+            logger.warning(f"User {user.username} with unhandled role '{user.role}' attempted to list feedback reviews.")
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+            
+        serializer = FeedbackReviewSerializer(queryset, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+class FeedbackReviewDetailView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get_object_and_check_permission(self, review_id, user, check_write_permission=False):
+        try:
+            # Use select_related to fetch related objects in a single query
+            review = FeedbackReview.objects.select_related('reviewer', 'session__user').get(pk=review_id)
+        except FeedbackReview.DoesNotExist:
+            logger.info(f"FeedbackReview with id {review_id} not found.")
+            return None
+
+        # Admin can do anything
+        if user.role == 'admin':
+            return review
+
+        is_owner_of_review = (review.reviewer == user)
+        # Check if the session being reviewed belongs to the current user (if operator)
+        is_owner_of_session_under_review = (review.session.user == user) 
+
+        # For write operations (PUT, PATCH, DELETE) - only Reviewer who owns the review or Admin
+        if check_write_permission:
+            if user.role == 'reviewer' and is_owner_of_review:
+                return review
+            # Admins already handled. Operators cannot edit/delete reviews directly via this view.
+            logger.warning(f"Write permission denied for user {user.username} (role: {user.role}) on FeedbackReview {review_id}.")
+            return None
+        
+        # For read operations (GET)
+        if user.role == 'reviewer':
+            # Reviewer can see their own reviews or reviews for sessions they are a participant in
+            is_participant_in_session_under_review = SessionUser.objects.filter(session=review.session, user=user).exists()
+            if is_owner_of_review or is_participant_in_session_under_review:
+                return review
+        elif user.role == 'operator':
+            # Operator can see reviews on their sessions
+            if is_owner_of_session_under_review:
+                return review
+        
+        logger.warning(f"Read permission denied for user {user.username} (role: {user.role}) on FeedbackReview {review_id}.")
+        return None
+
+    def get(self, request, review_id, token):
+        user = request.validated_user # from RoleBasedPermission
+        review = self.get_object_and_check_permission(review_id, user, check_write_permission=False)
+        
+        if review is None:
+            return Response({"error": "FeedbackReview not found or permission denied."}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = FeedbackReviewSerializer(review)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, review_id, token): # Full update
+        return self._update_handler(request, review_id, token, partial=False)
+
+    def patch(self, request, review_id, token): # Partial update
+        return self._update_handler(request, review_id, token, partial=True)
+
+    def _update_handler(self, request, review_id, token, partial):
+        user = request.validated_user
+        # Use the permission checking method to ensure user has write access
+        review_for_permission_check = self.get_object_and_check_permission(review_id, user, check_write_permission=True)
+
+        if review_for_permission_check is None:
+            # Message already logged by get_object_and_check_permission if it was a specific permission denial
+            return Response({"error": "FeedbackReview not found or permission denied for update."}, status=status.HTTP_403_FORBIDDEN)
+
+        # Fetch the actual object again to pass to serializer. This ensures we are working with a fresh instance.
+        try:
+             review_to_update = FeedbackReview.objects.get(pk=review_id)
+        except FeedbackReview.DoesNotExist: 
+            # This case should ideally be caught by get_object_and_check_permission, but as a safeguard:
+            return Response({"error": "FeedbackReview not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # The serializer's update method prevents changing reviewer and session.
+        serializer = FeedbackReviewSerializer(review_to_update, data=request.data, partial=partial)
+        if serializer.is_valid():
+            updated_review = serializer.save()
+            AuditLog.objects.create(
+                action='feedbackreview_update',
+                user=user,
+                session=updated_review.session, 
+                object_id=updated_review.id,
+                object_type='FeedbackReview',
+                details={'updated_fields': list(request.data.keys())}
+            )
+            logger.info(f"FeedbackReview {updated_review.id} updated by user {user.username}")
+            return Response(FeedbackReviewSerializer(updated_review).data, status=status.HTTP_200_OK)
+        logger.error(f"Error updating FeedbackReview {review_id}: {serializer.errors}")
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, review_id, token):
+        user = request.validated_user
+        review_for_permission_check = self.get_object_and_check_permission(review_id, user, check_write_permission=True)
+
+        if review_for_permission_check is None:
+            return Response({"error": "FeedbackReview not found or permission denied for deletion."}, status=status.HTTP_403_FORBIDDEN)
+        
+        # Fetch the actual object again for deletion
+        try:
+            review_to_delete = FeedbackReview.objects.get(pk=review_id)
+        except FeedbackReview.DoesNotExist: 
+            return Response({"error": "FeedbackReview not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        session_id_for_log = review_to_delete.session.id
+        comments_for_log = review_to_delete.comments # Capture before delete
+        
+        review_to_delete.delete()
+
+        AuditLog.objects.create(
+            action='feedbackreview_delete',
+            user=user,
+            session_id=session_id_for_log, 
+            object_id=review_id, 
+            object_type='FeedbackReview',
+            details={'comments_length': len(comments_for_log if comments_for_log else "")}
+        )
+        logger.info(f"FeedbackReview {review_id} deleted by user {user.username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 # def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
 #     """
 #     Transcribes audio with Vosk and includes speaker diarization.
+#
+#     Args:
+#         audio_url (str): URL of the audio file.
+#         model_path (str): Path to the Vosk ASR model.
+#         speaker_model_path (str): Path to the Vosk speaker diarization model.
+#
+#     Returns:
+#         dict: Formatted transcription with speaker labels.
+#     """
+#     # Download the file
+#     response = requests.get(audio_url)
+#     if response.status_code != 200:
+#         raise ValueError(f"Failed to download file: {response.status_code}")
+#     import tempfile
+#     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+#         temp_audio.write(response.content)
+#         temp_audio_path = temp_audio.name
+#
+#     try:
+#         model = vosk.Model(model_path)
+#         spk_model = vosk.SpkModel(speaker_model_path)  # Load Speaker Model
+#
+#         with wave.open(temp_audio_path, "rb") as wf:
+#             recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
+#             recognizer.SetWords(True)
+#             recognizer.SetSpkModel(spk_model)  # Enable speaker diarization
+#
+#             transcription = []
+#
+#             while True:
+#                 data = wf.readframes(4000)
+#                 if len(data) == 0:
+#                     break
+#
+#                 if recognizer.AcceptWaveform(data):
+#                     result = json.loads(recognizer.Result())
+#
+#                     # Extract speaker ID
+#                     speaker_id = None
+#                     if "spk" in result:
+#                         if isinstance(result["spk"], list) and result["spk"]:  # Ensure it's a non-empty list
+#                             speaker_id = result["spk"][0]  # Take the first speaker ID
+#                         elif isinstance(result["spk"], (int, float)):  # Handle single value
+#                             speaker_id = result["spk"]
+#
+#                     # Ensure valid speaker ID
+#                     speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+#
+#                     # Append transcription
+#                     if "text" in result and result["text"]:
+#                         transcription.append({"speaker": speaker, "text": result["text"]})
+#
+#             # Process the final result
+#             final_result = json.loads(recognizer.FinalResult())
+#             if "text" in final_result and final_result["text"]:
+#                 speaker_id = None
+#                 if "spk" in final_result:
+#                     if isinstance(final_result["spk"], list) and final_result["spk"]:
+#                         speaker_id = final_result["spk"][0]
+#                     elif isinstance(final_result["spk"], (int, float)):
+#                         speaker_id = final_result["spk"]
+#
+#                 speaker = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
+#                 transcription.append({"speaker": speaker, "text": final_result["text"]})
+#
+#     finally:
+#         os.remove(temp_audio_path)  # Delete temp file after processing
+#
+#     return transcription
+
+class AdminUserListView(APIView):
+    permission_classes = [RoleBasedPermission] # Ensures admin-only access
+
+    def get(self, request, token):
+        # request.validated_user is set by RoleBasedPermission, confirming admin role
+        if request.validated_user.role != 'admin':
+             # This check is technically redundant if RoleBasedPermission is correctly configured
+             # to only allow admins for views not specified for other roles, but good for defense in depth.
+            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        users = UserProfile.objects.all().order_by('id')
+        serializer = AdminUserProfileSerializer(users, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+class AdminUserDetailView(APIView):
+    permission_classes = [RoleBasedPermission] # Ensures admin-only access
+
+    def get_object(self, user_id):
+        try:
+            return UserProfile.objects.get(pk=user_id)
+        except UserProfile.DoesNotExist:
+            return None
+
+    def get(self, request, user_id, token):
+        if request.validated_user.role != 'admin':
+            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+        
+        user_profile = self.get_object(user_id)
+        if user_profile is None:
+            return Response({"error": "UserProfile not found."}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = AdminUserProfileSerializer(user_profile)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, user_id, token): # Full update
+        return self._update_handler(request, user_id, token, partial=False)
+
+    def patch(self, request, user_id, token): # Partial update
+        return self._update_handler(request, user_id, token, partial=True)
+
+    def _update_handler(self, request, user_id, token, partial):
+        if request.validated_user.role != 'admin':
+            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        user_profile = self.get_object(user_id)
+        if user_profile is None:
+            return Response({"error": "UserProfile not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Prevent admin from updating their own critical fields like role or is_active via this view
+        # to avoid self-lockout. They should use Django admin or other means.
+        if user_profile == request.validated_user and ('role' in request.data or 'is_active' in request.data):
+            logger.warning(f"Admin user {request.validated_user.username} attempted to change their own role or active status via API.")
+            return Response({"error": "Admins cannot change their own role or active status via this API."}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Password update is excluded by AdminUserProfileSerializer's update method
+        serializer = AdminUserProfileSerializer(user_profile, data=request.data, partial=partial)
+        if serializer.is_valid():
+            updated_user_profile = serializer.save()
+            AuditLog.objects.create(
+                action='userprofile_update',
+                user=request.validated_user, # The admin performing the action
+                object_id=updated_user_profile.id,
+                object_type='UserProfile',
+                details={
+                    'target_user_id': updated_user_profile.id,
+                    'target_username': updated_user_profile.username,
+                    'updated_fields': list(request.data.keys())
+                }
+            )
+            logger.info(f"UserProfile {updated_user_profile.id} ({updated_user_profile.username}) updated by admin {request.validated_user.username}")
+            return Response(AdminUserProfileSerializer(updated_user_profile).data, status=status.HTTP_200_OK)
+        logger.error(f"Error updating UserProfile {user_id}: {serializer.errors}")
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, user_id, token):
+        if request.validated_user.role != 'admin':
+            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        user_profile_to_delete = self.get_object(user_id)
+        if user_profile_to_delete is None:
+            return Response({"error": "UserProfile not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Prevent admin from deleting themselves
+        if user_profile_to_delete == request.validated_user:
+            logger.warning(f"Admin user {request.validated_user.username} attempted to delete themselves via API.")
+            return Response({"error": "Admin users cannot delete themselves via the API."}, status=status.HTTP_400_BAD_REQUEST)
+
+        username_for_log = user_profile_to_delete.username
+        user_profile_to_delete.delete()
+
+        AuditLog.objects.create(
+            action='userprofile_delete',
+            user=request.validated_user, # The admin performing the action
+            object_id=user_id, 
+            object_type='UserProfile',
+            details={'deleted_user_id': user_id, 'deleted_username': username_for_log}
+        )
+        logger.info(f"UserProfile {user_id} ({username_for_log}) deleted by admin {request.validated_user.username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+# def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
+#     """
 
 #     Args:
 #         audio_url (str): URL of the audio file.
@@ -604,6 +1249,113 @@ class AuditLogView(APIView):
         except Exception as e:
             logger.error(f"Error fetching audit logs: {str(e)}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class SessionDetailView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def get_object_and_check_permission(self, session_id, user, check_ownership_for_write=False):
+        try:
+            session = Session.objects.select_related('user', 'sop').prefetch_related('audio_files', 'session_users__user').get(pk=session_id)
+        except Session.DoesNotExist:
+            logger.info(f"Session with id {session_id} not found.")
+            return None
+
+        # Admin can do anything
+        if user.role == 'admin':
+            return session
+
+        is_owner = (session.user == user)
+        is_participant = SessionUser.objects.filter(session=session, user=user).exists()
+        
+        # For write operations (PUT, PATCH, DELETE), only owner (Operator) or Admin can proceed
+        if check_ownership_for_write:
+            if user.role == 'operator' and is_owner:
+                return session
+            else: # Admin case already handled, so this denies non-owner operators and all reviewers
+                logger.warning(f"Write permission denied for user {user.username} (role: {user.role}) on Session {session_id}. Not owner.")
+                return None 
+        
+        # For read operations (GET)
+        if user.role == 'operator':
+            if is_owner or is_participant:
+                return session
+        elif user.role == 'reviewer':
+            # Reviewers can retrieve sessions they are a participant in OR are assigned to review via FeedbackReview
+            # (Assuming FeedbackReview links a reviewer to a session)
+            # For now, let's stick to participant status for reviewers as well, or if they have reviewed it.
+            # is_reviewer_for_session = FeedbackReview.objects.filter(session=session, reviewer=user).exists()
+            if is_participant: #  or is_reviewer_for_session:
+                return session
+        
+        logger.warning(f"Read permission denied for user {user.username} (role: {user.role}) on Session {session_id}.")
+        return None
+
+
+    def get(self, request, session_id, token):
+        user = request.validated_user # Set by RoleBasedPermission
+        session = self.get_object_and_check_permission(session_id, user, check_ownership_for_write=False)
+        
+        if session is None:
+            return Response({"error": "Session not found or permission denied."}, status=status.HTTP_404_NOT_FOUND)
+        
+        serializer = SessionSerializer(session)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def put(self, request, session_id, token):
+        return self._update_handler(request, session_id, token, partial=False)
+
+    def patch(self, request, session_id, token):
+        return self._update_handler(request, session_id, token, partial=True)
+
+    def _update_handler(self, request, session_id, token, partial):
+        user = request.validated_user
+        session = self.get_object_and_check_permission(session_id, user, check_ownership_for_write=True)
+
+        if session is None:
+            return Response({"error": "Session not found or permission denied for update."}, status=status.HTTP_403_FORBIDDEN) # 403 for permission issue
+
+        # Prevent 'user' (owner) from being changed
+        if 'user' in request.data or 'user_id' in request.data:
+            logger.warning(f"User {user.username} attempt to change session owner denied for session {session_id}.")
+            return Response({"error": "Session owner cannot be changed."}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = SessionSerializer(session, data=request.data, partial=partial)
+        if serializer.is_valid():
+            updated_session = serializer.save()
+            AuditLog.objects.create(
+                action='session_update',
+                user=user,
+                session=updated_session,
+                object_id=updated_session.id,
+                object_type='Session',
+                details={'updated_fields': list(request.data.keys())}
+            )
+            logger.info(f"Session {updated_session.id} updated by user {user.username}")
+            return Response(SessionSerializer(updated_session).data, status=status.HTTP_200_OK)
+        logger.error(f"Error updating session {session_id}: {serializer.errors}")
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+    def delete(self, request, session_id, token):
+        user = request.validated_user
+        session = self.get_object_and_check_permission(session_id, user, check_ownership_for_write=True)
+
+        if session is None:
+            return Response({"error": "Session not found or permission denied for deletion."}, status=status.HTTP_403_FORBIDDEN) # 403 for permission
+
+        session_name_for_log = session.name
+        session.delete()
+
+        AuditLog.objects.create(
+            action='session_delete',
+            user=user,
+            # session field in AuditLog might be an issue if it's set to CASCADE on SessionUser etc.
+            # For now, we log object_id and type. If session object itself is needed, consider how.
+            object_id=session_id, 
+            object_type='Session',
+            details={'name': session_name_for_log}
+        )
+        logger.info(f"Session {session_id} named '{session_name_for_log}' deleted by user {user.username}")
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class SessionStatusUpdateView(APIView):

@@ -59,6 +59,10 @@ class Feedback(models.Model):
     audio_file = models.ForeignKey(AudioFile, on_delete=models.CASCADE)
     feedback = models.CharField(max_length=50)  # complete, incomplete, needs review
     comments = models.TextField(null=True, blank=True)
+    created_by = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='feedbacks_submitted')
+    created_at = models.DateTimeField(auto_now_add=True, null=True) # Add default for existing rows
+    updated_at = models.DateTimeField(auto_now=True, null=True) # Add default for existing rows
+
 
     def __str__(self):
         return f"Feedback for {self.audio_file.id}"
@@ -141,8 +145,18 @@ class AuditLog(models.Model):
         ('feedback_submit', 'Feedback Submit'),
         ('sop_create', 'SOP Create'),
         ('sop_update', 'SOP Update'),
+        ('sop_delete', 'SOP Delete'), 
+        ('audiofile_delete', 'AudioFile Delete'),
+        ('feedback_update', 'Feedback Update'),
+        ('feedback_delete', 'Feedback Delete'),
         ('review_submit', 'Review Submit'),
+        ('feedbackreview_update', 'FeedbackReview Update'), 
+        ('feedbackreview_delete', 'FeedbackReview Delete'), 
+        ('userprofile_update', 'UserProfile Update'), # Added UserProfile Update
+        ('userprofile_delete', 'UserProfile Delete'), # Added UserProfile Delete
         ('session_status_update', 'Session Status Update'),
+        ('session_update', 'Session Update'), 
+        ('session_delete', 'Session Delete'), 
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')

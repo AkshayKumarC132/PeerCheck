@@ -20,6 +20,27 @@ class UserProfileSerializer(serializers.ModelSerializer):
         user.save()
         return user
 
+class AdminUserProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = UserProfile
+        fields = [
+            'id', 'username', 'email', 'name', 'role', 
+            'is_active', 'is_staff', 
+            'theme', # Theme can be viewed by admin
+            'date_joined', 'last_login' 
+        ]
+        read_only_fields = ['date_joined', 'last_login', 'theme'] # Admin cannot change theme directly
+
+    def update(self, instance, validated_data):
+        # Password should not be updated here by admin; use a separate mechanism if needed.
+        validated_data.pop('password', None) 
+        
+        # Ensure role is valid if provided
+        if 'role' in validated_data and validated_data['role'] not in [choice[0] for choice in UserProfile.ROLE_CHOICES]:
+            raise serializers.ValidationError({'role': 'Invalid role selected.'})
+
+        return super().update(instance, validated_data)
+
 class UserSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserSettings
@@ -43,6 +64,8 @@ class LoginSerializer(serializers.Serializer):
     password = serializers.CharField()
 
 class SOPStepSerializer(serializers.ModelSerializer):
+    id = serializers.IntegerField(required=False) # Allow id for updates
+
     class Meta:
         model = SOPStep
         fields = ['id', 'step_number', 'instruction_text', 'expected_keywords']
@@ -61,6 +84,44 @@ class SOPSerializer(serializers.ModelSerializer):
             SOPStep.objects.create(sop=sop, **step_data)
         return sop
 
+    def update(self, instance, validated_data):
+        steps_data = validated_data.pop('steps', [])
+        
+        # Update SOP instance fields
+        instance.name = validated_data.get('name', instance.name)
+        instance.version = validated_data.get('version', instance.version)
+        # created_by should generally not be updated, but if it's part of validated_data, handle it
+        instance.created_by = validated_data.get('created_by', instance.created_by)
+        instance.save()
+
+        # Handle nested SOPStep updates
+        existing_steps = {step.id: step for step in instance.steps.all()}
+        incoming_step_ids = set()
+
+        for step_data in steps_data:
+            step_id = step_data.get('id')
+            if step_id: # If ID is provided, it's an existing step to update
+                incoming_step_ids.add(step_id)
+                if step_id in existing_steps:
+                    step_instance = existing_steps[step_id]
+                    step_instance.step_number = step_data.get('step_number', step_instance.step_number)
+                    step_instance.instruction_text = step_data.get('instruction_text', step_instance.instruction_text)
+                    step_instance.expected_keywords = step_data.get('expected_keywords', step_instance.expected_keywords)
+                    step_instance.save()
+                else:
+                    # Handle case where an ID is provided but doesn't exist (optional: raise error or create new)
+                    # For now, we'll assume valid IDs or create new if ID is not in existing_steps
+                    SOPStep.objects.create(sop=instance, **step_data) # Create if ID is new/invalid
+            else: # No ID, so create a new step
+                SOPStep.objects.create(sop=instance, **step_data)
+        
+        # Delete steps that are in existing_steps but not in incoming_step_ids
+        steps_to_delete_ids = set(existing_steps.keys()) - incoming_step_ids
+        for step_id_to_delete in steps_to_delete_ids:
+            SOPStep.objects.filter(id=step_id_to_delete).delete()
+            
+        return instance
+
     def validate(self, data):
         if not data.get('name'):
             raise serializers.ValidationError({"name": "This field is required."})
@@ -78,9 +139,17 @@ class AudioFileSerializer(serializers.ModelSerializer):
         fields = ['id', 'file_path', 'transcription', 'status', 'keywords_detected', 'duration', 'sop']
 
 class FeedbackSerializer(serializers.ModelSerializer):
+    created_by = UserProfileSerializer(read_only=True)
+    audio_file = AudioFileSerializer(read_only=True) # Make audio_file read-only for updates, set on create
+    audio_file_id = serializers.PrimaryKeyRelatedField(
+        queryset=AudioFile.objects.all(), source='audio_file', write_only=True
+    )
+
     class Meta:
         model = Feedback
-        fields = '__all__'
+        fields = ['id', 'audio_file', 'audio_file_id', 'feedback', 'comments', 'created_by', 'created_at', 'updated_at']
+        read_only_fields = ['created_by', 'created_at', 'updated_at']
+
 
 class ProcessAudioViewSerializer(serializers.Serializer):
     file = serializers.FileField(required=True)
@@ -126,27 +195,64 @@ class ProcessAudioViewSerializer(serializers.Serializer):
 
 class SessionSerializer(serializers.ModelSerializer):
     audio_files = AudioFileSerializer(many=True, read_only=True)
-    sop = SOPSerializer(read_only=True)
-    user = UserProfileSerializer(read_only=True)  # Add read_only serializer for user
+    # sop = SOPSerializer(read_only=True) # Keep original for GET display
+    user = UserProfileSerializer(read_only=True)
+    
     audio_file_ids = serializers.ListField(
         child=serializers.IntegerField(), write_only=True, required=False
     )
+    sop_id = serializers.PrimaryKeyRelatedField(
+        queryset=SOP.objects.all(), source='sop', write_only=True, required=False, allow_null=True
+    )
+    # To display SOP details in GET responses, but use sop_id for write operations
+    sop_details = SOPSerializer(source='sop', read_only=True)
+
 
     class Meta:
         model = Session
-        fields = ['id', 'name', 'user', 'sop', 'status', 'audio_files', 'audio_file_ids', 'created_at', 'updated_at']
+        fields = [
+            'id', 'name', 'user', 
+            'sop_details', # For reading SOP
+            'sop_id',      # For writing SOP
+            'status', 'audio_files', 
+            'audio_file_ids', 'created_at', 'updated_at'
+        ]
+        # 'sop' is implicitly handled by sop_details (read) and sop_id (write)
 
     def create(self, validated_data):
         audio_file_ids = validated_data.pop('audio_file_ids', [])
+        # sop instance is already set by PrimaryKeyRelatedField if sop_id is provided
         session = Session.objects.create(**validated_data)
         if audio_file_ids:
             audio_files = AudioFile.objects.filter(id__in=audio_file_ids)
             session.audio_files.set(audio_files)
         return session
 
+    def update(self, instance, validated_data):
+        instance.name = validated_data.get('name', instance.name)
+        instance.status = validated_data.get('status', instance.status)
+        
+        # Update SOP if sop_id is provided
+        if 'sop' in validated_data: # 'sop' will be the key due to source='sop' on sop_id field
+            instance.sop = validated_data.get('sop', instance.sop)
+
+        # Update audio files if audio_file_ids is provided
+        if 'audio_file_ids' in validated_data:
+            audio_file_ids = validated_data.pop('audio_file_ids', [])
+            if audio_file_ids is not None: # Check if it's explicitly provided (even if empty list)
+                audio_files = AudioFile.objects.filter(id__in=audio_file_ids)
+                instance.audio_files.set(audio_files)
+        
+        instance.save()
+        return instance
+
     def validate(self, data):
-        if not data.get('name'):
-            raise serializers.ValidationError({"name": "This field is required."})
+        # Name is required on create, but not necessarily on partial update
+        if self.instance is None and not data.get('name'): # Check if it's a create operation
+            raise serializers.ValidationError({"name": "This field is required for creating a session."})
+        
+        # If sop_id is provided, it's already validated by PrimaryKeyRelatedField
+        # If status is provided, it should be one of the valid choices (handled by model)
         return data
 
 class SessionUserSerializer(serializers.ModelSerializer):
@@ -177,3 +283,14 @@ class FeedbackReviewSerializer(serializers.ModelSerializer):
         reviewer_id = validated_data.pop('reviewer_id')
         validated_data['reviewer'] = UserProfile.objects.get(id=reviewer_id)
         return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        # Prevent reviewer and session from being changed during an update
+        validated_data.pop('reviewer_id', None) # Or raise error if present
+        validated_data.pop('reviewer', None)
+        validated_data.pop('session', None) # Or raise error if present
+
+        instance.comments = validated_data.get('comments', instance.comments)
+        instance.resolved_flag = validated_data.get('resolved_flag', instance.resolved_flag)
+        instance.save()
+        return instance

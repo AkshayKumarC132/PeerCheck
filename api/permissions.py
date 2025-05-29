@@ -38,20 +38,34 @@ class RoleBasedPermission(permissions.BasePermission):
             'operator': {
                 'sopcreateview': ['post'],
                 'soplistview': ['get'],
+                'sopdetailview': ['get', 'put', 'delete'], 
+                'audiofiledetailview': ['get', 'delete'],
                 'processaudioview': ['post'],
-                'feedbackview': ['post'],
+                'feedbackview': ['post'], 
+                'feedbacklistview': ['get'], 
+                'feedbackdetailview': ['get', 'put', 'patch', 'delete'], 
                 'getaudiorecordsview': ['get'],
                 'reanalyzeaudioview': ['post'],
                 'sessioncreateview': ['post'],
                 'sessionlistview': ['get'],
+                'sessiondetailview': ['get', 'put', 'patch', 'delete'], 
+                'feedbackreviewlistview': ['get'], # Added FeedbackReviewListView
+                'feedbackreviewdetailview': ['get'],      # Added FeedbackReviewDetailView (Operator GET only)
                 'usersettingsview': ['get', 'patch'],
-                'sessionstatusupdateview': ['patch'],
+                'sessionstatusupdateview': ['patch'], 
             },
             'reviewer': {
                 'soplistview': ['get'],
+                'sopdetailview': ['get'], 
+                'audiofiledetailview': ['get'],
+                'feedbacklistview': ['get'], 
+                'feedbackdetailview': ['get'], 
                 'getaudiorecordsview': ['get'],
                 'sessionlistview': ['get'],
-                'sessionreviewview': ['get', 'post'],
+                'sessiondetailview': ['get'], 
+                'sessionreviewview': ['get', 'post'], # Existing permission for creating reviews
+                'feedbackreviewlistview': ['get'], # Added FeedbackReviewListView
+                'feedbackreviewdetailview': ['get', 'put', 'patch', 'delete'], # Added FeedbackReviewDetailView
                 'auditlogview': ['get'],
             }
         }
