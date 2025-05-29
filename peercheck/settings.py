@@ -56,7 +56,9 @@ REST_FRAMEWORK = {
         'knox.auth.TokenAuthentication',  # Knox token-based authentication
         'rest_framework.authentication.SessionAuthentication',  # For sessions
         'rest_framework.authentication.BasicAuthentication',  # For basic auth
-    )
+    ),
+    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    'PAGE_SIZE': 10,
 }
 
 # Knox-specific settings

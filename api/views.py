@@ -15,6 +15,7 @@ from fuzzywuzzy import fuzz
 from Levenshtein import distance
 from .authentication import token_verification
 from .permissions import RoleBasedPermission
+from rest_framework.pagination import PageNumberPagination # Added for pagination
 import logging
 from django.db import models
 
@@ -270,8 +271,10 @@ class FeedbackListView(APIView):
             logger.warning(f"User {user.username} with unhandled role '{user.role}' attempted to list feedback.")
             return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
             
-        serializer = FeedbackSerializer(queryset, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        paginator = PageNumberPagination()
+        paginated_queryset = paginator.paginate_queryset(queryset, request, view=self)
+        serializer = FeedbackSerializer(paginated_queryset, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 class FeedbackDetailView(APIView):
     permission_classes = [RoleBasedPermission]
@@ -489,9 +492,13 @@ class GetAudioRecordsView(APIView):
                     sessions__session_users__user=user
                 ).distinct()
             audio_records = audio_records.order_by("-id")
-            serializer = AudioFileSerializer(audio_records, many=True)
-            return Response({"audio_records": serializer.data}, status=status.HTTP_200_OK)
+            
+            paginator = PageNumberPagination()
+            paginated_queryset = paginator.paginate_queryset(audio_records, request, view=self)
+            serializer = AudioFileSerializer(paginated_queryset, many=True)
+            return paginator.get_paginated_response(serializer.data)
         except Exception as e:
+            logger.error(f"Error fetching audio records with pagination: {str(e)}")
             return Response(
                 {"error": f"Error fetching audio records: {str(e)}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -610,18 +617,25 @@ class SOPListView(APIView):
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
 
         # request.validated_user is set by RoleBasedPermission
+        queryset = None
         if request.validated_user.role == 'admin':
-            sops = SOP.objects.all()
+            queryset = SOP.objects.all().order_by('-updated_at')
         elif request.validated_user.role == 'operator':
-            sops = SOP.objects.filter(created_by=request.validated_user)
+            queryset = SOP.objects.filter(created_by=request.validated_user).order_by('-updated_at')
         elif request.validated_user.role == 'reviewer':
             # Reviewers can see all SOPs for now, or define specific logic if needed
-            sops = SOP.objects.all()
+            queryset = SOP.objects.all().order_by('-updated_at')
         else:
             return Response({"error": "Forbidden"}, status=status.HTTP_403_FORBIDDEN)
 
-        serializer = SOPSerializer(sops, many=True)
-        return Response({'sops': serializer.data}, status=status.HTTP_200_OK)
+        paginator = PageNumberPagination()
+        paginated_queryset = paginator.paginate_queryset(queryset, request, view=self)
+        
+        # If paginated_queryset is None, it means pagination was not triggered (e.g. page query param not present, or allow_empty=False and queryset is empty)
+        # However, PageNumberPagination usually returns an empty list for empty querysets if page query param is present.
+        # For consistency, we serialize what paginate_queryset returns.
+        serializer = SOPSerializer(paginated_queryset, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 class SOPDetailView(APIView):
     permission_classes = [RoleBasedPermission]
@@ -728,10 +742,13 @@ class SessionListView(APIView):
             else:
                 sessions = Session.objects.filter(user=user_data['user'])
             sessions = sessions.order_by("-created_at")
-            serializer = SessionSerializer(sessions, many=True)
-            return Response({'sessions': serializer.data}, status=status.HTTP_200_OK)
+            
+            paginator = PageNumberPagination()
+            paginated_queryset = paginator.paginate_queryset(sessions, request, view=self)
+            serializer = SessionSerializer(paginated_queryset, many=True)
+            return paginator.get_paginated_response(serializer.data)
         except Exception as e:
-            logger.error(f"Error fetching sessions: {str(e)}")
+            logger.error(f"Error fetching sessions with pagination: {str(e)}")
             return Response({"error": f"Error fetching sessions: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
 
@@ -814,8 +831,10 @@ class FeedbackReviewListView(APIView):
             logger.warning(f"User {user.username} with unhandled role '{user.role}' attempted to list feedback reviews.")
             return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
             
-        serializer = FeedbackReviewSerializer(queryset, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        paginator = PageNumberPagination()
+        paginated_queryset = paginator.paginate_queryset(queryset, request, view=self)
+        serializer = FeedbackReviewSerializer(paginated_queryset, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 class FeedbackReviewDetailView(APIView):
     permission_classes = [RoleBasedPermission]
@@ -939,6 +958,38 @@ class FeedbackReviewDetailView(APIView):
 # def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
 #     """
 #     Transcribes audio with Vosk and includes speaker diarization.
+
+class AdminDashboardSummaryView(APIView):
+    permission_classes = [RoleBasedPermission] # Ensures admin-only access
+
+    def get(self, request, token):
+        # request.validated_user is set by RoleBasedPermission
+        # The permission class should ensure only admins can reach this point.
+        # A redundant check for defense in depth:
+        if request.validated_user.role != 'admin':
+            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            total_users = UserProfile.objects.count()
+            total_sops = SOP.objects.count()
+            active_sessions = Session.objects.filter(status='active').count()
+            # Assuming FeedbackReview is the correct model for "pending reviews"
+            # and 'resolved_flag=False' means it's pending.
+            pending_reviews = FeedbackReview.objects.filter(resolved_flag=False).count()
+
+            data = {
+                "total_users": total_users,
+                "total_sops": total_sops,
+                "active_sessions": active_sessions,
+                "pending_reviews": pending_reviews
+            }
+            return Response(data, status=status.HTTP_200_OK)
+        except Exception as e:
+            logger.error(f"Error generating admin dashboard summary: {str(e)}")
+            return Response({"error": "An error occurred while generating the summary."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+# def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
+#     """
 #
 #     Args:
 #         audio_url (str): URL of the audio file.
@@ -1020,8 +1071,12 @@ class AdminUserListView(APIView):
             return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
 
         users = UserProfile.objects.all().order_by('id')
-        serializer = AdminUserProfileSerializer(users, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)
+        
+        paginator = PageNumberPagination()
+        paginated_queryset = paginator.paginate_queryset(users, request, view=self)
+        # AdminUserProfileSerializer is already imported in the original file if this view exists
+        serializer = AdminUserProfileSerializer(paginated_queryset, many=True)
+        return paginator.get_paginated_response(serializer.data)
 
 class AdminUserDetailView(APIView):
     permission_classes = [RoleBasedPermission] # Ensures admin-only access
@@ -1244,10 +1299,13 @@ class AuditLogView(APIView):
         logger.info(f"Fetching audit logs for user: {request.validated_user.username}")
         try:
             logs = AuditLog.objects.all().order_by('-timestamp')
-            serializer = AuditLogSerializer(logs, many=True)
-            return Response({'audit_logs': serializer.data}, status=status.HTTP_200_OK)
+            
+            paginator = PageNumberPagination()
+            paginated_queryset = paginator.paginate_queryset(logs, request, view=self)
+            serializer = AuditLogSerializer(paginated_queryset, many=True)
+            return paginator.get_paginated_response(serializer.data)
         except Exception as e:
-            logger.error(f"Error fetching audit logs: {str(e)}")
+            logger.error(f"Error fetching audit logs with pagination: {str(e)}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 class SessionDetailView(APIView):
