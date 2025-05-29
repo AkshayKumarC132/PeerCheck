@@ -71,11 +71,12 @@ class SOPSerializer(serializers.ModelSerializer):
         return data
 
 class AudioFileSerializer(serializers.ModelSerializer):
-    sop = SOPSerializer(read_only=True)
+    session = serializers.PrimaryKeyRelatedField(queryset=Session.objects.all(), allow_null=True, required=False)
+    speaker_tag = serializers.CharField(max_length=100, allow_null=True, required=False)
 
     class Meta:
         model = AudioFile
-        fields = ['id', 'file_path', 'transcription', 'status', 'keywords_detected', 'duration', 'sop']
+        fields = ['id', 'file_path', 'transcription', 'status', 'keywords_detected', 'duration', 'session', 'speaker_tag']
 
 class FeedbackSerializer(serializers.ModelSerializer):
     class Meta:
@@ -125,23 +126,46 @@ class ProcessAudioViewSerializer(serializers.Serializer):
         return value
 
 class SessionSerializer(serializers.ModelSerializer):
+    created_by = UserProfileSerializer(read_only=True)
+    sop = SOPSerializer(read_only=True) # SOP can be optional for a session initially
+    status = serializers.CharField(read_only=True) # Or ChoiceField if you want to validate against choices
     audio_files = AudioFileSerializer(many=True, read_only=True)
-    sop = SOPSerializer(read_only=True)
-    user = UserProfileSerializer(read_only=True)  # Add read_only serializer for user
-    audio_file_ids = serializers.ListField(
-        child=serializers.IntegerField(), write_only=True, required=False
-    )
+    session_users = serializers.SerializerMethodField(read_only=True) # Updated to SerializerMethodField
+    feedback_reviews = serializers.SerializerMethodField(read_only=True) # Updated to SerializerMethodField
 
     class Meta:
         model = Session
-        fields = ['id', 'name', 'user', 'sop', 'audio_files', 'audio_file_ids', 'created_at', 'updated_at']
+        fields = [
+            'id', 'name', 'created_by', 'sop', 'status', 
+            'audio_files', 'session_users', 'feedback_reviews',
+            'created_at', 'updated_at'
+        ]
 
+    def get_session_users(self, obj):
+        # Assuming 'session_users' is the related_name from SessionUser to Session
+        # If SessionUser model does not have a direct relation from Session model like 'session_users'
+        # you might need to fetch them differently, e.g. SessionUser.objects.filter(session=obj)
+        # For now, assuming related_name='session_users' on SessionUser.session ForeignKey
+        # or if that is not the case, and SessionUser model has session_users as related_name on Session.
+        # Let's check the SessionUser model again.
+        # SessionUser has session = ForeignKey(Session, related_name='session_users')
+        # So, obj.session_users.all() should work.
+        session_users_queryset = obj.session_users.all()
+        return SessionUserSerializer(session_users_queryset, many=True).data
+
+    def get_feedback_reviews(self, obj):
+        # Similar to session_users, assuming related_name='feedback_reviews'
+        # on FeedbackReview.session ForeignKey.
+        # FeedbackReview has session = ForeignKey(Session, related_name='feedback_reviews')
+        # So, obj.feedback_reviews.all() should work.
+        feedback_reviews_queryset = obj.feedback_reviews.all()
+        return FeedbackReviewSerializer(feedback_reviews_queryset, many=True).data
+    
     def create(self, validated_data):
-        audio_file_ids = validated_data.pop('audio_file_ids', [])
+        # Audio files are linked via their own serializer/view by setting their 'session' FK
+        # SessionUsers are created separately
+        # FeedbackReviews are created separately
         session = Session.objects.create(**validated_data)
-        if audio_file_ids:
-            audio_files = AudioFile.objects.filter(id__in=audio_file_ids)
-            session.audio_files.set(audio_files)
         return session
 
     def validate(self, data):

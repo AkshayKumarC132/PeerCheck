@@ -4,16 +4,16 @@ from django.contrib.auth.models import AbstractUser
 
 class UserProfile(AbstractUser):
     ROLE_CHOICES = (
+        ('operator', 'Operator'),
+        ('reviewer', 'Reviewer'),
         ('admin', 'Admin'),
-        ('user', 'User'),
-        ('auditor', 'Auditor'),
     )
     id = models.AutoField(primary_key=True, db_column='user_id')
     name = models.CharField(max_length=100, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     theme = models.CharField(max_length=50, default="light")
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='user')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='operator')
 
     class Meta:
         db_table = "user_profile"
@@ -48,7 +48,8 @@ class AudioFile(models.Model):
     status = models.CharField(max_length=50, default="pending")  # pending, processed
     keywords_detected = models.TextField(null=True, blank=True)
     duration = models.FloatField(null=True, blank=True)  # Duration in seconds
-    sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files')
+    session = models.ForeignKey('Session', on_delete=models.CASCADE, related_name='audio_files', null=True, blank=True)
+    speaker_tag = models.CharField(max_length=100, null=True, blank=True)
 
     def __str__(self):
         return self.file_path
@@ -76,14 +77,14 @@ class KnoxAuthtoken(models.Model):
 
 class Session(models.Model):
     name = models.CharField(max_length=255)
-    user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='sessions')
+    created_by = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='created_sessions')
     sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='sessions')
-    audio_files = models.ManyToManyField(AudioFile, related_name='sessions', blank=True)
+    status = models.CharField(max_length=20, choices=(('active', 'Active'), ('archived', 'Archived'), ('under_review', 'Under Review')), default='active')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.name} by {self.user.username}"
+        return f"{self.name} by {self.created_by.username}"
     
 class SessionUser(models.Model):
     session = models.ForeignKey(Session, on_delete=models.CASCADE, related_name='session_users')
@@ -142,8 +143,13 @@ class AuditLog(models.Model):
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
     timestamp = models.DateTimeField(auto_now_add=True)
     session = models.ForeignKey(Session, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
-    object_id = models.IntegerField()
-    object_type = models.CharField(max_length=50)  # e.g., AudioFile, SOP, FeedbackReview
+    # object_id is no longer needed if we are linking directly to objects,
+    # but let's keep it for now for other potential non-session related logs or for generic linking.
+    # If it's exclusively for session-related entities that are linked via FKs in their respective models,
+    # then object_id and object_type might become redundant for those specific logs.
+    # For this iteration, we are only changing session_id to a ForeignKey.
+    object_id = models.IntegerField(null=True, blank=True) # Allow null if not always applicable
+    object_type = models.CharField(max_length=50, null=True, blank=True) # Allow null if not always applicable
     details = models.JSONField(default=dict)  # Additional context
 
     def __str__(self):

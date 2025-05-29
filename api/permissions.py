@@ -35,25 +35,44 @@ class RoleBasedPermission(permissions.BasePermission):
 
         # Define permissions per role
         permissions = {
-            'user': {
-                'sopcreateview': ['post'],
-                'soplistview': ['get'],
+            'operator': {
                 'processaudioview': ['post'],
-                'feedbackview': ['post'],
-                'getaudiorecordsview': ['get'],
-                'reanalyzeaudioview': ['post'],
                 'sessioncreateview': ['post'],
                 'sessionlistview': ['get'],
-                'usersettingsview': ['get', 'patch'],
-            },
-            'auditor': {
                 'soplistview': ['get'],
+                'usersettingsview': ['get', 'patch'],
+                'feedbackview': ['post'], # Retained as per instruction
                 'getaudiorecordsview': ['get'],
+                'reanalyzeaudioview': ['post'],
+                # SOPCreateView is admin only now
+            },
+            'reviewer': {
                 'sessionlistview': ['get'],
                 'sessionreviewview': ['get', 'post'],
+                'soplistview': ['get'],
+                'getaudiorecordsview': ['get'], # Access to relevant records
+                'usersettingsview': ['get', 'patch'],
                 'auditlogview': ['get'],
             }
+            # Admin specific views like sopcreateview, systemsettingsview, full auditlogview
+            # are covered by the "if role == 'admin': return True" check.
+            # If more granular control for admin is needed below this block,
+            # it can be added, but typically admin has all permissions not explicitly denied.
         }
+
+        # Specific views for admin not covered by operator/reviewer roles explicitly listed
+        # This is mostly for documentation or if the admin check was more nuanced.
+        # Given the current "return True" for admin, this section is not strictly necessary for functionality
+        # but helps in defining what an admin *can* do if that logic were different.
+        if role == 'admin':
+            admin_permissions = {
+                'sopcreateview': ['post', 'get'], # get is usually via soplistview
+                'systemsettingsview': ['get', 'patch'],
+                'auditlogview': ['get'], # Already in reviewer, but admin also has it
+                # Plus all operator and reviewer permissions
+            }
+            # Merge admin specific perms if needed, or rely on the blanket True
+            # For now, the blanket True for admin covers these.
 
         allowed_methods = permissions.get(role, {}).get(view_name, [])
         is_allowed = method in allowed_methods

@@ -33,10 +33,19 @@ class RegisterView(generics.CreateAPIView):
         username = data['username']
         email = data['email']
         password = data['password']
-        role = data.get('role', 'user')  # Default to 'user'
-
+        # Default to 'operator' if role is not provided or is invalid
+        role = data.get('role', 'operator')
         if role not in dict(UserProfile.ROLE_CHOICES):
-            raise serializers.ValidationError({"error": f"Invalid role: {role}"})
+            # If an invalid role is provided, default to 'operator'
+            # Or, raise an error if strict role assignment is required.
+            # For now, let's default to 'operator' as per "defaulting to 'operator' if not provided or if the provided role is invalid"
+            role = 'operator' 
+            # Alternatively, to be strict:
+            # raise serializers.ValidationError({"error": f"Invalid role: {role}. Valid roles are: {dict(UserProfile.ROLE_CHOICES).keys()}"})
+
+        # This check is now handled by defaulting above, but if we were strict, it would be:
+        # if role not in dict(UserProfile.ROLE_CHOICES):
+        #     raise serializers.ValidationError({"error": f"Invalid role: {role}"})
 
         # Check if email already exists
         if UserProfile.objects.filter(email=email).exists():
