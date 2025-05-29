@@ -16,6 +16,7 @@ from Levenshtein import distance
 from .authentication import token_verification
 from .permissions import RoleBasedPermission
 import logging
+from django.db import models
 
 logger = logging.getLogger(__name__)
 
@@ -236,13 +237,19 @@ class GetAudioRecordsView(APIView):
         user_data = token_verification(token)
         if user_data['status'] != 200:
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
-        
+        user = user_data['user']
         try:
             # audio_records = AudioFile.objects.all().order_by("-id")
             if user_data['user'].role == 'admin':
                 audio_records = AudioFile.objects.all()
-            else:
-                audio_records = AudioFile.objects.filter(user=user_data['user'])
+            elif user.role == 'operator':
+                audio_records = AudioFile.objects.filter(
+                    models.Q(user=user) | models.Q(sessions__user=user)
+                ).distinct()
+            else:  # reviewer
+                audio_records = AudioFile.objects.filter(
+                    sessions__session_users__user=user
+                ).distinct()
             audio_records = audio_records.order_by("-id")
             serializer = AudioFileSerializer(audio_records, many=True)
             return Response({"audio_records": serializer.data}, status=status.HTTP_200_OK)
