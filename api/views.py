@@ -1041,10 +1041,49 @@ class SOPListView(APIView):
     Retrieves a list of Standard Operating Procedures (SOPs).
     Supports pagination and role-based filtering.
     """
-    permission_classes = [RoleBasedPermission] # Already defined
+    permission_classes = [RoleBasedPermission]
 
-    # get method already decorated in previous step (pagination)
-    # No changes needed for SOPListView.get other than what was done for pagination
+    @extend_schema(
+        summary="List SOPs",
+        description="Fetches a paginated list of SOPs. Includes the username of the creator along with the created_by field.",
+        parameters=[
+            OpenApiParameter('token', OpenApiTypes.STR, OpenApiParameter.PATH, description='Authentication token.'),
+            OpenApiParameter('page', OpenApiTypes.INT, OpenApiParameter.QUERY, description='Page number for pagination.'),
+        ],
+        responses={
+            200: SOPSerializer(many=True),  # Actual response is paginated
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+        },
+        tags=['SOP']
+    )
+    def get(self, request, token, format=None):
+        """
+        Lists SOPs with pagination.
+        Includes the username of the creator in the response.
+        """
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            sops = SOP.objects.all().select_related('created_by').order_by('-created_at')  # Use select_related for optimization
+            paginator = PageNumberPagination()
+            paginated_queryset = paginator.paginate_queryset(sops, request, view=self)
+
+            # Add username to the response
+            response_data = [
+                {
+                    **SOPSerializer(sop).data,
+                    "created_by_username": sop.created_by.username if sop.created_by else None
+                }
+                for sop in paginated_queryset
+            ]
+
+            return paginator.get_paginated_response(response_data)
+        except Exception as e:
+            logger.error(f"Error fetching SOPs with pagination: {str(e)}")
+            return Response({"error": f"Error fetching SOPs: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
 class SOPDetailView(APIView):
     """
