@@ -1,6 +1,7 @@
 import os
 import uuid
 import boto3
+from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
@@ -99,13 +100,35 @@ class ProcessAudioView(CreateAPIView):
 
         if session_id and session_user_ids:
             try:
-                session = Session.objects.get(id=session_id, user=user_data['user'])
-                for user_id in session_user_ids:
-                    su, created = SessionUser.objects.get_or_create(session=session, user_id=user_id)
+                session_instance = Session.objects.get(id=session_id, user=user_data['user']) # Renamed to avoid conflict later
+                
+                # Ensure SessionUser entries exist for all provided user_ids
+                # Convert session_user_ids to int if they are strings
+                processed_user_ids = []
+                for user_id_str in session_user_ids:
+                    try:
+                        processed_user_ids.append(int(user_id_str))
+                    except ValueError:
+                        logger.error(f"Invalid user_id format in session_user_ids: {user_id_str}")
+                        return Response({"error": f"Invalid user_id format: {user_id_str}"}, status=status.HTTP_400_BAD_REQUEST)
+
+                for user_id_val in processed_user_ids:
+                    su, created = SessionUser.objects.get_or_create(session=session_instance, user_id=user_id_val)
                     if created:
-                        logger.info(f"Created SessionUser: user_id={user_id}, session_id={session_id}")
+                        logger.info(f"Created SessionUser: user_id={user_id_val}, session_id={session_instance.id}")
                     else:
-                        logger.info(f"SessionUser already exists: user_id={user_id}, session_id={session_id}")
+                        logger.info(f"SessionUser already exists: user_id={user_id_val}, session_id={session_instance.id}")
+                
+                # Assign speaker tags based on the order of session_user_ids, fetched by created_at
+                # This order matches the one used in transcribe_with_speaker_diarization
+                actual_session_users = SessionUser.objects.filter(session=session_instance, user_id__in=processed_user_ids).order_by('created_at')
+                for idx, su_instance in enumerate(actual_session_users):
+                    tag = f"Speaker_{idx + 1}"
+                    if su_instance.speaker_tag != tag: # Only update if different or not set
+                        su_instance.speaker_tag = tag
+                        su_instance.save()
+                        logger.info(f"Assigned speaker_tag '{tag}' to user {su_instance.user.username} in session {session_instance.id}")
+
             except Session.DoesNotExist:
                 logger.error(f"Session not found: ID {session_id}")
                 return Response({"error": "Session not found"}, status=status.HTTP_404_NOT_FOUND)
@@ -410,7 +433,16 @@ class SessionReviewView(APIView):
             data['session'] = session.id
             serializer = FeedbackReviewSerializer(data=data)
             if serializer.is_valid():
-                serializer.save()
+                feedback_review = serializer.save() # Assign to variable
+                # Log audit for FeedbackReview submission
+                AuditLog.objects.create(
+                    action='review_submit',
+                    user=request.validated_user,
+                    session=session,
+                    object_id=feedback_review.id,
+                    object_type='FeedbackReview',
+                    details={'reviewer_comments_length': len(feedback_review.comments if feedback_review.comments else "")}
+                )
                 logger.info("Feedback review submitted successfully")
                 return Response(serializer.data, status=status.HTTP_201_CREATED)
             logger.error(f"Feedback review submission failed: {serializer.errors}")
@@ -563,3 +595,41 @@ class AuditLogView(APIView):
         except Exception as e:
             logger.error(f"Error fetching audit logs: {str(e)}")
             return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SessionStatusUpdateView(APIView):
+    permission_classes = [RoleBasedPermission]
+
+    def patch(self, request, session_id, token, format=None):
+        # request.validated_user is set by RoleBasedPermission
+        user = request.validated_user
+        
+        session_obj = get_object_or_404(Session, id=session_id) # Renamed to avoid conflict
+        requested_status = request.data.get('status')
+
+        if not requested_status or requested_status not in [choice[0] for choice in Session.STATUS_CHOICES]:
+            return Response({'error': f"Invalid status value. Must be one of: {[choice[0] for choice in Session.STATUS_CHOICES]}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if user.role == 'operator' and session_obj.user != user:
+            logger.warning(f"Permission denied: Operator {user.username} trying to update session {session_obj.id} owned by {session_obj.user.username}")
+            return Response({'error': 'Permission denied. Operators can only update their own sessions.'}, status=status.HTTP_403_FORBIDDEN)
+
+        old_status = session_obj.status # Capture status before update
+
+        # If admin, or operator owns the session, proceed with update
+        session_obj.status = requested_status
+        session_obj.save()
+        
+        # Log audit
+        AuditLog.objects.create(
+            action='session_status_update',
+            user=user,
+            session=session_obj, # Use the retrieved session object
+            object_id=session_obj.id,
+            object_type='Session',
+            details={'previous_status': old_status, 'new_status': requested_status}
+        )
+        
+        logger.info(f"Session {session_obj.id} status updated to {requested_status} by user {user.username}")
+        serializer = SessionSerializer(session_obj) # Use the retrieved session object
+        return Response(serializer.data, status=status.HTTP_200_OK)

@@ -5,15 +5,15 @@ from django.contrib.auth.models import AbstractUser
 class UserProfile(AbstractUser):
     ROLE_CHOICES = (
         ('admin', 'Admin'),
-        ('user', 'User'),
-        ('auditor', 'Auditor'),
+        ('operator', 'Operator'),
+        ('reviewer', 'Reviewer'),
     )
     id = models.AutoField(primary_key=True, db_column='user_id')
     name = models.CharField(max_length=100, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     theme = models.CharField(max_length=50, default="light")
-    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='user')
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='operator')
 
     class Meta:
         db_table = "user_profile"
@@ -79,6 +79,11 @@ class Session(models.Model):
     user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='sessions')
     sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='sessions')
     audio_files = models.ManyToManyField(AudioFile, related_name='sessions', blank=True)
+    STATUS_CHOICES = (
+        ('active', 'Active'),
+        ('archived', 'Archived'),
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='active')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -137,6 +142,7 @@ class AuditLog(models.Model):
         ('sop_create', 'SOP Create'),
         ('sop_update', 'SOP Update'),
         ('review_submit', 'Review Submit'),
+        ('session_status_update', 'Session Status Update'),
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')

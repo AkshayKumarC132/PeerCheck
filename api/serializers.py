@@ -134,7 +134,7 @@ class SessionSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Session
-        fields = ['id', 'name', 'user', 'sop', 'audio_files', 'audio_file_ids', 'created_at', 'updated_at']
+        fields = ['id', 'name', 'user', 'sop', 'status', 'audio_files', 'audio_file_ids', 'created_at', 'updated_at']
 
     def create(self, validated_data):
         audio_file_ids = validated_data.pop('audio_file_ids', [])

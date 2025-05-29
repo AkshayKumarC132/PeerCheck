@@ -35,7 +35,7 @@ class RoleBasedPermission(permissions.BasePermission):
 
         # Define permissions per role
         permissions = {
-            'user': {
+            'operator': {
                 'sopcreateview': ['post'],
                 'soplistview': ['get'],
                 'processaudioview': ['post'],
@@ -45,8 +45,9 @@ class RoleBasedPermission(permissions.BasePermission):
                 'sessioncreateview': ['post'],
                 'sessionlistview': ['get'],
                 'usersettingsview': ['get', 'patch'],
+                'sessionstatusupdateview': ['patch'],
             },
-            'auditor': {
+            'reviewer': {
                 'soplistview': ['get'],
                 'getaudiorecordsview': ['get'],
                 'sessionlistview': ['get'],
