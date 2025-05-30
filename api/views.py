@@ -113,6 +113,26 @@ class ProcessAudioView(CreateAPIView):
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
         print(f"User data: {user_data}"
               f"Request data: {request.data}")
+        
+        # Parse the session_user_ids field if it's a string
+        session_user_ids = request.data.get("session_user_ids", None)
+        if session_user_ids:
+            if isinstance(session_user_ids, str):
+                try:
+                    # Only parse if it's a string
+                    session_user_ids = json.loads(session_user_ids)
+                    print(f"Parsed session_user_ids: {session_user_ids}")
+                except json.JSONDecodeError:
+                    return Response({'error': 'Invalid JSON format for session_user_ids.'}, status=status.HTTP_400_BAD_REQUEST)
+            elif isinstance(session_user_ids, dict):
+                # If it's already a dictionary, just use it as is
+                session_user_ids = session_user_ids.get("userIds", [])
+                print(f"Using provided session_user_ids: {session_user_ids}")
+            else:
+                return Response({'error': 'Invalid format for session_user_ids. Must be a JSON object or dictionary.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            session_user_ids = None
+
         serializer = ProcessAudioViewSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -123,7 +143,9 @@ class ProcessAudioView(CreateAPIView):
         keywords = request.data.get("keywords", "")
         sop_id = request.data.get("sop_id") 
         session_id = serializer.validated_data.get("session_id")
-        session_user_ids = serializer.validated_data.get("session_user_ids", [])
+        # session_user_ids = serializer.validated_data.get("session_user_ids", [])
+
+        print(f"Session ID: {session_id}, Session User IDs: {session_user_ids}")
 
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
@@ -159,7 +181,8 @@ class ProcessAudioView(CreateAPIView):
                 # Ensure SessionUser entries exist for all provided user_ids
                 # Convert session_user_ids to int if they are strings
                 processed_user_ids = []
-                for user_id_str in session_user_ids:
+                for user_id_str in session_user_ids.get("userIds", []):  # Extract list from dictionary
+                    print(f"Processing user_id: {user_id_str}")
                     try:
                         user_id_int = int(user_id_str)
                         # Verify user exists
@@ -1892,10 +1915,11 @@ class AdminUserListView(APIView):
 
     def get(self, request, token):
         # request.validated_user is set by RoleBasedPermission, confirming admin role
-        if request.validated_user.role != 'admin':
+        role = request.validated_user.role
+        if role not in ['admin', 'operator']:
              # This check is technically redundant if RoleBasedPermission is correctly configured
              # to only allow admins for views not specified for other roles, but good for defense in depth.
-            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"error": "Forbidden. Admin or operator access required."}, status=status.HTTP_403_FORBIDDEN)
 
         users = UserProfile.objects.all().order_by('id')
         

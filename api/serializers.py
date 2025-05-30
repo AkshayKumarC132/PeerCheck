@@ -86,11 +86,10 @@ class SOPSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         steps_data = validated_data.pop('steps', [])
-        
+
         # Update SOP instance fields
         instance.name = validated_data.get('name', instance.name)
         instance.version = validated_data.get('version', instance.version)
-        # created_by should generally not be updated, but if it's part of validated_data, handle it
         instance.created_by = validated_data.get('created_by', instance.created_by)
         instance.save()
 
@@ -100,26 +99,38 @@ class SOPSerializer(serializers.ModelSerializer):
 
         for step_data in steps_data:
             step_id = step_data.get('id')
-            if step_id: # If ID is provided, it's an existing step to update
+            step_number = step_data.get('step_number')
+
+            if step_id:  # If ID is provided, it's an existing step to update
                 incoming_step_ids.add(step_id)
                 if step_id in existing_steps:
                     step_instance = existing_steps[step_id]
+
+                    # Only check for duplicate step_number if it's being updated
+                    if step_instance.step_number != step_number:
+                        # Ensure no other step has the same step_number
+                        if SOPStep.objects.filter(sop=instance, step_number=step_number).exclude(id=step_instance.id).exists():
+                            raise serializers.ValidationError(f"Step number {step_number} already exists for this SOP.")
+
+                    # Update the existing step
                     step_instance.step_number = step_data.get('step_number', step_instance.step_number)
                     step_instance.instruction_text = step_data.get('instruction_text', step_instance.instruction_text)
                     step_instance.expected_keywords = step_data.get('expected_keywords', step_instance.expected_keywords)
                     step_instance.save()
                 else:
-                    # Handle case where an ID is provided but doesn't exist (optional: raise error or create new)
-                    # For now, we'll assume valid IDs or create new if ID is not in existing_steps
-                    SOPStep.objects.create(sop=instance, **step_data) # Create if ID is new/invalid
-            else: # No ID, so create a new step
+                    SOPStep.objects.create(sop=instance, **step_data)  # Create if ID is new/invalid
+            else:  # No ID, so create a new step
+                # Check for duplicate step_number within the same SOP
+                if SOPStep.objects.filter(sop=instance, step_number=step_number).exists():
+                    raise serializers.ValidationError(f"Step number {step_number} already exists for this SOP.")
+
                 SOPStep.objects.create(sop=instance, **step_data)
-        
+
         # Delete steps that are in existing_steps but not in incoming_step_ids
         steps_to_delete_ids = set(existing_steps.keys()) - incoming_step_ids
         for step_id_to_delete in steps_to_delete_ids:
             SOPStep.objects.filter(id=step_id_to_delete).delete()
-            
+
         return instance
 
     def validate(self, data):
@@ -150,6 +161,12 @@ class FeedbackSerializer(serializers.ModelSerializer):
         fields = ['id', 'audio_file', 'audio_file_id', 'feedback', 'comments', 'created_by', 'created_at', 'updated_at']
         read_only_fields = ['created_by', 'created_at', 'updated_at']
 
+class SessionUserIdsSerializer(serializers.Serializer):
+    userIds = serializers.ListField(
+        child=serializers.IntegerField(),
+        required=False,
+        default=[]
+    )
 
 class ProcessAudioViewSerializer(serializers.Serializer):
     file = serializers.FileField(required=True)
@@ -158,41 +175,65 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     start_prompt = serializers.CharField(required=False, allow_blank=True)
     end_prompt = serializers.CharField(required=False, allow_blank=True)
     keywords = serializers.CharField(required=False, allow_blank=True)
-    session_user_ids = serializers.CharField(required=False, allow_blank=True, default=[])
+    session_user_ids = SessionUserIdsSerializer(required=False)
 
     def validate_session_user_ids(self, value):
-        if value in [None, '', [], {}]:
+        # If the nested object is provided as a string, attempt to parse it
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)  # Parse the stringified JSON
+            except json.JSONDecodeError:
+                raise serializers.ValidationError("Invalid JSON format for session_user_ids.")
+        
+        # If value is None or an empty dictionary, return an empty list
+        if value is None:
             return []
-        # Handle form-data: value might be ["[2,5]"]
-        if isinstance(value, list) and value and isinstance(value[0], str):
-            try:
-                parsed_value = json.loads(value[0])
-                if not isinstance(parsed_value, list):
-                    raise serializers.ValidationError("session_user_ids must be a list of integers.")
-                value = [int(x) for x in parsed_value]
-            except json.JSONDecodeError:
-                try:
-                    parsed_value = ast.literal_eval(value[0])
-                    if not isinstance(parsed_value, list):
-                        raise serializers.ValidationError("session_user_ids must be a list of integers.")
-                    value = [int(x) for x in parsed_value]
-                except (ValueError, SyntaxError):
-                    raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
-        elif isinstance(value, str):
-            try:
-                parsed_value = json.loads(value)
-                if not isinstance(parsed_value, list):
-                    raise serializers.ValidationError("session_user_ids must be a list of integers.")
-                value = [int(x) for x in parsed_value]
-            except json.JSONDecodeError:
-                try:
-                    parsed_value = ast.literal_eval(value)
-                    if not isinstance(parsed_value, list):
-                        raise serializers.ValidationError("session_user_ids must be a list of integers.")
-                    value = [int(x) for x in parsed_value]
-                except (ValueError, SyntaxError):
-                    raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
-        return value
+        
+        user_ids = value.get('userIds', [])
+        
+        if not isinstance(user_ids, list):
+            raise serializers.ValidationError("userIds must be a list of integers.")
+        
+        # Ensure all are integers
+        try:
+            print(f"Extracted user IDs: {[int(uid) for uid in user_ids]}")
+            return [int(uid) for uid in user_ids]
+        except ValueError:
+            raise serializers.ValidationError("All userIds must be integers.")
+
+    # def validate_session_user_ids(self, value):
+    #     if value in [None, '', [], {}]:
+    #         return []
+    #     # Handle form-data: value might be ["[2,5]"]
+    #     if isinstance(value, list) and value and isinstance(value[0], str):
+    #         try:
+    #             parsed_value = json.loads(value[0])
+    #             if not isinstance(parsed_value, list):
+    #                 raise serializers.ValidationError("session_user_ids must be a list of integers.")
+    #             value = [int(x) for x in parsed_value]
+    #         except json.JSONDecodeError:
+    #             try:
+    #                 parsed_value = ast.literal_eval(value[0])
+    #                 if not isinstance(parsed_value, list):
+    #                     raise serializers.ValidationError("session_user_ids must be a list of integers.")
+    #                 value = [int(x) for x in parsed_value]
+    #             except (ValueError, SyntaxError):
+    #                 raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
+    #     elif isinstance(value, str):
+    #         try:
+    #             parsed_value = json.loads(value)
+    #             if not isinstance(parsed_value, list):
+    #                 raise serializers.ValidationError("session_user_ids must be a list of integers.")
+    #             value = [int(x) for x in parsed_value]
+    #         except json.JSONDecodeError:
+    #             try:
+    #                 parsed_value = ast.literal_eval(value)
+    #                 if not isinstance(parsed_value, list):
+    #                     raise serializers.ValidationError("session_user_ids must be a list of integers.")
+    #                 value = [int(x) for x in parsed_value]
+    #             except (ValueError, SyntaxError):
+    #                 raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
+    #     return value
 
 class SessionSerializer(serializers.ModelSerializer):
     audio_files = AudioFileSerializer(many=True, read_only=True)
