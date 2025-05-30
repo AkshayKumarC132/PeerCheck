@@ -53,6 +53,7 @@ class RoleBasedPermission(permissions.BasePermission):
                 'feedbackreviewdetailview': ['get'],      # Added FeedbackReviewDetailView (Operator GET only)
                 'usersettingsview': ['get', 'patch'],
                 'sessionstatusupdateview': ['patch'], 
+                'adminuserlistview': ['get']
             },
             'reviewer': {
                 'soplistview': ['get'],

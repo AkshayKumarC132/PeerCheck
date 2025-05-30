@@ -26,6 +26,7 @@ from .serializers import ( # Ensure all relevant serializers are imported
 )
 import logging
 from django.db import models
+import ast
 
 logger = logging.getLogger(__name__)
 
@@ -112,6 +113,26 @@ class ProcessAudioView(CreateAPIView):
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
         print(f"User data: {user_data}"
               f"Request data: {request.data}")
+        
+        # Parse the session_user_ids field if it's a string
+        session_user_ids = request.data.get("session_user_ids", None)
+        if session_user_ids:
+            if isinstance(session_user_ids, str):
+                try:
+                    # Only parse if it's a string
+                    session_user_ids = json.loads(session_user_ids)
+                    print(f"Parsed session_user_ids: {session_user_ids}")
+                except json.JSONDecodeError:
+                    return Response({'error': 'Invalid JSON format for session_user_ids.'}, status=status.HTTP_400_BAD_REQUEST)
+            elif isinstance(session_user_ids, dict):
+                # If it's already a dictionary, just use it as is
+                session_user_ids = session_user_ids.get("userIds", [])
+                print(f"Using provided session_user_ids: {session_user_ids}")
+            else:
+                return Response({'error': 'Invalid format for session_user_ids. Must be a JSON object or dictionary.'}, status=status.HTTP_400_BAD_REQUEST)
+        else:
+            session_user_ids = None
+
         serializer = ProcessAudioViewSerializer(data=request.data)
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -122,10 +143,29 @@ class ProcessAudioView(CreateAPIView):
         keywords = request.data.get("keywords", "")
         sop_id = request.data.get("sop_id") 
         session_id = serializer.validated_data.get("session_id")
-        session_user_ids = serializer.validated_data.get("session_user_ids", [])
+        # session_user_ids = serializer.validated_data.get("session_user_ids", [])
+
+        print(f"Session ID: {session_id}, Session User IDs: {session_user_ids}")
 
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # New parameters for enhanced speaker diarization
+        min_speaker_duration = float(request.data.get("min_speaker_duration", 2.0))
+        speaker_similarity_threshold = float(request.data.get("speaker_similarity_threshold", 0.85))
+
+        # Validate audio file before processing
+        if audio_file:
+            # Get file extension for format validation
+            file_extension = audio_file.name.split('.')[-1].lower() if '.' in audio_file.name else 'unknown'
+            supported_formats = get_supported_audio_formats()
+            
+            if file_extension not in supported_formats and file_extension != 'unknown':
+                return Response({
+                    "error": f"Unsupported audio format: {file_extension}. "
+                             f"Supported formats: {', '.join(supported_formats)}"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
 
         file_name = f"peercheck_files/{uuid.uuid4()}_{audio_file.name}"
         try:
@@ -141,11 +181,19 @@ class ProcessAudioView(CreateAPIView):
                 # Ensure SessionUser entries exist for all provided user_ids
                 # Convert session_user_ids to int if they are strings
                 processed_user_ids = []
-                for user_id_str in session_user_ids:
+                for user_id_str in session_user_ids.get("userIds", []):  # Extract list from dictionary
+                    print(f"Processing user_id: {user_id_str}")
                     try:
-                        processed_user_ids.append(int(user_id_str))
+                        user_id_int = int(user_id_str)
+                        # Verify user exists
+                        from django.contrib.auth import get_user_model
+                        User = get_user_model()
+                        if User.objects.filter(id=user_id_int).exists():
+                            processed_user_ids.append(user_id_int)
+                        else:
+                            logger.warning(f"User ID {user_id_int} not found")
                     except ValueError:
-                        logger.error(f"Invalid user_id format in session_user_ids: {user_id_str}")
+                        logger.error(f"Invalid user_id format: {user_id_str}")
                         return Response({"error": f"Invalid user_id format: {user_id_str}"}, status=status.HTTP_400_BAD_REQUEST)
 
                 for user_id_val in processed_user_ids:
@@ -158,6 +206,7 @@ class ProcessAudioView(CreateAPIView):
                 # Assign speaker tags based on the order of session_user_ids, fetched by created_at
                 # This order matches the one used in transcribe_with_speaker_diarization
                 actual_session_users = SessionUser.objects.filter(session=session_instance, user_id__in=processed_user_ids).order_by('created_at')
+                
                 for idx, su_instance in enumerate(actual_session_users):
                     tag = f"Speaker_{idx + 1}"
                     if su_instance.speaker_tag != tag: # Only update if different or not set
@@ -173,12 +222,36 @@ class ProcessAudioView(CreateAPIView):
                 return Response({"error": f"Session user creation failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            transcription = transcribe_with_speaker_diarization(file_url, MODEL_PATH, SPEAKER_MODEL_PATH, session_id)
+            transcription = transcribe_with_speaker_diarization(
+                audio_url=file_url, 
+                model_path=MODEL_PATH, 
+                speaker_model_path=SPEAKER_MODEL_PATH, 
+                session_id=session_id,
+                min_speaker_duration=min_speaker_duration,
+                speaker_similarity_threshold=speaker_similarity_threshold
+            )
             transcription_text = " ".join([segment["text"] for segment in transcription])
+            # Extract speaker statistics
+            unique_speakers = set(segment["speaker"] for segment in transcription)
+            speaker_stats = {
+                "total_speakers": len(unique_speakers),
+                "speakers": list(unique_speakers),
+                "total_segments": len(transcription),
+                "average_confidence": sum(segment.get("confidence", 0) for segment in transcription) / len(transcription) if transcription else 0
+            }
             logger.info(f"Transcription segments: {transcription}")
         except Exception as e:
-            logger.error(f"Transcription failed: {str(e)}")
-            return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+            logger.error(f"Enhanced transcription failed: {str(e)}")
+            # Fallback to basic transcription if enhanced fails
+            try:
+                logger.info("Attempting fallback to basic transcription")
+                transcription_text = process_audio_pipeline(file_url, MODEL_PATH)
+                transcription = [{"speaker": "Unknown", "text": transcription_text, "timestamp": 0, "confidence": 0.5}]
+                speaker_stats = {"total_speakers": 1, "speakers": ["Unknown"], "total_segments": 1, "average_confidence": 0.5}
+                logger.info("Fallback transcription completed")
+            except Exception as fallback_error:
+                logger.error(f"Both enhanced and fallback transcription failed: {str(fallback_error)}")
+                return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
         audio_instance = AudioFile.objects.create(
             file_path=file_url,
@@ -193,16 +266,23 @@ class ProcessAudioView(CreateAPIView):
         # Log audit
         AuditLog.objects.create(
             action='audio_upload',
-            user=request.validated_user,
+            user=user_data['user'],
             # user = user_data['user'],
             session_id=session_id,
             object_id=audio_instance.id,
             object_type='AudioFile',
-            details={'file_name': audio_file.name}
+            details={
+                    'file_name': audio_file.name,
+                    'file_size': audio_file.size,
+                    'speaker_stats': speaker_stats,
+                    'processing_method': 'enhanced_diarization'
+                }
         )
 
         response_data = {
             "transcription": transcription,
+            "transcription_text": transcription_text,  # For backward compatibility
+            "speaker_statistics": speaker_stats,
             "status": "processed",
             "audio_file": AudioFileSerializer(audio_instance).data
         }
@@ -817,7 +897,19 @@ class GetAudioRecordsView(APIView):
             paginator = PageNumberPagination()
             paginated_queryset = paginator.paginate_queryset(audio_records, request, view=self)
             serializer = AudioFileSerializer(paginated_queryset, many=True)
-            return paginator.get_paginated_response(serializer.data)
+            response_data = serializer.data
+
+            # Convert 'keywords_detected' from string to list for each item
+            for item in response_data:
+                keywords = item.get('keywords_detected', None)
+                if isinstance(keywords, str):
+                    try:
+                        item['keywords_detected'] = ast.literal_eval(keywords)
+                    except (ValueError, SyntaxError):
+                        # If parsing fails, assign an empty list or handle accordingly
+                        item['keywords_detected'] = []
+
+            return paginator.get_paginated_response(response_data)
         except Exception as e:
             logger.error(f"Error fetching audio records with pagination: {str(e)}")
             return Response(
@@ -871,23 +963,97 @@ class ReAnalyzeAudioView(APIView):
         if not file_path or not new_keywords:
             return Response({"error": "File path and keywords are required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Process transcription
-        transcription = process_audio_pipeline(file_path, MODEL_PATH)
-        
-        keywords_list = [kw.strip() for kw in new_keywords.split(",")]
-        detected_keywords = detect_keywords(transcription, keywords_list)
 
-        AudioFile.objects.filter(file_path=file_path).update(
-            transcription=transcription,
-            keywords_detected=detected_keywords,
-            status="reanalyzed",
-            duration=len(transcription.split()),
-        )
+        try:
+            audio_instance = AudioFile.objects.get(file_path=file_path)
+        except AudioFile.DoesNotExist:
+            return Response({"error": "Audio file not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        # New parameters for enhanced speaker diarization
+        min_speaker_duration = float(request.data.get("min_speaker_duration", 2.0))
+        speaker_similarity_threshold = float(request.data.get("speaker_similarity_threshold", 0.85))
+    
+        # Initialize variables
+        transcription = None
+        transcription_text = ""
+        speaker_stats = {}
+        try:
+            # Call your speaker diarization transcription function
+            transcription = transcribe_with_speaker_diarization(
+                audio_url=file_path,
+                model_path=MODEL_PATH,
+                speaker_model_path=SPEAKER_MODEL_PATH,
+                session_id=None,  # or generate a session id if needed
+                min_speaker_duration=min_speaker_duration,
+                speaker_similarity_threshold=speaker_similarity_threshold
+            )
+            # Compose full transcription text
+            transcription_text = " ".join([segment["text"] for segment in transcription])
+
+            # Extract speaker statistics
+            unique_speakers = set(segment["speaker"] for segment in transcription)
+            total_confidence = sum(segment.get("confidence", 0) for segment in transcription)
+            average_confidence = total_confidence / len(transcription) if transcription else 0
+
+            speaker_stats = {
+                "total_speakers": len(unique_speakers),
+                "speakers": list(unique_speakers),
+                "total_segments": len(transcription),
+                "average_confidence": average_confidence
+            }
+
+            logger.info(f"Transcription segments: {transcription}")
+
+        except Exception as e:
+            logger.error(f"Enhanced transcription failed: {str(e)}")
+            # Fallback to basic transcription
+            try:
+                logger.info("Attempting fallback to basic transcription")
+                transcription_text = process_audio_pipeline(file_path, MODEL_PATH)
+                transcription = [{"speaker": "Unknown", "text": transcription_text, "timestamp": 0, "confidence": 0.5}]
+                speaker_stats = {
+                    "total_speakers": 1,
+                    "speakers": ["Unknown"],
+                    "total_segments": 1,
+                    "average_confidence": 0.5
+                }
+                logger.info("Fallback transcription completed")
+            except Exception as fallback_error:
+                logger.error(f"Both enhanced and fallback transcription failed: {str(fallback_error)}")
+                return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+        # # Process transcription
+        # transcription = process_audio_pipeline(file_path, MODEL_PATH)
+        
+        # keywords_list = [kw.strip() for kw in new_keywords.split(",")]
+        # detected_keywords = detect_keywords(transcription, keywords_list)
+
+        # Save results to database
+        try:
+            # Assuming transcription is a JSONField in your model
+            audio_instance.transcription = transcription
+            # Detect keywords in the full text
+            keywords_list = [kw.strip() for kw in new_keywords.split(",")]
+            detected_keywords = detect_keywords(transcription_text, keywords_list)
+            audio_instance.keywords_detected = list(detected_keywords)
+            audio_instance.status = "reanalyzed"
+            audio_instance.duration = len(transcription_text.split())
+            audio_instance.save()
+        except Exception as save_e:
+            logger.error(f"Error saving transcription: {str(save_e)}")
+            return Response({"error": "Failed to save transcription data."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        try:
+            detected_keywords_list = ast.literal_eval(detected_keywords)
+            if not isinstance(detected_keywords_list, list):
+                detected_keywords_list = []
+        except (ValueError, SyntaxError):
+            detected_keywords_list = []
+        
         return Response(
             {
                 "file_path": file_path,
                 "transcription": transcription,
-                "detected_keywords": detected_keywords,
+                "detected_keywords": detected_keywords_list,
             },
             status=status.HTTP_200_OK,
         )
@@ -985,10 +1151,54 @@ class SOPListView(APIView):
     Retrieves a list of Standard Operating Procedures (SOPs).
     Supports pagination and role-based filtering.
     """
-    permission_classes = [RoleBasedPermission] # Already defined
+    permission_classes = [RoleBasedPermission]
 
-    # get method already decorated in previous step (pagination)
-    # No changes needed for SOPListView.get other than what was done for pagination
+    @extend_schema(
+        summary="List SOPs",
+        description="Fetches a paginated list of SOPs. Includes the username of the creator along with the created_by field.",
+        parameters=[
+            OpenApiParameter('token', OpenApiTypes.STR, OpenApiParameter.PATH, description='Authentication token.'),
+            OpenApiParameter('page', OpenApiTypes.INT, OpenApiParameter.QUERY, description='Page number for pagination.'),
+        ],
+        responses={
+            200: SOPSerializer(many=True),  # Actual response is paginated
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+        },
+        tags=['SOP']
+    )
+    def get(self, request, token, format=None):
+        """
+        Lists SOPs with pagination.
+        Includes the username of the creator in the response.
+        """
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            if user_data['user'].role == 'admin':
+                sops = SOP.objects.all().select_related('created_by').order_by('-created_at')
+            else:
+                # For non-admin users, filter SOPs based on their role
+                sops = SOP.objects.filter(created_by=user_data['user']).select_related('created_by').order_by('-created_at')
+            # sops = SOP.objects.all().select_related('created_by').order_by('-created_at')  # Use select_related for optimization
+            paginator = PageNumberPagination()
+            paginated_queryset = paginator.paginate_queryset(sops, request, view=self)
+
+            # Add username to the response
+            response_data = [
+                {
+                    **SOPSerializer(sop).data,
+                    "created_by_username": sop.created_by.username if sop.created_by else None
+                }
+                for sop in paginated_queryset
+            ]
+
+            return paginator.get_paginated_response(response_data)
+        except Exception as e:
+            logger.error(f"Error fetching SOPs with pagination: {str(e)}")
+            return Response({"error": f"Error fetching SOPs: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
 class SOPDetailView(APIView):
     """
@@ -1705,10 +1915,11 @@ class AdminUserListView(APIView):
 
     def get(self, request, token):
         # request.validated_user is set by RoleBasedPermission, confirming admin role
-        if request.validated_user.role != 'admin':
+        role = request.validated_user.role
+        if role not in ['admin', 'operator']:
              # This check is technically redundant if RoleBasedPermission is correctly configured
              # to only allow admins for views not specified for other roles, but good for defense in depth.
-            return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
+            return Response({"error": "Forbidden. Admin or operator access required."}, status=status.HTTP_403_FORBIDDEN)
 
         users = UserProfile.objects.all().order_by('id')
         

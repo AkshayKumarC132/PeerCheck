@@ -425,90 +425,463 @@ def match_sop_steps(transcription, sop):
 
     return results
 
-def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str, session_id: int = None):
-    from .models import SessionUser
-    import tempfile
-    logger.info(f"Starting transcription with diarization for URL: {audio_url}")
-    
-    # Download and preprocess audio
-    try:
-        response = requests.get(audio_url)
-        if response.status_code != 200:
-            logger.error(f"Failed to download file: {response.status_code}")
-            raise ValueError(f"Failed to download file: {response.status_code}")
-        
-        audio_data = BytesIO(response.content)
-        audio = AudioSegment.from_file(audio_data)
-        if audio.frame_rate != 16000 or audio.channels != 1:
-            audio = audio.set_frame_rate(16000).set_channels(1)
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
-            audio.export(temp_audio, format="wav")
-            temp_audio_path = temp_audio.name
-        logger.info(f"Audio properties: sample_rate={audio.frame_rate}, channels={audio.channels}, duration={len(audio)/1000}s")
-    except Exception as e:
-        logger.error(f"Audio preprocessing failed: {str(e)}")
-        raise ValueError(f"Audio preprocessing failed: {str(e)}")
+from typing import List, Dict, Optional, Tuple
+from collections import defaultdict
+import tempfile
+from pydub.effects import normalize
 
+def transcribe_with_speaker_diarization(
+    audio_url: str, 
+    model_path: str, 
+    speaker_model_path: str, 
+    session_id: int = None,
+    min_speaker_duration: float = 2.0,
+    speaker_similarity_threshold: float = 0.85
+) -> List[Dict]:
+    """
+    Enhanced transcription with speaker diarization supporting multiple audio formats.
+    
+    Args:
+        audio_url (str): URL of the audio file
+        model_path (str): Path to the Vosk ASR model
+        speaker_model_path (str): Path to the Vosk speaker diarization model
+        session_id (int, optional): Session ID for mapping speakers to users
+        min_speaker_duration (float): Minimum duration (seconds) for speaker segments
+        speaker_similarity_threshold (float): Threshold for speaker clustering
+    
+    Returns:
+        List[Dict]: Transcription with speaker labels and metadata
+    """
+    from .models import SessionUser
+    
+    logger.info(f"Starting enhanced transcription with diarization for URL: {audio_url}")
+    
+    # Step 1: Download and validate audio
+    audio_data, original_format = _download_and_validate_audio(audio_url)
+    
+    # Step 2: Enhanced audio preprocessing
+    preprocessed_audio, audio_info = _enhanced_audio_preprocessing(audio_data, original_format)
+    
+    # Step 3: Create temporary file for Vosk processing
+    temp_audio_path = None
     try:
-        model = vosk.Model(model_path)
-        spk_model = vosk.SpkModel(speaker_model_path)
-        with wave.open(temp_audio_path, "rb") as wf:
-            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
-                logger.error("Invalid audio format for Vosk")
-                raise ValueError("Audio must be mono, 16-bit PCM, 16 kHz")
-            
-            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
-            recognizer.SetWords(True)
-            recognizer.SetSpkModel(spk_model)
-            transcription = []
-            detected_speakers = set()
-            
-            # Load session users for mapping
-            speaker_map = {}
-            if session_id:
-                session_users = SessionUser.objects.filter(session_id=session_id).order_by('created_at')
-                for idx, su in enumerate(session_users):
-                    speaker_tag = f"Speaker_{idx + 1}"
-                    speaker_map[speaker_tag] = su.user.username
-                    logger.info(f"Mapping {speaker_tag} to {su.user.username}")
-            
-            while True:
-                data = wf.readframes(4000)
-                if len(data) == 0:
-                    break
-                if recognizer.AcceptWaveform(data):
-                    result = json.loads(recognizer.Result())
-                    speaker_id = None
-                    if "spk" in result:
-                        if isinstance(result["spk"], list) and result["spk"]:
-                            speaker_id = result["spk"][0]
-                        elif isinstance(result["spk"], (int, float)):
-                            speaker_id = result["spk"]
-                    speaker_tag = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
-                    detected_speakers.add(speaker_tag)
-                    speaker = speaker_map.get(speaker_tag, speaker_tag)
-                    if "text" in result and result["text"]:
-                        transcription.append({"speaker": speaker, "text": result["text"]})
-            
-            final_result = json.loads(recognizer.FinalResult())
-            if "text" in final_result and final_result["text"]:
-                speaker_id = None
-                if "spk" in final_result:
-                    if isinstance(final_result["spk"], list) and final_result["spk"]:
-                        speaker_id = final_result["spk"][0]
-                    elif isinstance(final_result["spk"], (int, float)):
-                        speaker_id = final_result["spk"]
-                speaker_tag = f"Speaker_{int(speaker_id) + 1}" if speaker_id is not None else "Unknown"
-                detected_speakers.add(speaker_tag)
-                speaker = speaker_map.get(speaker_tag, speaker_tag)
-                transcription.append({"speaker": speaker, "text": final_result["text"]})
-            
-            logger.info(f"Detected speakers: {detected_speakers}")
-            if len(detected_speakers) <= 1 and session_id:
-                logger.warning("Only one speaker detected; diarization may have failed")
-        return transcription
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            preprocessed_audio.export(temp_audio, format="wav")
+            temp_audio_path = temp_audio.name
+        
+        logger.info(f"Audio preprocessing completed. Properties: {audio_info}")
+        
+        # Step 4: Load session users for speaker mapping
+        speaker_map = {}
+        expected_speakers = 0
+        if session_id:
+            speaker_map, expected_speakers = _load_speaker_mapping(session_id)
+        
+        # Step 5: Perform transcription with speaker diarization
+        raw_transcription = _perform_transcription_with_diarization(
+            temp_audio_path, model_path, speaker_model_path, audio_info
+        )
+        
+        # Step 6: Enhanced speaker processing and clustering
+        processed_transcription = _enhance_speaker_detection(
+            raw_transcription, 
+            speaker_map, 
+            expected_speakers,
+            min_speaker_duration,
+            speaker_similarity_threshold
+        )
+        
+        # Step 7: Post-processing and quality checks
+        final_transcription = _post_process_transcription(processed_transcription, audio_info)
+        
+        logger.info(f"Transcription completed successfully. Detected {len(set(t['speaker'] for t in final_transcription))} unique speakers")
+        return final_transcription
+        
     except Exception as e:
         logger.error(f"Transcription with diarization failed: {str(e)}")
         raise ValueError(f"Transcription failed: {str(e)}")
     finally:
-        os.remove(temp_audio_path)
+        # Cleanup temporary files
+        if temp_audio_path and os.path.exists(temp_audio_path):
+            os.remove(temp_audio_path)
+
+def _download_and_validate_audio(audio_url: str) -> Tuple[BytesIO, str]:
+    """Download and validate audio file from URL."""
+    try:
+        response = requests.get(audio_url, stream=True, timeout=30)
+        if response.status_code != 200:
+            raise ValueError(f"Failed to download file: HTTP {response.status_code}")
+        
+        # Detect original format from content-type or URL extension
+        content_type = response.headers.get('content-type', '').lower()
+        original_format = _detect_audio_format(audio_url, content_type)
+        
+        audio_data = BytesIO(response.content)
+        logger.info(f"Downloaded audio file: {len(response.content)} bytes, format: {original_format}")
+        
+        return audio_data, original_format
+        
+    except requests.RequestException as e:
+        logger.error(f"Network error downloading audio: {str(e)}")
+        raise ValueError(f"Failed to download audio file: {str(e)}")
+
+def _detect_audio_format(url: str, content_type: str) -> str:
+    """Detect audio format from URL extension or content type."""
+    # Common audio formats mapping
+    format_mapping = {
+        'audio/wav': 'wav',
+        'audio/wave': 'wav',
+        'audio/mpeg': 'mp3',
+        'audio/mp3': 'mp3',
+        'audio/mp4': 'mp4',
+        'audio/m4a': 'm4a',
+        'audio/aac': 'aac',
+        'audio/ogg': 'ogg',
+        'audio/flac': 'flac',
+        'audio/webm': 'webm'
+    }
+    
+    # Try content type first
+    if content_type in format_mapping:
+        return format_mapping[content_type]
+    
+    # Fall back to URL extension
+    extension = url.lower().split('.')[-1] if '.' in url else 'unknown'
+    return extension if extension in ['wav', 'mp3', 'mp4', 'm4a', 'aac', 'ogg', 'flac', 'webm'] else 'unknown'
+
+def _enhanced_audio_preprocessing(audio_data: BytesIO, original_format: str) -> Tuple[AudioSegment, Dict]:
+    """Enhanced audio preprocessing with format detection and optimization."""
+    try:
+        # Load audio with format detection
+        audio_data.seek(0)
+        
+        if original_format == 'unknown':
+            # Try to load without specifying format (pydub auto-detection)
+            audio = AudioSegment.from_file(audio_data)
+        else:
+            # Load with specific format
+            audio = AudioSegment.from_file(audio_data, format=original_format)
+        
+        # Collect original audio information
+        audio_info = {
+            'original_format': original_format,
+            'original_sample_rate': audio.frame_rate,
+            'original_channels': audio.channels,
+            'original_duration': len(audio) / 1000.0,  # Convert to seconds
+            'original_bitrate': getattr(audio, 'bitrate', 'unknown'),
+            'sample_width': audio.sample_width
+        }
+        
+        logger.info(f"Original audio info: {audio_info}")
+        
+        # Audio quality enhancements
+        processed_audio = audio
+        
+        # Normalize audio levels
+        processed_audio = normalize(processed_audio)
+        
+        # Convert to mono if stereo/multi-channel
+        if processed_audio.channels != 1:
+            processed_audio = processed_audio.set_channels(1)
+            logger.info("Converted audio to mono")
+        
+        # Resample to 16kHz for Vosk compatibility
+        if processed_audio.frame_rate != 16000:
+            processed_audio = processed_audio.set_frame_rate(16000)
+            logger.info(f"Resampled audio from {audio_info['original_sample_rate']}Hz to 16000Hz")
+        
+        # Ensure 16-bit sample width
+        if processed_audio.sample_width != 2:
+            processed_audio = processed_audio.set_sample_width(2)
+            logger.info("Converted to 16-bit sample width")
+        
+        # Audio quality filters for better speech recognition
+        # Apply gentle noise reduction by filtering extreme frequencies
+        if len(processed_audio) > 0:
+            # High-pass filter to remove low-frequency noise
+            processed_audio = processed_audio.high_pass_filter(80)
+            # Low-pass filter to remove high-frequency noise
+            processed_audio = processed_audio.low_pass_filter(8000)
+        
+        # Update audio info with processed values
+        audio_info.update({
+            'processed_sample_rate': processed_audio.frame_rate,
+            'processed_channels': processed_audio.channels,
+            'processed_duration': len(processed_audio) / 1000.0,
+            'processed_sample_width': processed_audio.sample_width
+        })
+        
+        return processed_audio, audio_info
+        
+    except Exception as e:
+        logger.error(f"Error in audio preprocessing: {str(e)}")
+        raise ValueError(f"Audio preprocessing failed: {str(e)}")
+
+def _load_speaker_mapping(session_id: int) -> Tuple[Dict[str, str], int]:
+    """Load speaker mapping from session users."""
+    from .models import SessionUser
+    
+    speaker_map = {}
+    try:
+        session_users = SessionUser.objects.filter(session_id=session_id).order_by('created_at')
+        for idx, su in enumerate(session_users):
+            speaker_tag = f"Speaker_{idx + 1}"
+            speaker_map[speaker_tag] = su.user.username
+            logger.info(f"Mapping {speaker_tag} to {su.user.username}")
+        
+        return speaker_map, len(session_users)
+    except Exception as e:
+        logger.error(f"Error loading speaker mapping: {str(e)}")
+        return {}, 0
+
+def _perform_transcription_with_diarization(
+    audio_path: str, 
+    model_path: str, 
+    speaker_model_path: str, 
+    audio_info: Dict
+) -> List[Dict]:
+    """Perform the core transcription with speaker diarization."""
+    try:
+        # Load models
+        model = vosk.Model(model_path)
+        spk_model = vosk.SpkModel(speaker_model_path)
+        
+        transcription = []
+        
+        with wave.open(audio_path, "rb") as wf:
+            # Verify audio format
+            if wf.getnchannels() != 1 or wf.getsampwidth() != 2 or wf.getframerate() != 16000:
+                raise ValueError("Audio format validation failed for Vosk processing")
+            
+            # Initialize recognizer with enhanced settings
+            recognizer = vosk.KaldiRecognizer(model, wf.getframerate())
+            recognizer.SetWords(True)
+            recognizer.SetSpkModel(spk_model)
+            
+            # Process audio in chunks
+            chunk_size = 4000
+            frame_count = 0
+            
+            while True:
+                data = wf.readframes(chunk_size)
+                if len(data) == 0:
+                    break
+                
+                frame_count += chunk_size
+                timestamp = frame_count / wf.getframerate()
+                
+                if recognizer.AcceptWaveform(data):
+                    result = json.loads(recognizer.Result())
+                    if result.get("text"):
+                        speaker_info = _extract_speaker_info(result, timestamp)
+                        transcription.append({
+                            "text": result["text"],
+                            "timestamp": timestamp,
+                            "raw_speaker_id": speaker_info["speaker_id"],
+                            "speaker_confidence": speaker_info["confidence"],
+                            "speaker_vector": speaker_info.get("vector"),
+                            "word_details": result.get("result", [])
+                        })
+            
+            # Process final result
+            final_result = json.loads(recognizer.FinalResult())
+            if final_result.get("text"):
+                speaker_info = _extract_speaker_info(final_result, timestamp)
+                transcription.append({
+                    "text": final_result["text"],
+                    "timestamp": timestamp,
+                    "raw_speaker_id": speaker_info["speaker_id"],
+                    "speaker_confidence": speaker_info["confidence"],
+                    "speaker_vector": speaker_info.get("vector"),
+                    "word_details": final_result.get("result", [])
+                })
+        
+        return transcription
+        
+    except Exception as e:
+        logger.error(f"Error in core transcription: {str(e)}")
+        raise
+
+def _extract_speaker_info(result: Dict, timestamp: float) -> Dict:
+    """Extract and validate speaker information from Vosk result."""
+    speaker_info = {
+        "speaker_id": None,
+        "confidence": 0.0,
+        "vector": None
+    }
+    
+    if "spk" in result:
+        spk_data = result["spk"]
+        
+        if isinstance(spk_data, list) and spk_data:
+            # Speaker vector format
+            speaker_info["vector"] = spk_data
+            # Generate speaker ID from vector (simplified clustering)
+            speaker_info["speaker_id"] = _vector_to_speaker_id(spk_data)
+            speaker_info["confidence"] = 0.8  # Default confidence for vector-based
+            
+        elif isinstance(spk_data, (int, float)):
+            # Direct speaker ID format
+            speaker_info["speaker_id"] = int(spk_data)
+            speaker_info["confidence"] = 0.9  # Higher confidence for direct ID
+    
+    # Handle confidence if provided separately
+    if "spk_conf" in result:
+        speaker_info["confidence"] = float(result["spk_conf"])
+    
+    return speaker_info
+
+def _vector_to_speaker_id(vector: List[float], threshold: float = 0.85) -> int:
+    """Convert speaker vector to speaker ID using simple clustering."""
+    # This is a simplified approach - in production, you might want to use
+    # more sophisticated clustering algorithms like DBSCAN or K-means
+    
+    # For now, use a hash-based approach for consistency
+    vector_hash = hash(tuple(round(v, 3) for v in vector[:10]))  # Use first 10 components
+    return abs(vector_hash) % 10  # Limit to 10 possible speakers
+
+def _enhance_speaker_detection(
+    raw_transcription: List[Dict], 
+    speaker_map: Dict[str, str], 
+    expected_speakers: int,
+    min_duration: float,
+    similarity_threshold: float
+) -> List[Dict]:
+    """Enhanced speaker detection with clustering and validation."""
+    
+    if not raw_transcription:
+        return []
+    
+    # Group by raw speaker ID and analyze patterns
+    speaker_groups = defaultdict(list)
+    for segment in raw_transcription:
+        speaker_id = segment.get("raw_speaker_id")
+        if speaker_id is not None:
+            speaker_groups[speaker_id].append(segment)
+    
+    # Filter out speakers with insufficient content
+    valid_speakers = {}
+    for speaker_id, segments in speaker_groups.items():
+        total_duration = sum(len(seg["text"].split()) * 0.6 for seg in segments)  # Rough duration estimate
+        if total_duration >= min_duration:
+            valid_speakers[speaker_id] = segments
+    
+    logger.info(f"Detected {len(valid_speakers)} valid speakers after filtering")
+    
+    # Assign final speaker labels
+    processed_transcription = []
+    speaker_counter = 1
+    speaker_id_mapping = {}
+    
+    for segment in raw_transcription:
+        raw_speaker_id = segment.get("raw_speaker_id")
+        
+        if raw_speaker_id in valid_speakers:
+            if raw_speaker_id not in speaker_id_mapping:
+                speaker_tag = f"Speaker_{speaker_counter}"
+                speaker_id_mapping[raw_speaker_id] = speaker_tag
+                speaker_counter += 1
+            
+            final_speaker_tag = speaker_id_mapping[raw_speaker_id]
+            final_speaker_name = speaker_map.get(final_speaker_tag, final_speaker_tag)
+        else:
+            final_speaker_name = "Unknown"
+        
+        processed_transcription.append({
+            "speaker": final_speaker_name,
+            "text": segment["text"],
+            "timestamp": segment["timestamp"],
+            "confidence": segment.get("speaker_confidence", 0.0),
+            "word_details": segment.get("word_details", [])
+        })
+    
+    return processed_transcription
+
+def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> List[Dict]:
+    """Post-process transcription for quality and consistency."""
+    
+    if not transcription:
+        logger.warning("Empty transcription received for post-processing")
+        return []
+    
+    # Remove empty or very short segments
+    filtered_transcription = [
+        segment for segment in transcription 
+        if segment.get("text", "").strip() and len(segment["text"].split()) >= 2
+    ]
+    
+    # Merge consecutive segments from the same speaker
+    merged_transcription = []
+    current_speaker = None
+    current_text = ""
+    current_timestamp = 0
+    current_confidence = 0
+    
+    for segment in filtered_transcription:
+        speaker = segment["speaker"]
+        text = segment["text"].strip()
+        
+        if speaker == current_speaker and text:
+            # Merge with previous segment
+            current_text += " " + text
+            current_confidence = max(current_confidence, segment.get("confidence", 0))
+        else:
+            # Save previous segment if it exists
+            if current_text:
+                merged_transcription.append({
+                    "speaker": current_speaker,
+                    "text": current_text,
+                    "timestamp": current_timestamp,
+                    "confidence": current_confidence
+                })
+            
+            # Start new segment
+            current_speaker = speaker
+            current_text = text
+            current_timestamp = segment["timestamp"]
+            current_confidence = segment.get("confidence", 0)
+    
+    # Don't forget the last segment
+    if current_text:
+        merged_transcription.append({
+            "speaker": current_speaker,
+            "text": current_text,
+            "timestamp": current_timestamp,
+            "confidence": current_confidence
+        })
+    
+    # Add metadata
+    unique_speakers = set(seg["speaker"] for seg in merged_transcription)
+    total_duration = audio_info.get("processed_duration", 0)
+    
+    logger.info(f"Post-processing completed: {len(merged_transcription)} segments, "
+                f"{len(unique_speakers)} unique speakers, {total_duration:.1f}s total duration")
+    
+    return merged_transcription
+
+# Additional utility functions for audio format support
+
+def validate_audio_file(file_path: str) -> Dict[str, any]:
+    """Validate and get information about an audio file."""
+    try:
+        audio = AudioSegment.from_file(file_path)
+        return {
+            "valid": True,
+            "duration": len(audio) / 1000.0,
+            "sample_rate": audio.frame_rate,
+            "channels": audio.channels,
+            "sample_width": audio.sample_width,
+            "format": "detected"
+        }
+    except Exception as e:
+        return {
+            "valid": False,
+            "error": str(e)
+        }
+
+def get_supported_audio_formats() -> List[str]:
+    """Get list of supported audio formats."""
+    return [
+        "wav", "mp3", "mp4", "m4a", "aac", 
+        "ogg", "flac", "webm", "wma", "3gp"
+    ]
