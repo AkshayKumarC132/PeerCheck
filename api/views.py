@@ -26,6 +26,7 @@ from .serializers import ( # Ensure all relevant serializers are imported
 )
 import logging
 from django.db import models
+import ast
 
 logger = logging.getLogger(__name__)
 
@@ -873,7 +874,19 @@ class GetAudioRecordsView(APIView):
             paginator = PageNumberPagination()
             paginated_queryset = paginator.paginate_queryset(audio_records, request, view=self)
             serializer = AudioFileSerializer(paginated_queryset, many=True)
-            return paginator.get_paginated_response(serializer.data)
+            response_data = serializer.data
+
+            # Convert 'keywords_detected' from string to list for each item
+            for item in response_data:
+                keywords = item.get('keywords_detected', None)
+                if isinstance(keywords, str):
+                    try:
+                        item['keywords_detected'] = ast.literal_eval(keywords)
+                    except (ValueError, SyntaxError):
+                        # If parsing fails, assign an empty list or handle accordingly
+                        item['keywords_detected'] = []
+
+            return paginator.get_paginated_response(response_data)
         except Exception as e:
             logger.error(f"Error fetching audio records with pagination: {str(e)}")
             return Response(
@@ -927,23 +940,97 @@ class ReAnalyzeAudioView(APIView):
         if not file_path or not new_keywords:
             return Response({"error": "File path and keywords are required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Process transcription
-        transcription = process_audio_pipeline(file_path, MODEL_PATH)
-        
-        keywords_list = [kw.strip() for kw in new_keywords.split(",")]
-        detected_keywords = detect_keywords(transcription, keywords_list)
 
-        AudioFile.objects.filter(file_path=file_path).update(
-            transcription=transcription,
-            keywords_detected=detected_keywords,
-            status="reanalyzed",
-            duration=len(transcription.split()),
-        )
+        try:
+            audio_instance = AudioFile.objects.get(file_path=file_path)
+        except AudioFile.DoesNotExist:
+            return Response({"error": "Audio file not found"}, status=status.HTTP_404_NOT_FOUND)
+        
+        # New parameters for enhanced speaker diarization
+        min_speaker_duration = float(request.data.get("min_speaker_duration", 2.0))
+        speaker_similarity_threshold = float(request.data.get("speaker_similarity_threshold", 0.85))
+    
+        # Initialize variables
+        transcription = None
+        transcription_text = ""
+        speaker_stats = {}
+        try:
+            # Call your speaker diarization transcription function
+            transcription = transcribe_with_speaker_diarization(
+                audio_url=file_path,
+                model_path=MODEL_PATH,
+                speaker_model_path=SPEAKER_MODEL_PATH,
+                session_id=None,  # or generate a session id if needed
+                min_speaker_duration=min_speaker_duration,
+                speaker_similarity_threshold=speaker_similarity_threshold
+            )
+            # Compose full transcription text
+            transcription_text = " ".join([segment["text"] for segment in transcription])
+
+            # Extract speaker statistics
+            unique_speakers = set(segment["speaker"] for segment in transcription)
+            total_confidence = sum(segment.get("confidence", 0) for segment in transcription)
+            average_confidence = total_confidence / len(transcription) if transcription else 0
+
+            speaker_stats = {
+                "total_speakers": len(unique_speakers),
+                "speakers": list(unique_speakers),
+                "total_segments": len(transcription),
+                "average_confidence": average_confidence
+            }
+
+            logger.info(f"Transcription segments: {transcription}")
+
+        except Exception as e:
+            logger.error(f"Enhanced transcription failed: {str(e)}")
+            # Fallback to basic transcription
+            try:
+                logger.info("Attempting fallback to basic transcription")
+                transcription_text = process_audio_pipeline(file_path, MODEL_PATH)
+                transcription = [{"speaker": "Unknown", "text": transcription_text, "timestamp": 0, "confidence": 0.5}]
+                speaker_stats = {
+                    "total_speakers": 1,
+                    "speakers": ["Unknown"],
+                    "total_segments": 1,
+                    "average_confidence": 0.5
+                }
+                logger.info("Fallback transcription completed")
+            except Exception as fallback_error:
+                logger.error(f"Both enhanced and fallback transcription failed: {str(fallback_error)}")
+                return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+        # # Process transcription
+        # transcription = process_audio_pipeline(file_path, MODEL_PATH)
+        
+        # keywords_list = [kw.strip() for kw in new_keywords.split(",")]
+        # detected_keywords = detect_keywords(transcription, keywords_list)
+
+        # Save results to database
+        try:
+            # Assuming transcription is a JSONField in your model
+            audio_instance.transcription = transcription
+            # Detect keywords in the full text
+            keywords_list = [kw.strip() for kw in new_keywords.split(",")]
+            detected_keywords = detect_keywords(transcription_text, keywords_list)
+            audio_instance.keywords_detected = list(detected_keywords)
+            audio_instance.status = "reanalyzed"
+            audio_instance.duration = len(transcription_text.split())
+            audio_instance.save()
+        except Exception as save_e:
+            logger.error(f"Error saving transcription: {str(save_e)}")
+            return Response({"error": "Failed to save transcription data."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+        try:
+            detected_keywords_list = ast.literal_eval(detected_keywords)
+            if not isinstance(detected_keywords_list, list):
+                detected_keywords_list = []
+        except (ValueError, SyntaxError):
+            detected_keywords_list = []
+        
         return Response(
             {
                 "file_path": file_path,
                 "transcription": transcription,
-                "detected_keywords": detected_keywords,
+                "detected_keywords": detected_keywords_list,
             },
             status=status.HTTP_200_OK,
         )
@@ -1067,7 +1154,12 @@ class SOPListView(APIView):
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            sops = SOP.objects.all().select_related('created_by').order_by('-created_at')  # Use select_related for optimization
+            if user_data['user'].role == 'admin':
+                sops = SOP.objects.all().select_related('created_by').order_by('-created_at')
+            else:
+                # For non-admin users, filter SOPs based on their role
+                sops = SOP.objects.filter(created_by=user_data['user']).select_related('created_by').order_by('-created_at')
+            # sops = SOP.objects.all().select_related('created_by').order_by('-created_at')  # Use select_related for optimization
             paginator = PageNumberPagination()
             paginated_queryset = paginator.paginate_queryset(sops, request, view=self)
 
