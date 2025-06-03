@@ -6,7 +6,7 @@ from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDe
                     SessionCreateView, SessionListView, SessionDetailView, 
                     SessionReviewView, SessionStatusUpdateView, 
                     AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView, # Added AdminDashboardSummaryView
-                    UserSettingsView, SystemSettingsView, AuditLogView)
+                    UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
 
 urlpatterns = [
@@ -30,6 +30,7 @@ urlpatterns = [
     path('login/', LoginViewAPI.as_view(), name='login'),
 
     path('logout/<str:token>/', LogoutViewAPI.as_view(), name='logout'),
+    path('profile/<str:token>/', UserProfileDetailsView.as_view(), name='profile'),  # Assuming this is for user profile
 
     path('sop/create/<str:token>/', SOPCreateView.as_view(), name='sop-create'),
     path('sop/list/<str:token>/', SOPListView.as_view(), name='sop-list'),

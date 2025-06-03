@@ -53,7 +53,8 @@ class RoleBasedPermission(permissions.BasePermission):
                 'feedbackreviewdetailview': ['get'],      # Added FeedbackReviewDetailView (Operator GET only)
                 'usersettingsview': ['get', 'patch'],
                 'sessionstatusupdateview': ['patch'], 
-                'adminuserlistview': ['get']
+                'adminuserlistview': ['get'],
+                'userprofiledetailsview': ['get'],
             },
             'reviewer': {
                 'soplistview': ['get'],
@@ -68,6 +69,8 @@ class RoleBasedPermission(permissions.BasePermission):
                 'feedbackreviewlistview': ['get'], # Added FeedbackReviewListView
                 'feedbackreviewdetailview': ['get', 'put', 'patch', 'delete'], # Added FeedbackReviewDetailView
                 'auditlogview': ['get'],
+                'usersettingsview': ['get', 'patch'],
+                'userprofiledetailsview': ['get'],
             }
         }
 

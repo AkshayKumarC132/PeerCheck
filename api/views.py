@@ -2412,3 +2412,45 @@ class SessionStatusUpdateView(APIView):
         logger.info(f"Session {session_obj.id} status updated to {requested_status} by user {user.username}")
         serializer = SessionSerializer(session_obj) # Use the retrieved session object
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class UserProfileDetailsView(APIView):
+    """
+    API to fetch user profile details based on the provided token.
+    """
+    permission_classes = [RoleBasedPermission]
+
+    @extend_schema(
+        summary="Get User Profile",
+        description="Fetches the details of the authenticated user's profile based on the provided token.",
+        parameters=[
+            OpenApiParameter('token', OpenApiTypes.STR, OpenApiParameter.PATH, description='Authentication token.')
+        ],
+        responses={
+            200: UserProfileSerializer,
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+            404: ErrorResponseSerializer,
+        },
+        tags=['User Profile']
+    )
+    def get(self, request, token):
+        """
+        Retrieves the user profile details for the authenticated user.
+        """
+        # Validate the token
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = user_data['user']
+        try:
+            # Fetch the user profile
+            user_profile = UserProfile.objects.get(username=user)
+            serializer = UserProfileSerializer(user_profile)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except UserProfile.DoesNotExist:
+            return Response({"error": "User profile not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error fetching user profile: {str(e)}")
+            return Response({"error": "An error occurred while fetching the user profile."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
