@@ -33,6 +33,7 @@ class SOPStep(models.Model):
     step_number = models.PositiveIntegerField()
     instruction_text = models.TextField()
     expected_keywords = models.TextField()  # Comma-separated keywords
+    confirmation_keywords = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -98,6 +99,13 @@ class SessionUser(models.Model):
     session = models.ForeignKey(Session, on_delete=models.CASCADE, related_name='session_users')
     user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='session_participations')
     speaker_tag = models.CharField(max_length=50, null=True, blank=True)  # e.g., Speaker_1
+    ROLE_CHOICES = (
+        ('operator', 'Operator'),
+        ('reviewer', 'Reviewer'),
+        ('observer', 'Observer'),
+    )
+    role = models.CharField(max_length=20, choices=ROLE_CHOICES, default='operator')
+    speaker_embedding = models.JSONField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

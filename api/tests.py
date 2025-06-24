@@ -1,6 +1,6 @@
 from django.test import TestCase
 from rest_framework.test import APIClient
-from .models import UserProfile, SOP, SOPStep, AudioFile, Session
+from .models import UserProfile, SOP, SOPStep, AudioFile, Session, SessionUser
 from knox.models import AuthToken
 from django.core.files.uploadedfile import SimpleUploadedFile
 from unittest.mock import patch
@@ -32,11 +32,9 @@ class SOPTests(TestCase):
     def test_sop_matching(self, mock_transcribe, mock_upload):
         # Mock responses
         mock_upload.return_value = "https://s3.amazonaws.com/peercheck_files/test.wav"
-        mock_transcribe.return_value = {
-            "transcription": [
-                {"speaker": "Speaker_1", "text": "hello world", "confidence": 85}
-            ]
-        }
+        mock_transcribe.return_value = [
+            {"speaker": "Speaker_1", "speaker_tag": "Speaker_1", "text": "hello world", "timestamp": 0, "confidence": 85}
+        ]
 
         data = {
             'file': self.audio_file,
@@ -61,9 +59,9 @@ class ProcessAudioTests(TestCase):
     def test_process_audio_with_valid_token(self, mock_transcribe, mock_upload):
         # Mock responses
         mock_upload.return_value = "https://s3.amazonaws.com/peercheck_files/test.wav"
-        mock_transcribe.return_value = {
-            "transcription": [{"speaker": "Speaker_1", "text": "hello world"}]
-        }
+        mock_transcribe.return_value = [
+            {"speaker": "Speaker_1", "speaker_tag": "Speaker_1", "text": "hello world", "timestamp": 0}
+        ]
 
         data = {
             'file': self.audio_file,
@@ -109,6 +107,7 @@ class SessionTests(TestCase):
         self.assertEqual(Session.objects.count(), 2)
         self.assertEqual(Session.objects.last().audio_files.count(), 1)
         self.assertEqual(response.json()['name'], 'Training Session')
+        self.assertTrue(SessionUser.objects.filter(session__name='Training Session', user=self.user, role='operator').exists())
 
     def test_create_session_auditor_fails(self):
         data = {
@@ -169,9 +168,9 @@ class RoleBasedAccessTests(TestCase):
             'sop_id': self.sop.id
         }
         with patch('api.views.upload_file_to_s3', return_value="https://s3.amazonaws.com/test.wav"):
-            with patch('api.views.transcribe_with_speaker_diarization', return_value={
-                "transcription": [{"speaker": "Speaker_1", "text": "test"}]
-            }):
+            with patch('api.views.transcribe_with_speaker_diarization', return_value=[
+                {"speaker": "Speaker_1", "speaker_tag": "Speaker_1", "text": "test", "timestamp": 0}
+            ]):
                 response = self.client.post(f'/api/process-audio/{self.user_token}/', data, format='multipart')
         self.assertEqual(response.status_code, 200)
 

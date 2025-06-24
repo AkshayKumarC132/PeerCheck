@@ -22,7 +22,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/5.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-a29z8fjb^1pcdcx9^qo=@ikm_kpsxu8kmxh&(1xv7*)r70&cd+'
+SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'insecure-secret-key')
 
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = True
@@ -127,15 +127,14 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'main.sqlite3',
     },
-    'default1y': {
+    'postgres': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'Peer Check',
-        'USER': 'postgres',
-        'PASSWORD': 'QP3HeJel62BPzPaq07uETezy',
-        'HOST': 'e-commerce.cj3oddyv0bsk.us-west-1.rds.amazonaws.com',
-        'PORT': '5432',
+        'NAME': os.environ.get('POSTGRES_DB', ''),
+        'USER': os.environ.get('POSTGRES_USER', ''),
+        'PASSWORD': os.environ.get('POSTGRES_PASSWORD', ''),
+        'HOST': os.environ.get('POSTGRES_HOST', ''),
+        'PORT': os.environ.get('POSTGRES_PORT', '5432'),
     },
-}
 
 
 # Password validation
@@ -186,6 +185,10 @@ STATIC_URL = 'static/'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'uploads'
 
+AWS_STORAGE_BUCKET_NAME = os.environ.get("AWS_STORAGE_BUCKET_NAME")
+AWS_S3_REGION_NAME = os.environ.get("AWS_S3_REGION_NAME")
+AWS_S3_ACCESS_KEY_ID = os.environ.get("AWS_S3_ACCESS_KEY_ID")
+AWS_S3_SECRET_ACCESS_KEY = os.environ.get("AWS_S3_SECRET_ACCESS_KEY")
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.1/ref/settings/#default-auto-field
 
