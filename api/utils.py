@@ -374,33 +374,44 @@ def process_audio_pipeline(file_url: str, model_path: str) -> str:
 
 from fuzzywuzzy import fuzz
 
-def match_sop_steps(transcription, sop):
-    """
-    Match transcription against SOP steps and calculate confidence scores.
-    
+DEFAULT_CONFIRMATIONS = ["roger", "acknowledged"]
+
+def match_sop_steps(transcription_segments, sop, confirmation_window=30):
+    """Match transcription against SOP steps and check for verbal confirmation.
+
     Args:
-        transcription (str): Transcribed audio text.
+        transcription_segments (List[Dict]): List of transcription segments with
+            ``text`` and ``timestamp``.
         sop (SOP): SOP instance to match against.
-    
+        confirmation_window (int): Seconds to search after a matched instruction
+            for confirmation keywords.
+
     Returns:
-        list: List of dicts with step details and confidence scores.
+        list: List of dicts with step details and confirmation status.
     """
+    full_text = " ".join(seg.get("text", "") for seg in transcription_segments)
+    transcription_lower = full_text.lower()
     results = []
-    transcription_lower = transcription.lower()
 
     for step in sop.steps.all():
         expected_keywords = [kw.strip().lower() for kw in step.expected_keywords.split(',')]
+        confirm_keywords = [kw.strip().lower() for kw in (step.confirmation_keywords or '').split(',') if kw.strip()]
         matches = []
         total_confidence = 0
         matched_count = 0
+        instruction_timestamp = None
+
+        for segment in transcription_segments:
+            seg_text_lower = segment.get("text", "").lower()
+            if any(kw in seg_text_lower for kw in expected_keywords):
+                instruction_timestamp = segment.get("timestamp")
+                break
 
         for keyword in expected_keywords:
             if keyword in transcription_lower:
-                # Exact match
                 confidence = 100
                 matched_count += 1
             else:
-                # Fuzzy match for partial similarity
                 best_score = 0
                 for word in transcription_lower.split():
                     score = fuzz.ratio(word, keyword)
@@ -412,15 +423,26 @@ def match_sop_steps(transcription, sop):
             matches.append({"keyword": keyword, "confidence": confidence})
             total_confidence += confidence
 
-        # Calculate average confidence for the step
         step_confidence = total_confidence / len(expected_keywords) if expected_keywords else 0
+
+        confirmed = False
+        if instruction_timestamp is not None:
+            for segment in transcription_segments:
+                ts = segment.get("timestamp", 0)
+                if instruction_timestamp < ts <= instruction_timestamp + confirmation_window:
+                    seg_text_lower = segment.get("text", "").lower()
+                    if any(c in seg_text_lower for c in DEFAULT_CONFIRMATIONS + confirm_keywords):
+                        confirmed = True
+                        break
+
         results.append({
             "step_number": step.step_number,
             "instruction_text": step.instruction_text,
             "expected_keywords": expected_keywords,
             "matches": matches,
             "confidence_score": round(step_confidence, 2),
-            "matched": matched_count > 0
+            "matched": matched_count > 0,
+            "confirmed": confirmed
         })
 
     return results
@@ -781,18 +803,21 @@ def _enhance_speaker_detection(
                 speaker_tag = f"Speaker_{speaker_counter}"
                 speaker_id_mapping[raw_speaker_id] = speaker_tag
                 speaker_counter += 1
-            
+
             final_speaker_tag = speaker_id_mapping[raw_speaker_id]
             final_speaker_name = speaker_map.get(final_speaker_tag, final_speaker_tag)
         else:
             final_speaker_name = "Unknown"
-        
+            final_speaker_tag = None
+
         processed_transcription.append({
             "speaker": final_speaker_name,
+            "speaker_tag": final_speaker_tag,
             "text": segment["text"],
             "timestamp": segment["timestamp"],
             "confidence": segment.get("speaker_confidence", 0.0),
-            "word_details": segment.get("word_details", [])
+            "word_details": segment.get("word_details", []),
+            "speaker_vector": segment.get("speaker_vector")
         })
     
     return processed_transcription
@@ -813,15 +838,19 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
     # Merge consecutive segments from the same speaker
     merged_transcription = []
     current_speaker = None
+    current_tag = None
+    current_vector = None
     current_text = ""
     current_timestamp = 0
     current_confidence = 0
     
     for segment in filtered_transcription:
         speaker = segment["speaker"]
+        tag = segment.get("speaker_tag")
+        vector = segment.get("speaker_vector")
         text = segment["text"].strip()
-        
-        if speaker == current_speaker and text:
+
+        if speaker == current_speaker and tag == current_tag and text:
             # Merge with previous segment
             current_text += " " + text
             current_confidence = max(current_confidence, segment.get("confidence", 0))
@@ -830,13 +859,17 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             if current_text:
                 merged_transcription.append({
                     "speaker": current_speaker,
+                    "speaker_tag": current_tag,
                     "text": current_text,
                     "timestamp": current_timestamp,
-                    "confidence": current_confidence
+                    "confidence": current_confidence,
+                    "speaker_vector": current_vector
                 })
-            
+
             # Start new segment
             current_speaker = speaker
+            current_tag = tag
+            current_vector = vector
             current_text = text
             current_timestamp = segment["timestamp"]
             current_confidence = segment.get("confidence", 0)
@@ -845,9 +878,11 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
     if current_text:
         merged_transcription.append({
             "speaker": current_speaker,
+            "speaker_tag": current_tag,
             "text": current_text,
             "timestamp": current_timestamp,
-            "confidence": current_confidence
+            "confidence": current_confidence,
+            "speaker_vector": current_vector
         })
     
     # Add metadata

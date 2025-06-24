@@ -1,9 +1,8 @@
 # PeerCheck
 
-This project is an offline-capable, edge-deployed system designed to process audio prompts, analyze them, and respond in a multimodal manner through an API
+PeerCheck is an offline-capable system for uploading audio, transcribing it with speaker diarization, and managing Standard Operating Procedures (SOPs) and feedback through a REST API.
 
 ## Table of Contents
-
 - [Features](#features)
 - [Prerequisites](#prerequisites)
 - [Installation](#installation)
@@ -11,52 +10,43 @@ This project is an offline-capable, edge-deployed system designed to process aud
 - [Contributing](#contributing)
 - [License](#license)
 
+## Features
+- Upload audio files which are stored on AWS S3
+- Automatic transcription with optional speaker diarization
+- SOP creation with step tracking and keyword matching
+- Session management linking multiple audio files
+- Feedback and review workflow with role-based permissions
+- User and system settings endpoints
+
 ## Prerequisites
-
-Before you begin, ensure you have met the following requirements:
-
-- Python 3.x installed on your machine.
-- Git installed on your machine.
-- A virtual environment manager (optional, but recommended).
+- Python 3.x installed
+- Git installed
+- Optional: a virtual environment manager
 
 ## Installation
-
-Follow these steps to get your development environment set up:
-
-1. **Clone the repository:**
-
-   Open your terminal and run:
-
-   ```bash
-   git clone https://github.com/AkshayKumarC132/PeerCheck
-   cd PeerCheck
-
-## Setting up a Virtual Environment (Optional but Recommended)
-
-2. Creating a virtual environment isolates your project dependencies and prevents conflicts with other Python projects.
-### Activating the Virtual Environment 
-
-   ```bash
-   python -m venv venv
-   venv\Scripts\activate
-   ```
-
-#### For macOS/Linux:
+Clone the repository and install dependencies:
 ```bash
-   source venv/bin/activate
-```
-## Installing Dependencies
-
-After activating your virtual environment, install the required dependencies using the `requirements.txt` file:
-```bash
+git clone https://github.com/AkshayKumarC132/PeerCheck
+cd PeerCheck
+python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 ```
+Set the following environment variables before running the server:
+- `DJANGO_SECRET_KEY`
+- `POSTGRES_DB`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_HOST`, `POSTGRES_PORT` (optional)
+- `AWS_STORAGE_BUCKET_NAME`, `AWS_S3_REGION_NAME`, `AWS_S3_ACCESS_KEY_ID`, `AWS_S3_SECRET_ACCESS_KEY`
 
-## Running the Development Server
 
-Start the Django development server:
+## Usage
+Run the Django development server:
 ```bash
 python manage.py runserver
 ```
+The application will be available at `http://127.0.0.1:8000/`.
 
-The application will be accessible at `http://127.0.0.1:8000/`.
+## Contributing
+Pull requests are welcome. Please open an issue first to discuss any major changes.
+
+## License
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+

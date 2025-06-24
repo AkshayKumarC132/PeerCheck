@@ -223,9 +223,9 @@ class ProcessAudioView(CreateAPIView):
 
         try:
             transcription = transcribe_with_speaker_diarization(
-                audio_url=file_url, 
-                model_path=MODEL_PATH, 
-                speaker_model_path=SPEAKER_MODEL_PATH, 
+                audio_url=file_url,
+                model_path=MODEL_PATH,
+                speaker_model_path=SPEAKER_MODEL_PATH,
                 session_id=session_id,
                 min_speaker_duration=min_speaker_duration,
                 speaker_similarity_threshold=speaker_similarity_threshold
@@ -252,6 +252,19 @@ class ProcessAudioView(CreateAPIView):
             except Exception as fallback_error:
                 logger.error(f"Both enhanced and fallback transcription failed: {str(fallback_error)}")
                 return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        if session_id:
+            try:
+                for seg in transcription:
+                    tag = seg.get("speaker_tag")
+                    vector = seg.get("speaker_vector")
+                    if tag and vector:
+                        su = SessionUser.objects.filter(session_id=session_id, speaker_tag=tag).first()
+                        if su and not su.speaker_embedding:
+                            su.speaker_embedding = vector
+                            su.save(update_fields=["speaker_embedding"])
+            except Exception as e:
+                logger.error(f"Failed to store speaker embeddings: {str(e)}")
 
         audio_instance = AudioFile.objects.create(
             file_path=file_url,
@@ -290,7 +303,7 @@ class ProcessAudioView(CreateAPIView):
         if sop_id:
             try:
                 sop = SOP.objects.get(id=sop_id)
-                sop_matches = match_sop_steps(transcription_text, sop)
+                sop_matches = match_sop_steps(transcription, sop)
                 response_data["sop_matches"] = sop_matches
                 audio_instance.sop = sop
                 audio_instance.save()
@@ -1365,7 +1378,8 @@ class SessionCreateView(CreateAPIView):
         # print(f"Request data: {request.data}") # Debug
         # print(f"User data: {user_data}") # Debug
         if serializer.is_valid():
-            serializer.save(user=user_data['user'])
+            session = serializer.save(user=user_data['user'])
+            SessionUser.objects.get_or_create(session=session, user=user_data['user'], defaults={"role": "operator"})
             return Response(serializer.data, status=status.HTTP_201_CREATED)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1405,7 +1419,9 @@ class SessionListView(APIView):
             if user_data['user'].role == 'admin':
                 sessions = Session.objects.all()
             else:
-                sessions = Session.objects.filter(user=user_data['user'])
+                sessions = Session.objects.filter(
+                    session_users__user=user_data['user']
+                ).distinct()
             sessions = sessions.order_by("-created_at")
             
             paginator = PageNumberPagination()
