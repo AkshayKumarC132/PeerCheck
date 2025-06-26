@@ -60,5 +60,11 @@ python manage.py runserver
 ```
 
 The application will be accessible at `http://127.0.0.1:8000/`.
+
 ### Speaker Recognition
-The system stores voice embeddings to remember speaker names across recordings.
+When processing audio with multiple speakers you can pass a `speaker_names`
+parameter containing a JSON object that maps detected speaker tags (for example
+`"Speaker_1"`) to real names. These names are saved with the corresponding
+voice embedding so future recordings can automatically identify the speaker
+using cosine similarity.
+

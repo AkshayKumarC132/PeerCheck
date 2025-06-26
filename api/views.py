@@ -248,12 +248,15 @@ class ProcessAudioView(CreateAPIView):
             for tag, emb in embeddings.items():
                 profile, _ = find_matching_speaker_profile(emb)
                 if profile:
-                    name_map[tag] = profile.name
-                elif tag in speaker_names_param:
-                    profile = SpeakerProfile.objects.create(name=speaker_names_param[tag], embedding=emb)
-                    name_map[tag] = profile.name
+                    name = profile.name
                 else:
-                    name_map[tag] = tag
+                    provided = speaker_names_param.get(tag, tag)
+                    profile, _ = SpeakerProfile.objects.get_or_create(
+                        name=provided,
+                        defaults={"embedding": emb},
+                    )
+                    name = profile.name
+                name_map[tag] = name
 
             for seg in transcription:
                 if seg["speaker"] in name_map:
@@ -1032,12 +1035,15 @@ class ReAnalyzeAudioView(APIView):
             for tag, emb in embeddings.items():
                 profile, _ = find_matching_speaker_profile(emb)
                 if profile:
-                    name_map[tag] = profile.name
-                elif tag in speaker_names_param:
-                    profile = SpeakerProfile.objects.create(name=speaker_names_param[tag], embedding=emb)
-                    name_map[tag] = profile.name
+                    name = profile.name
                 else:
-                    name_map[tag] = tag
+                    provided = speaker_names_param.get(tag, tag)
+                    profile, _ = SpeakerProfile.objects.get_or_create(
+                        name=provided,
+                        defaults={"embedding": emb},
+                    )
+                    name = profile.name
+                name_map[tag] = name
 
             for seg in transcription:
                 if seg["speaker"] in name_map:

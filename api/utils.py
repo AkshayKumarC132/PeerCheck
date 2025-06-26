@@ -890,26 +890,35 @@ def _aggregate_speaker_embeddings(raw_transcription: List[Dict], mapping: Dict[i
     return aggregated
 
 def find_matching_speaker_profile(embedding: List[float], threshold: float = 0.75):
-    """Return the SpeakerProfile matching the embedding if similarity exceeds threshold."""
+    """Return the SpeakerProfile matching the embedding if similarity exceeds threshold.
+
+    If a profile is matched, its stored embedding is updated by averaging it with
+    the provided embedding to make future matches more robust.
+    """
     from .models import SpeakerProfile
 
-    all_profiles = SpeakerProfile.objects.all()
-    if not all_profiles:
+    profiles = SpeakerProfile.objects.all()
+    if not profiles:
         return None, 0.0
 
     target = np.array(embedding)
     target_norm = np.linalg.norm(target)
     best_score = 0.0
     best_profile = None
-    for profile in all_profiles:
+    for profile in profiles:
         stored = np.array(profile.embedding)
         score = float(np.dot(target, stored) / (target_norm * np.linalg.norm(stored)))
         if score > best_score:
             best_score = score
             best_profile = profile
 
-    if best_score >= threshold:
+    if best_profile and best_score >= threshold:
+        # Update the stored embedding by averaging with the new vector
+        new_emb = np.mean([np.array(best_profile.embedding), target], axis=0)
+        best_profile.embedding = new_emb.tolist()
+        best_profile.save(update_fields=["embedding"])
         return best_profile, best_score
+
     return None, best_score
 
 # Additional utility functions for audio format support
