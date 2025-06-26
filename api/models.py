@@ -105,6 +105,16 @@ class SessionUser(models.Model):
 
     def __str__(self):
         return f"{self.user.username} in {self.session.name}"
+
+class SpeakerProfile(models.Model):
+    """Stores a speaker embedding with an associated human readable name."""
+    name = models.CharField(max_length=100, unique=True)
+    embedding = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
     
 class FeedbackReview(models.Model):
     reviewer = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='feedback_reviews')

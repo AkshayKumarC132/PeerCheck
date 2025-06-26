@@ -425,10 +425,11 @@ def match_sop_steps(transcription, sop):
 
     return results
 
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Any
 from collections import defaultdict
 import tempfile
 from pydub.effects import normalize
+import numpy as np
 
 def transcribe_with_speaker_diarization(
     audio_url: str, 
@@ -437,7 +438,7 @@ def transcribe_with_speaker_diarization(
     session_id: int = None,
     min_speaker_duration: float = 2.0,
     speaker_similarity_threshold: float = 0.85
-) -> List[Dict]:
+) -> Dict[str, Any]:
     """
     Enhanced transcription with speaker diarization supporting multiple audio formats.
     
@@ -450,7 +451,9 @@ def transcribe_with_speaker_diarization(
         speaker_similarity_threshold (float): Threshold for speaker clustering
     
     Returns:
-        List[Dict]: Transcription with speaker labels and metadata
+        Dict[str, Any]: Contains the processed transcription list under
+        ``transcription`` and averaged embeddings per speaker under
+        ``speaker_embeddings``.
     """
     from .models import SessionUser
     
@@ -483,19 +486,25 @@ def transcribe_with_speaker_diarization(
         )
         
         # Step 6: Enhanced speaker processing and clustering
-        processed_transcription = _enhance_speaker_detection(
-            raw_transcription, 
-            speaker_map, 
+        processed_transcription, id_mapping = _enhance_speaker_detection(
+            raw_transcription,
+            speaker_map,
             expected_speakers,
             min_speaker_duration,
             speaker_similarity_threshold
         )
+
+        speaker_embeddings = _aggregate_speaker_embeddings(raw_transcription, id_mapping)
         
         # Step 7: Post-processing and quality checks
         final_transcription = _post_process_transcription(processed_transcription, audio_info)
         
-        logger.info(f"Transcription completed successfully. Detected {len(set(t['speaker'] for t in final_transcription))} unique speakers")
-        return final_transcription
+        logger.info(
+            f"Transcription completed successfully. Detected {len(set(t['speaker'] for t in final_transcription))} unique speakers")
+        return {
+            "transcription": final_transcription,
+            "speaker_embeddings": speaker_embeddings,
+        }
         
     except Exception as e:
         logger.error(f"Transcription with diarization failed: {str(e)}")
@@ -677,7 +686,7 @@ def _perform_transcription_with_diarization(
                         transcription.append({
                             "text": result["text"],
                             "timestamp": timestamp,
-                            "raw_speaker_id": speaker_info["speaker_id"],
+                            "raw_speaker_id": speaker_info.get("speaker_id"),
                             "speaker_confidence": speaker_info["confidence"],
                             "speaker_vector": speaker_info.get("vector"),
                             "word_details": result.get("result", [])
@@ -690,7 +699,7 @@ def _perform_transcription_with_diarization(
                 transcription.append({
                     "text": final_result["text"],
                     "timestamp": timestamp,
-                    "raw_speaker_id": speaker_info["speaker_id"],
+                    "raw_speaker_id": speaker_info.get("speaker_id"),
                     "speaker_confidence": speaker_info["confidence"],
                     "speaker_vector": speaker_info.get("vector"),
                     "word_details": final_result.get("result", [])
@@ -707,7 +716,7 @@ def _extract_speaker_info(result: Dict, timestamp: float) -> Dict:
     speaker_info = {
         "speaker_id": None,
         "confidence": 0.0,
-        "vector": None
+        "vector": None,
     }
     
     if "spk" in result:
@@ -716,8 +725,7 @@ def _extract_speaker_info(result: Dict, timestamp: float) -> Dict:
         if isinstance(spk_data, list) and spk_data:
             # Speaker vector format
             speaker_info["vector"] = spk_data
-            # Generate speaker ID from vector (simplified clustering)
-            speaker_info["speaker_id"] = _vector_to_speaker_id(spk_data)
+            # Speaker ID is assigned later during clustering
             speaker_info["confidence"] = 0.8  # Default confidence for vector-based
             
         elif isinstance(spk_data, (int, float)):
@@ -731,71 +739,93 @@ def _extract_speaker_info(result: Dict, timestamp: float) -> Dict:
     
     return speaker_info
 
-def _vector_to_speaker_id(vector: List[float], threshold: float = 0.85) -> int:
-    """Convert speaker vector to speaker ID using simple clustering."""
-    # This is a simplified approach - in production, you might want to use
-    # more sophisticated clustering algorithms like DBSCAN or K-means
-    
-    # For now, use a hash-based approach for consistency
-    vector_hash = hash(tuple(round(v, 3) for v in vector[:10]))  # Use first 10 components
-    return abs(vector_hash) % 10  # Limit to 10 possible speakers
+def _vector_to_speaker_id(vector: List[float], clusters: List[np.ndarray], threshold: float = 0.85) -> int:
+    """Assign a vector to a cluster index based on cosine similarity."""
+    if not clusters:
+        clusters.append(np.array(vector))
+        return 0
+
+    target = np.array(vector)
+    target_norm = np.linalg.norm(target)
+    best_score = 0.0
+    best_idx = -1
+    for idx, center in enumerate(clusters):
+        score = float(np.dot(target, center) / (target_norm * np.linalg.norm(center)))
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_score >= threshold:
+        # Update cluster center
+        clusters[best_idx] = np.mean([clusters[best_idx], target], axis=0)
+        return best_idx
+
+    clusters.append(target)
+    return len(clusters) - 1
 
 def _enhance_speaker_detection(
-    raw_transcription: List[Dict], 
-    speaker_map: Dict[str, str], 
+    raw_transcription: List[Dict],
+    speaker_map: Dict[str, str],
     expected_speakers: int,
     min_duration: float,
     similarity_threshold: float
-) -> List[Dict]:
-    """Enhanced speaker detection with clustering and validation."""
+) -> Tuple[List[Dict], Dict[int, str]]:
+    """Enhanced speaker detection with clustering and validation.
+
+    Returns both the processed transcription and a mapping of raw speaker IDs to
+    final speaker tags for later use.
+    """
     
     if not raw_transcription:
-        return []
-    
-    # Group by raw speaker ID and analyze patterns
-    speaker_groups = defaultdict(list)
+        return [], {}
+
+    # Cluster segments using their speaker vectors
+    clusters: List[np.ndarray] = []
+    segment_clusters: Dict[int, List[Dict]] = defaultdict(list)
+
     for segment in raw_transcription:
-        speaker_id = segment.get("raw_speaker_id")
-        if speaker_id is not None:
-            speaker_groups[speaker_id].append(segment)
-    
-    # Filter out speakers with insufficient content
-    valid_speakers = {}
-    for speaker_id, segments in speaker_groups.items():
-        total_duration = sum(len(seg["text"].split()) * 0.6 for seg in segments)  # Rough duration estimate
-        if total_duration >= min_duration:
-            valid_speakers[speaker_id] = segments
-    
-    logger.info(f"Detected {len(valid_speakers)} valid speakers after filtering")
-    
-    # Assign final speaker labels
-    processed_transcription = []
-    speaker_counter = 1
-    speaker_id_mapping = {}
-    
-    for segment in raw_transcription:
-        raw_speaker_id = segment.get("raw_speaker_id")
-        
-        if raw_speaker_id in valid_speakers:
-            if raw_speaker_id not in speaker_id_mapping:
-                speaker_tag = f"Speaker_{speaker_counter}"
-                speaker_id_mapping[raw_speaker_id] = speaker_tag
-                speaker_counter += 1
-            
-            final_speaker_tag = speaker_id_mapping[raw_speaker_id]
-            final_speaker_name = speaker_map.get(final_speaker_tag, final_speaker_tag)
+        vector = segment.get("speaker_vector")
+        if vector is None:
+            cluster_id = 0
         else:
-            final_speaker_name = "Unknown"
-        
+            cluster_id = _vector_to_speaker_id(vector, clusters, similarity_threshold)
+        segment["raw_speaker_id"] = cluster_id
+        segment_clusters[cluster_id].append(segment)
+
+    # Filter clusters by minimum duration
+    valid_clusters: Dict[int, List[Dict]] = {}
+    for cid, segs in segment_clusters.items():
+        total_duration = sum(len(seg["text"].split()) * 0.6 for seg in segs)
+        if total_duration >= min_duration:
+            valid_clusters[cid] = segs
+
+    logger.info(f"Detected {len(valid_clusters)} valid speakers after filtering")
+
+    processed_transcription = []
+    speaker_id_mapping: Dict[int, str] = {}
+    counter = 1
+
+    for segment in raw_transcription:
+        cid = segment.get("raw_speaker_id")
+        if cid in valid_clusters:
+            if cid not in speaker_id_mapping:
+                tag = f"Speaker_{counter}"
+                speaker_id_mapping[cid] = tag
+                counter += 1
+            tag = speaker_id_mapping[cid]
+            final_name = speaker_map.get(tag, tag)
+        else:
+            final_name = "Unknown"
+
         processed_transcription.append({
-            "speaker": final_speaker_name,
+            "speaker": final_name,
             "text": segment["text"],
             "timestamp": segment["timestamp"],
             "confidence": segment.get("speaker_confidence", 0.0),
-            "word_details": segment.get("word_details", [])
+            "word_details": segment.get("word_details", []),
         })
-    
-    return processed_transcription
+
+    return processed_transcription, speaker_id_mapping
 
 def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> List[Dict]:
     """Post-process transcription for quality and consistency."""
@@ -856,8 +886,57 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
     
     logger.info(f"Post-processing completed: {len(merged_transcription)} segments, "
                 f"{len(unique_speakers)} unique speakers, {total_duration:.1f}s total duration")
-    
+
     return merged_transcription
+
+def _aggregate_speaker_embeddings(raw_transcription: List[Dict], mapping: Dict[int, str]) -> Dict[str, List[float]]:
+    """Average speaker vectors for each final speaker tag."""
+    speaker_vectors: Dict[str, List[List[float]]] = defaultdict(list)
+    for segment in raw_transcription:
+        raw_id = segment.get("raw_speaker_id")
+        vector = segment.get("speaker_vector")
+        if raw_id is None or vector is None:
+            continue
+        tag = mapping.get(raw_id)
+        if tag:
+            speaker_vectors[tag].append(vector)
+
+    aggregated = {}
+    for tag, vectors in speaker_vectors.items():
+        aggregated[tag] = np.mean(np.array(vectors), axis=0).tolist()
+    return aggregated
+
+def find_matching_speaker_profile(embedding: List[float], threshold: float = 0.75):
+    """Return the SpeakerProfile matching the embedding if similarity exceeds threshold.
+
+    If a profile is matched, its stored embedding is updated by averaging it with
+    the provided embedding to make future matches more robust.
+    """
+    from .models import SpeakerProfile
+
+    profiles = SpeakerProfile.objects.all()
+    if not profiles:
+        return None, 0.0
+
+    target = np.array(embedding)
+    target_norm = np.linalg.norm(target)
+    best_score = 0.0
+    best_profile = None
+    for profile in profiles:
+        stored = np.array(profile.embedding)
+        score = float(np.dot(target, stored) / (target_norm * np.linalg.norm(stored)))
+        if score > best_score:
+            best_score = score
+            best_profile = profile
+
+    if best_profile and best_score >= threshold:
+        # Update the stored embedding by averaging with the new vector
+        new_emb = np.mean([np.array(best_profile.embedding), target], axis=0)
+        best_profile.embedding = new_emb.tolist()
+        best_profile.save(update_fields=["embedding"])
+        return best_profile, best_score
+
+    return None, best_score
 
 # Additional utility functions for audio format support
 
