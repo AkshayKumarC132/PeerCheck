@@ -347,3 +347,20 @@ class FeedbackReviewSerializer(serializers.ModelSerializer):
         instance.resolved_flag = validated_data.get('resolved_flag', instance.resolved_flag)
         instance.save()
         return instance
+
+
+class SpeakerProfileSerializer(serializers.ModelSerializer):
+    embedding_count = serializers.IntegerField(source='embeddings.count', read_only=True)
+
+    class Meta:
+        model = SpeakerProfile
+        fields = ['id', 'name', 'embedding_count', 'created_at', 'updated_at']
+
+
+class SpeakerEmbeddingSerializer(serializers.ModelSerializer):
+    speaker = SpeakerProfileSerializer(read_only=True)
+    speaker_id = serializers.IntegerField(write_only=True, required=False)
+
+    class Meta:
+        model = SpeakerEmbedding
+        fields = ['id', 'vector', 'speaker', 'speaker_id', 'audio_file', 'created_at']

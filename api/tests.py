@@ -186,3 +186,30 @@ class RoleBasedAccessTests(TestCase):
     def test_get_audio_records_auditor(self):
         response = self.client.get(f'/api/audio-records/{self.auditor_token}/')
         self.assertEqual(response.status_code, 200)
+
+
+class SpeakerTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = UserProfile.objects.create_user(username='spk', email='spk@example.com', password='testpass')
+        self.token = AuthToken.objects.create(self.user)[1]
+
+    def test_create_and_list_speaker_profile(self):
+        resp = self.client.post(f'/api/speakers/{self.token}/', {'name': 'Alice'}, format='json')
+        self.assertEqual(resp.status_code, 201)
+        list_resp = self.client.get(f'/api/speakers/{self.token}/')
+        self.assertEqual(list_resp.status_code, 200)
+        self.assertEqual(len(list_resp.json()['speakers']), 1)
+
+    def test_assign_embedding(self):
+        audio = AudioFile.objects.create(file_path='t.wav', transcription={}, status='processed', duration=0)
+        emb = SpeakerEmbedding.objects.create(vector=[0.1, 0.2], audio_file=audio)
+        profile = SpeakerProfile.objects.create(name='Bob')
+        resp = self.client.post(
+            f'/api/speakers/assign/{emb.id}/{self.token}/',
+            {'speaker_id': profile.id},
+            format='json'
+        )
+        self.assertEqual(resp.status_code, 200)
+        emb.refresh_from_db()
+        self.assertEqual(emb.speaker, profile)
