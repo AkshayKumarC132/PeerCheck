@@ -68,3 +68,7 @@ parameter containing a JSON object that maps detected speaker tags (for example
 voice embedding so future recordings can automatically identify the speaker
 using cosine similarity.
 
+If the audio contains a single speaker you may simply pass the name as a plain
+string (e.g. `speaker_names="Akshay"`). The value will automatically be applied
+to the first detected speaker.
+

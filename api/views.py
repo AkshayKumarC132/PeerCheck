@@ -240,7 +240,8 @@ class ProcessAudioView(CreateAPIView):
                     try:
                         speaker_names_param = json.loads(speaker_names_param)
                     except json.JSONDecodeError:
-                        speaker_names_param = {}
+                        # Treat value as name for the first detected speaker
+                        speaker_names_param = {"Speaker_1": speaker_names_param.strip()}
             else:
                 speaker_names_param = {}
 
@@ -1027,7 +1028,7 @@ class ReAnalyzeAudioView(APIView):
                     try:
                         speaker_names_param = json.loads(speaker_names_param)
                     except json.JSONDecodeError:
-                        speaker_names_param = {}
+                        speaker_names_param = {"Speaker_1": speaker_names_param.strip()}
             else:
                 speaker_names_param = {}
 
