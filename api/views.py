@@ -6,10 +6,11 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile
+from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile
 from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
         SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
 from .utils import *
+import json
 from peercheck import settings
 from fuzzywuzzy import fuzz
 from Levenshtein import distance
@@ -222,14 +223,42 @@ class ProcessAudioView(CreateAPIView):
                 return Response({"error": f"Session user creation failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
 
         try:
-            transcription = transcribe_with_speaker_diarization(
-                audio_url=file_url, 
-                model_path=MODEL_PATH, 
-                speaker_model_path=SPEAKER_MODEL_PATH, 
+            result = transcribe_with_speaker_diarization(
+                audio_url=file_url,
+                model_path=MODEL_PATH,
+                speaker_model_path=SPEAKER_MODEL_PATH,
                 session_id=session_id,
                 min_speaker_duration=min_speaker_duration,
                 speaker_similarity_threshold=speaker_similarity_threshold
             )
+            transcription = result.get("transcription", [])
+            embeddings = result.get("speaker_embeddings", {})
+
+            speaker_names_param = request.data.get("speaker_names")
+            if speaker_names_param:
+                if isinstance(speaker_names_param, str):
+                    try:
+                        speaker_names_param = json.loads(speaker_names_param)
+                    except json.JSONDecodeError:
+                        speaker_names_param = {}
+            else:
+                speaker_names_param = {}
+
+            name_map = {}
+            for tag, emb in embeddings.items():
+                profile, _ = find_matching_speaker_profile(emb)
+                if profile:
+                    name_map[tag] = profile.name
+                elif tag in speaker_names_param:
+                    profile = SpeakerProfile.objects.create(name=speaker_names_param[tag], embedding=emb)
+                    name_map[tag] = profile.name
+                else:
+                    name_map[tag] = tag
+
+            for seg in transcription:
+                if seg["speaker"] in name_map:
+                    seg["speaker"] = name_map[seg["speaker"]]
+
             transcription_text = " ".join([segment["text"] for segment in transcription])
             # Extract speaker statistics
             unique_speakers = set(segment["speaker"] for segment in transcription)
@@ -978,8 +1007,7 @@ class ReAnalyzeAudioView(APIView):
         transcription_text = ""
         speaker_stats = {}
         try:
-            # Call your speaker diarization transcription function
-            transcription = transcribe_with_speaker_diarization(
+            result = transcribe_with_speaker_diarization(
                 audio_url=file_path,
                 model_path=MODEL_PATH,
                 speaker_model_path=SPEAKER_MODEL_PATH,
@@ -987,7 +1015,34 @@ class ReAnalyzeAudioView(APIView):
                 min_speaker_duration=min_speaker_duration,
                 speaker_similarity_threshold=speaker_similarity_threshold
             )
-            # Compose full transcription text
+            transcription = result.get("transcription", [])
+            embeddings = result.get("speaker_embeddings", {})
+
+            speaker_names_param = request.data.get("speaker_names")
+            if speaker_names_param:
+                if isinstance(speaker_names_param, str):
+                    try:
+                        speaker_names_param = json.loads(speaker_names_param)
+                    except json.JSONDecodeError:
+                        speaker_names_param = {}
+            else:
+                speaker_names_param = {}
+
+            name_map = {}
+            for tag, emb in embeddings.items():
+                profile, _ = find_matching_speaker_profile(emb)
+                if profile:
+                    name_map[tag] = profile.name
+                elif tag in speaker_names_param:
+                    profile = SpeakerProfile.objects.create(name=speaker_names_param[tag], embedding=emb)
+                    name_map[tag] = profile.name
+                else:
+                    name_map[tag] = tag
+
+            for seg in transcription:
+                if seg["speaker"] in name_map:
+                    seg["speaker"] = name_map[seg["speaker"]]
+
             transcription_text = " ".join([segment["text"] for segment in transcription])
 
             # Extract speaker statistics

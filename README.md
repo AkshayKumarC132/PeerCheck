@@ -60,3 +60,5 @@ python manage.py runserver
 ```
 
 The application will be accessible at `http://127.0.0.1:8000/`.
+### Speaker Recognition
+The system stores voice embeddings to remember speaker names across recordings.
