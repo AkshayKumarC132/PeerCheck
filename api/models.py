@@ -168,3 +168,20 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} by {self.user.username if self.user else 'Unknown'} at {self.timestamp}"
+
+class SpeakerProfile(models.Model):
+    name = models.CharField(max_length=100)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+class SpeakerEmbedding(models.Model):
+    vector = models.JSONField()
+    speaker = models.ForeignKey(SpeakerProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name="embeddings")
+    audio_file = models.ForeignKey(AudioFile, on_delete=models.CASCADE, related_name="speaker_embeddings")
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Embedding {self.id} for {self.speaker.name if self.speaker else 'Unknown'}"

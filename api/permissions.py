@@ -55,6 +55,8 @@ class RoleBasedPermission(permissions.BasePermission):
                 'sessionstatusupdateview': ['patch'], 
                 'adminuserlistview': ['get'],
                 'userprofiledetailsview': ['get'],
+                'speakerprofilelistcreateview': ['get', 'post'],
+                'speakerembeddingassignview': ['post'],
             },
             'reviewer': {
                 'soplistview': ['get'],
@@ -71,6 +73,7 @@ class RoleBasedPermission(permissions.BasePermission):
                 'auditlogview': ['get'],
                 'usersettingsview': ['get', 'patch'],
                 'userprofiledetailsview': ['get'],
+                'speakerprofilelistcreateview': ['get'],
             }
         }
 

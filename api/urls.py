@@ -4,9 +4,10 @@ from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDe
                     GetAudioRecordsView, AudioFileDetailView, ReAnalyzeAudioView,
                     SOPCreateView, SOPListView, SOPDetailView, 
                     SessionCreateView, SessionListView, SessionDetailView, 
-                    SessionReviewView, SessionStatusUpdateView, 
+                    SessionReviewView, SessionStatusUpdateView,
                     AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView, # Added AdminDashboardSummaryView
-                    UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView)
+                    UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView,
+                    SpeakerProfileListCreateView, SpeakerEmbeddingAssignView)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
 
 urlpatterns = [
@@ -50,4 +51,8 @@ urlpatterns = [
     path('admin/users/<str:token>/', AdminUserListView.as_view(), name='admin-user-list'),
     path('admin/user/<int:user_id>/<str:token>/', AdminUserDetailView.as_view(), name='admin-user-detail'),
     path('admin/dashboard-summary/<str:token>/', AdminDashboardSummaryView.as_view(), name='admin-dashboard-summary'), # New dashboard summary URL
+
+    # Speaker management
+    path('speakers/<str:token>/', SpeakerProfileListCreateView.as_view(), name='speaker-profiles'),
+    path('speakers/assign/<int:embedding_id>/<str:token>/', SpeakerEmbeddingAssignView.as_view(), name='speaker-assign'),
 ]

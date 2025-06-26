@@ -6,7 +6,7 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile
+from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerEmbedding, SpeakerProfile
 from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
         SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
 from .utils import *
@@ -22,11 +22,13 @@ from .serializers import ( # Ensure all relevant serializers are imported
     AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
     SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
     UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer,
-    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
+    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer,
+    SpeakerProfileSerializer, SpeakerEmbeddingSerializer
 )
 import logging
 from django.db import models
 import ast
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -262,6 +264,41 @@ class ProcessAudioView(CreateAPIView):
             user=user_data['user']  # Set the user
         )
         logger.info(f"Created AudioFile instance: {audio_instance.id}")
+
+        # Store speaker embeddings and attempt automatic name assignment
+        existing_embeddings = SpeakerEmbedding.objects.select_related('speaker').all()
+
+        def _cosine_sim(v1, v2):
+            v1 = np.array(v1)
+            v2 = np.array(v2)
+            denom = (np.linalg.norm(v1) * np.linalg.norm(v2))
+            if denom == 0:
+                return 0.0
+            return float(np.dot(v1, v2) / denom)
+
+        for segment in transcription:
+            vec = segment.get('speaker_vector')
+            if not vec:
+                continue
+
+            best_profile = None
+            best_score = 0.0
+            for emb in existing_embeddings:
+                score = _cosine_sim(vec, emb.vector)
+                if score > best_score:
+                    best_score = score
+                    best_profile = emb.speaker
+
+            assigned_profile = best_profile if best_profile and best_score >= speaker_similarity_threshold else None
+
+            SpeakerEmbedding.objects.create(
+                vector=vec,
+                speaker=assigned_profile,
+                audio_file=audio_instance
+            )
+
+            if assigned_profile:
+                segment['speaker'] = assigned_profile.name
 
         # Log audit
         AuditLog.objects.create(
@@ -2454,3 +2491,56 @@ class UserProfileDetailsView(APIView):
         except Exception as e:
             logger.error(f"Error fetching user profile: {str(e)}")
             return Response({"error": "An error occurred while fetching the user profile."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SpeakerProfileListCreateView(APIView):
+    """List existing speaker profiles or create a new one."""
+    permission_classes = [RoleBasedPermission]
+
+    def get(self, request, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        profiles = SpeakerProfile.objects.all()
+        serializer = SpeakerProfileSerializer(profiles, many=True)
+        return Response({'speakers': serializer.data}, status=status.HTTP_200_OK)
+
+    def post(self, request, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = SpeakerProfileSerializer(data=request.data)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+
+class SpeakerEmbeddingAssignView(APIView):
+    """Manually assign a speaker name to an embedding."""
+    permission_classes = [RoleBasedPermission]
+
+    def post(self, request, embedding_id, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        embedding = get_object_or_404(SpeakerEmbedding, id=embedding_id)
+        speaker_name = request.data.get('speaker_name')
+        speaker_id = request.data.get('speaker_id')
+
+        if speaker_id:
+            speaker = get_object_or_404(SpeakerProfile, id=speaker_id)
+        elif speaker_name:
+            speaker, _ = SpeakerProfile.objects.get_or_create(name=speaker_name)
+        else:
+            return Response({'error': 'speaker_name or speaker_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        embedding.speaker = speaker
+        embedding.save()
+
+        serializer = SpeakerEmbeddingSerializer(embedding)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
