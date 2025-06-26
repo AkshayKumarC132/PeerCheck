@@ -156,7 +156,8 @@ class AuditLog(models.Model):
         ('userprofile_delete', 'UserProfile Delete'), # Added UserProfile Delete
         ('session_status_update', 'Session Status Update'),
         ('session_update', 'Session Update'), 
-        ('session_delete', 'Session Delete'), 
+        ('session_delete', 'Session Delete'),
+        ('speaker_name_assigned', 'Speaker Name Assigned'),
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
@@ -168,3 +169,14 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} by {self.user.username if self.user else 'Unknown'} at {self.timestamp}"
+
+
+class SpeakerProfile(models.Model):
+    name = models.CharField(max_length=255, unique=True)  # Assuming speaker names are unique
+    voice_embedding = models.JSONField()  # Store voice embedding as a JSON array
+    user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='speaker_profiles')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name

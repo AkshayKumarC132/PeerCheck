@@ -729,6 +729,17 @@ def _extract_speaker_info(result: Dict, timestamp: float) -> Dict:
     if "spk_conf" in result:
         speaker_info["confidence"] = float(result["spk_conf"])
     
+    # Ensure a vector is present, even if it's a placeholder or derived
+    # If spk is an ID, we might not have a direct vector from Vosk here.
+    # This is a simplification; ideally, the system always works with vectors for identification.
+    if speaker_info["vector"] is None and speaker_info["speaker_id"] is not None:
+        # Placeholder: In a real scenario, if we get an ID but no vector,
+        # we'd need a way to fetch/generate a representative vector for that ID
+        # or the speaker identification step would need to handle ID-based lookups too.
+        # For now, we'll create a dummy vector based on the ID for consistency in structure.
+        # This part highlights a potential area for deeper integration with voice embedding generation.
+        speaker_info["vector"] = [float(speaker_info["speaker_id"])] * 10 # Dummy vector
+
     return speaker_info
 
 def _vector_to_speaker_id(vector: List[float], threshold: float = 0.85) -> int:
@@ -740,8 +751,60 @@ def _vector_to_speaker_id(vector: List[float], threshold: float = 0.85) -> int:
     vector_hash = hash(tuple(round(v, 3) for v in vector[:10]))  # Use first 10 components
     return abs(vector_hash) % 10  # Limit to 10 possible speakers
 
+# Speaker Identification
+from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
+from .models import SpeakerProfile
+
+def get_all_speaker_profiles():
+    """Retrieves all speaker profiles from the database."""
+    return SpeakerProfile.objects.all()
+
+def identify_speaker(voice_embedding: List[float], known_speakers: List[SpeakerProfile], similarity_threshold: float = 0.75) -> Optional[str]:
+    """
+    Identifies a speaker by comparing the voice embedding with known speakers.
+
+    Args:
+        voice_embedding (List[float]): The voice embedding of the current speaker.
+        known_speakers (List[SpeakerProfile]): A list of SpeakerProfile objects.
+        similarity_threshold (float): Minimum similarity score to consider a match.
+
+    Returns:
+        Optional[str]: The name of the identified speaker, or None if no match.
+    """
+    if not voice_embedding or not known_speakers:
+        return None
+
+    current_embedding = np.array(voice_embedding).reshape(1, -1)
+
+    best_match_name = None
+    highest_similarity = 0.0
+
+    for speaker_profile in known_speakers:
+        profile_embedding = np.array(speaker_profile.voice_embedding).reshape(1, -1)
+
+        # Ensure embeddings are compatible for cosine similarity (same number of dimensions)
+        if current_embedding.shape[1] != profile_embedding.shape[1]:
+            logger.warning(f"Skipping speaker {speaker_profile.name} due to incompatible embedding dimensions. "
+                           f"Current: {current_embedding.shape[1]}, Profile: {profile_embedding.shape[1]}")
+            continue
+
+        similarity = cosine_similarity(current_embedding, profile_embedding)[0][0]
+
+        if similarity > highest_similarity:
+            highest_similarity = similarity
+            best_match_name = speaker_profile.name
+
+    if highest_similarity >= similarity_threshold:
+        logger.info(f"Identified speaker: {best_match_name} with similarity: {highest_similarity:.2f}")
+        return best_match_name
+    else:
+        logger.info(f"No speaker identified above threshold {similarity_threshold}. Highest similarity: {highest_similarity:.2f} for potential match {best_match_name if best_match_name else 'None'}")
+        return None
+
+
 def _enhance_speaker_detection(
-    raw_transcription: List[Dict], 
+    raw_transcription: List[Dict],
     speaker_map: Dict[str, str], 
     expected_speakers: int,
     min_duration: float,
@@ -752,49 +815,85 @@ def _enhance_speaker_detection(
     if not raw_transcription:
         return []
     
-    # Group by raw speaker ID and analyze patterns
-    speaker_groups = defaultdict(list)
-    for segment in raw_transcription:
-        speaker_id = segment.get("raw_speaker_id")
-        if speaker_id is not None:
-            speaker_groups[speaker_id].append(segment)
+    if not raw_transcription:
+        return []
+
+    known_speaker_profiles = get_all_speaker_profiles()
     
-    # Filter out speakers with insufficient content
-    valid_speakers = {}
-    for speaker_id, segments in speaker_groups.items():
-        total_duration = sum(len(seg["text"].split()) * 0.6 for seg in segments)  # Rough duration estimate
-        if total_duration >= min_duration:
-            valid_speakers[speaker_id] = segments
-    
-    logger.info(f"Detected {len(valid_speakers)} valid speakers after filtering")
-    
-    # Assign final speaker labels
-    processed_transcription = []
-    speaker_counter = 1
-    speaker_id_mapping = {}
-    
+    # Store embeddings for each raw speaker ID
+    speaker_embeddings_map = defaultdict(list)
     for segment in raw_transcription:
         raw_speaker_id = segment.get("raw_speaker_id")
-        
-        if raw_speaker_id in valid_speakers:
-            if raw_speaker_id not in speaker_id_mapping:
-                speaker_tag = f"Speaker_{speaker_counter}"
-                speaker_id_mapping[raw_speaker_id] = speaker_tag
-                speaker_counter += 1
-            
-            final_speaker_tag = speaker_id_mapping[raw_speaker_id]
-            final_speaker_name = speaker_map.get(final_speaker_tag, final_speaker_tag)
-        else:
-            final_speaker_name = "Unknown"
+        embedding = segment.get("speaker_vector")
+        if raw_speaker_id is not None and embedding:
+            speaker_embeddings_map[raw_speaker_id].append(embedding)
+
+    # Determine representative embedding for each raw speaker ID
+    representative_embeddings = {}
+    for raw_id, embeddings_list in speaker_embeddings_map.items():
+        if embeddings_list:
+            # Simple average for now, more sophisticated methods could be used
+            representative_embeddings[raw_id] = np.mean(embeddings_list, axis=0).tolist()
+
+    processed_transcription = []
+    unidentified_speaker_counter = 1
+    # Map raw Vosk speaker IDs to final names (either identified or generic)
+    final_speaker_name_map = {}
+
+    for segment in raw_transcription:
+        raw_speaker_id = segment.get("raw_speaker_id")
+        voice_embedding = segment.get("speaker_vector") # Use per-segment embedding for identification attempt
+        final_speaker_name = "Unknown" # Default
+
+        if raw_speaker_id is not None:
+            if raw_speaker_id in final_speaker_name_map:
+                final_speaker_name = final_speaker_name_map[raw_speaker_id]
+            else:
+                # Attempt to identify this speaker if we haven't processed this raw_speaker_id yet
+                # Use the representative embedding for this raw_speaker_id for more stable identification
+                representative_embedding_for_id = representative_embeddings.get(raw_speaker_id)
+
+                if representative_embedding_for_id:
+                    identified_name = identify_speaker(representative_embedding_for_id, known_speaker_profiles, similarity_threshold)
+                    if identified_name:
+                        final_speaker_name = identified_name
+                        logger.info(f"RawSpeakerID {raw_speaker_id} identified as: {final_speaker_name}")
+                    else:
+                        # Not identified in DB, assign a generic "Speaker X" label for this session
+                        # Check if session_id and speaker_map can provide a name (e.g. from UI input)
+                        # This part might need more sophisticated handling if multiple unidentified speakers exist
+                        session_assigned_tag = f"Speaker_{unidentified_speaker_counter}" # Placeholder, may map to speaker_map
+
+                        # Try to use speaker_map if available from session users
+                        # This mapping is based on order of users in session, not voice.
+                        # The true "Speaker_X" from voice might not align with "Speaker_X" from session user order.
+                        # This logic needs careful review. For now, prioritize voice ID if available.
+
+                        # If speaker_map provides a name for this generic tag, use it.
+                        # Otherwise, use the generic tag itself.
+                        final_speaker_name = speaker_map.get(session_assigned_tag, session_assigned_tag)
+
+                        # Store this assignment to ensure raw_speaker_id consistently maps to this name for this transcription
+                        final_speaker_name_map[raw_speaker_id] = final_speaker_name
+                        logger.info(f"RawSpeakerID {raw_speaker_id} assigned generic name: {final_speaker_name}")
+                        unidentified_speaker_counter += 1 # Increment for the next unidentified speaker
+                else:
+                    # No representative embedding, fall back to unknown or generic
+                    final_speaker_name = f"Speaker_{unidentified_speaker_counter}"
+                    final_speaker_name_map[raw_speaker_id] = final_speaker_name
+                    logger.info(f"RawSpeakerID {raw_speaker_id} (no representative embedding) assigned generic name: {final_speaker_name}")
+                    unidentified_speaker_counter += 1
         
         processed_transcription.append({
             "speaker": final_speaker_name,
             "text": segment["text"],
             "timestamp": segment["timestamp"],
-            "confidence": segment.get("speaker_confidence", 0.0),
-            "word_details": segment.get("word_details", [])
+            "confidence": segment.get("speaker_confidence", 0.0), # This is Vosk's confidence, not identification confidence
+            "word_details": segment.get("word_details", []),
+            "voice_embedding": voice_embedding # Keep the original segment embedding for potential future use (e.g. UI selection for naming)
         })
-    
+
+    logger.info(f"Enhance speaker detection complete. Final mapping: {final_speaker_name_map}")
     return processed_transcription
 
 def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> List[Dict]:

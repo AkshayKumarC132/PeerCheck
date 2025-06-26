@@ -31,6 +31,27 @@ class AdminUserProfileSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ['date_joined', 'last_login', 'theme'] # Admin cannot change theme directly
 
+
+class SpeakerProfileSerializer(serializers.ModelSerializer):
+    user = UserProfileSerializer(read_only=True) # Display user details, not just ID
+    user_id = serializers.PrimaryKeyRelatedField(
+        queryset=UserProfile.objects.all(), source='user', write_only=True, allow_null=True, required=False
+    )
+
+    class Meta:
+        model = SpeakerProfile
+        fields = ['id', 'name', 'voice_embedding', 'user', 'user_id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+    def validate_voice_embedding(self, value):
+        if not isinstance(value, list):
+            raise serializers.ValidationError("Voice embedding must be a list (JSON array).")
+        if not all(isinstance(item, (int, float)) for item in value):
+            raise serializers.ValidationError("All items in voice embedding must be numbers.")
+        # Add more specific validation for embedding dimension if necessary
+        # For example: if len(value) != EXPECTED_DIMENSION: raise serializers.ValidationError(...)
+        return value
+
     def update(self, instance, validated_data):
         # Password should not be updated here by admin; use a separate mechanism if needed.
         validated_data.pop('password', None) 

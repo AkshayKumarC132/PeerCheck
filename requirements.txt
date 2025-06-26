@@ -11,7 +11,7 @@ transformers
 spacy-transformers
 
 # Text-to-Speech
-TTS
+# TTS
 
 # API Development
 fastapi

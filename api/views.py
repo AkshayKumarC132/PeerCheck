@@ -22,10 +22,11 @@ from .serializers import ( # Ensure all relevant serializers are imported
     AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
     SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
     UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer,
-    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
+    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, SpeakerProfileSerializer, # Added SpeakerProfileSerializer
 )
 import logging
 from django.db import models
+import numpy as np # For averaging embeddings
 import ast
 
 logger = logging.getLogger(__name__)
@@ -144,8 +145,9 @@ class ProcessAudioView(CreateAPIView):
         sop_id = request.data.get("sop_id") 
         session_id = serializer.validated_data.get("session_id")
         # session_user_ids = serializer.validated_data.get("session_user_ids", [])
+        speaker_names_str = request.data.get("speaker_names", None) # Get speaker_names as a string
 
-        print(f"Session ID: {session_id}, Session User IDs: {session_user_ids}")
+        print(f"Session ID: {session_id}, Session User IDs: {session_user_ids}, Speaker Names: {speaker_names_str}")
 
         # if not audio_file or not start_prompt or not end_prompt:
         #     return Response({"error": "Missing Start or End Prompt fields."}, status=status.HTTP_400_BAD_REQUEST)
@@ -239,7 +241,27 @@ class ProcessAudioView(CreateAPIView):
                 "total_segments": len(transcription),
                 "average_confidence": sum(segment.get("confidence", 0) for segment in transcription) / len(transcription) if transcription else 0
             }
-            logger.info(f"Transcription segments: {transcription}")
+            logger.info(f"Raw transcription segments: {transcription}")
+
+            # Handle single speaker name override
+            if speaker_names_str:
+                provided_speaker_names = [name.strip() for name in speaker_names_str.split(',') if name.strip()]
+                if len(provided_speaker_names) == 1:
+                    single_speaker_name = provided_speaker_names[0]
+                    logger.info(f"Single speaker name '{single_speaker_name}' provided. Overriding all speaker labels.")
+                    for segment in transcription:
+                        segment['speaker'] = single_speaker_name
+
+                    # Update speaker_stats for single speaker
+                    speaker_stats = {
+                        "total_speakers": 1,
+                        "speakers": [single_speaker_name],
+                        "total_segments": len(transcription),
+                        "average_confidence": speaker_stats["average_confidence"] # Keep original average confidence
+                    }
+                    logger.info(f"Updated transcription for single speaker: {transcription}")
+                    logger.info(f"Updated speaker_stats for single speaker: {speaker_stats}")
+
         except Exception as e:
             logger.error(f"Enhanced transcription failed: {str(e)}")
             # Fallback to basic transcription if enhanced fails
@@ -2454,3 +2476,113 @@ class UserProfileDetailsView(APIView):
         except Exception as e:
             logger.error(f"Error fetching user profile: {str(e)}")
             return Response({"error": "An error occurred while fetching the user profile."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class AssignSpeakerNameView(APIView):
+    """
+    Assigns a name to an unidentified speaker in an audio file's transcription
+    and creates a SpeakerProfile for them.
+    """
+    permission_classes = [RoleBasedPermission] # Ensure appropriate permissions
+
+    @extend_schema(
+        summary="Assign Name to Unidentified Speaker",
+        description="Assigns a name to a generic speaker label (e.g., 'Speaker_1') in an audio file's transcription. Creates a SpeakerProfile for future recognition.",
+        parameters=[
+            OpenApiParameter('token', OpenApiTypes.STR, OpenApiParameter.PATH, description='Authentication token.')
+        ],
+        request=OpenApiTypes.OBJECT, # Example: {"audio_file_id": 1, "generic_speaker_label": "Speaker_1", "assigned_name": "John Doe"}
+        responses={
+            200: OpenApiTypes.OBJECT, # Example: {"message": "Speaker assigned successfully", "speaker_profile": ...}
+            400: ErrorResponseSerializer,
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+            404: ErrorResponseSerializer,
+        },
+        tags=['Audio Processing', 'Speaker Recognition']
+    )
+    def post(self, request, token, format=None):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        request.validated_user = user_data['user'] # For RoleBasedPermission if needed
+
+        audio_file_id = request.data.get('audio_file_id')
+        generic_speaker_label = request.data.get('generic_speaker_label')
+        assigned_name = request.data.get('assigned_name')
+
+        if not all([audio_file_id, generic_speaker_label, assigned_name]):
+            return Response({"error": "audio_file_id, generic_speaker_label, and assigned_name are required."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            audio_file = AudioFile.objects.get(pk=audio_file_id)
+        except AudioFile.DoesNotExist:
+            return Response({"error": "AudioFile not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        # Check permissions: user should own the audio file or be an admin
+        if not (request.validated_user.role == 'admin' or audio_file.user == request.validated_user):
+            logger.warning(f"User {request.validated_user.username} permission denied to assign speaker name for audio file {audio_file_id}")
+            return Response({"error": "Permission denied."}, status=status.HTTP_403_FORBIDDEN)
+
+        transcription_data = audio_file.transcription
+        if not isinstance(transcription_data, list):
+            return Response({"error": "Transcription data is not in the expected format."}, status=status.HTTP_400_BAD_REQUEST)
+
+        speaker_embeddings = []
+        found_label = False
+        for segment in transcription_data:
+            if segment.get('speaker') == generic_speaker_label:
+                found_label = True
+                if 'voice_embedding' in segment and segment['voice_embedding']:
+                    speaker_embeddings.append(segment['voice_embedding'])
+
+        if not found_label:
+            return Response({"error": f"Generic speaker label '{generic_speaker_label}' not found in transcription."}, status=status.HTTP_404_NOT_FOUND)
+
+        if not speaker_embeddings:
+            return Response({"error": f"No voice embeddings found for '{generic_speaker_label}'. Cannot create profile."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Calculate representative embedding (average)
+        try:
+            representative_embedding = np.mean(speaker_embeddings, axis=0).tolist()
+        except Exception as e:
+            logger.error(f"Error averaging embeddings: {str(e)}")
+            return Response({"error": "Could not process voice embeddings."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Create or update SpeakerProfile
+        speaker_profile, created = SpeakerProfile.objects.update_or_create(
+            name=assigned_name,
+            defaults={'voice_embedding': representative_embedding}
+        )
+        if created:
+            logger.info(f"Created new SpeakerProfile: {assigned_name}")
+        else:
+            logger.info(f"Updated SpeakerProfile: {assigned_name}")
+
+        # Update transcription data with the new name
+        for segment in transcription_data:
+            if segment.get('speaker') == generic_speaker_label:
+                segment['speaker'] = assigned_name
+
+        audio_file.transcription = transcription_data
+        audio_file.save()
+
+        # Log audit
+        AuditLog.objects.create(
+            action='speaker_name_assigned', # Add this to ACTION_CHOICES in AuditLog model
+            user=request.validated_user,
+            object_id=audio_file.id,
+            object_type='AudioFile',
+            details={
+                'assigned_name': assigned_name,
+                'generic_label': generic_speaker_label,
+                'speaker_profile_id': speaker_profile.id
+            }
+        )
+
+        return Response({
+            "message": "Speaker assigned successfully and profile created/updated.",
+            "speaker_profile": SpeakerProfileSerializer(speaker_profile).data,
+            "audio_file": AudioFileSerializer(audio_file).data
+        }, status=status.HTTP_200_OK)
