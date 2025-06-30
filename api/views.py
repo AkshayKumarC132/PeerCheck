@@ -6,7 +6,7 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile
+from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile
 from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
         SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
 from .utils import *
@@ -22,7 +22,7 @@ from .serializers import ( # Ensure all relevant serializers are imported
     AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
     SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
     UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer,
-    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
+    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, SpeakerProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
 )
 import logging
 from django.db import models
@@ -2454,3 +2454,40 @@ class UserProfileDetailsView(APIView):
         except Exception as e:
             logger.error(f"Error fetching user profile: {str(e)}")
             return Response({"error": "An error occurred while fetching the user profile."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class SpeakerProfileUpdateView(APIView):
+    """API to manually assign or update a speaker name."""
+    permission_classes = [RoleBasedPermission]
+
+    def put(self, request, profile_id, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            profile = SpeakerProfile.objects.get(id=profile_id)
+        except SpeakerProfile.DoesNotExist:
+            return Response({'error': 'Speaker profile not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        name = request.data.get('name')
+        if not name:
+            return Response({'error': 'Name is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        profile.name = name
+        profile.save()
+        return Response(SpeakerProfileSerializer(profile).data, status=status.HTTP_200_OK)
+
+
+class SpeakerProfileListView(APIView):
+    """API to list all speaker profiles."""
+    permission_classes = [RoleBasedPermission]
+
+    def get(self, request, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        profiles = SpeakerProfile.objects.all().order_by('id')
+        serializer = SpeakerProfileSerializer(profiles, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
