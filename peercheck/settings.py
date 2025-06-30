@@ -125,7 +125,7 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'main.sqlite3',
+        'NAME': BASE_DIR / 'initial.sqlite3',
     },
     'default1y': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
