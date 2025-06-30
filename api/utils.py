@@ -821,14 +821,14 @@ def _enhance_speaker_detection(
     for seg in raw_transcription:
         clusters[seg.get("cluster_id")].append(seg)
 
-    # Filter clusters with insufficient duration
-    valid_clusters = {}
-    for cid, segments in clusters.items():
-        total_duration = sum(len(s["text"].split()) * 0.6 for s in segments)
-        if total_duration >= min_duration:
-            valid_clusters[cid] = segments
-
-    logger.info(f"Detected {len(valid_clusters)} valid speakers after clustering")
+    # Evaluate cluster durations (approximate) but keep all clusters
+    cluster_durations = {
+        cid: sum(len(s["text"].split()) * 0.6 for s in segs)
+        for cid, segs in clusters.items()
+    }
+    logger.info(
+        f"Detected {len(clusters)} speaker clusters (min duration {min_duration}s)"
+    )
 
     # Assign final speaker labels consistently
     processed_transcription = []
@@ -838,15 +838,12 @@ def _enhance_speaker_detection(
     for segment in raw_transcription:
         cid = segment.get("cluster_id")
 
-        if cid in valid_clusters:
-            if cid not in cluster_to_tag:
-                tag = f"Speaker_{speaker_counter}"
-                cluster_to_tag[cid] = tag
-                speaker_counter += 1
-            final_tag = cluster_to_tag[cid]
-            speaker_name = speaker_map.get(final_tag, final_tag)
-        else:
-            speaker_name = "Unknown"
+        if cid not in cluster_to_tag:
+            tag = f"Speaker_{speaker_counter}"
+            cluster_to_tag[cid] = tag
+            speaker_counter += 1
+        final_tag = cluster_to_tag[cid]
+        speaker_name = speaker_map.get(final_tag, final_tag)
 
         processed_transcription.append({
             "speaker": speaker_name,
