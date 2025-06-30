@@ -36,3 +36,4 @@ boto3
 
 drf-spectacular
 drf-yasg
+speechbrain
