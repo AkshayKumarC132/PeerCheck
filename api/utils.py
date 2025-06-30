@@ -790,7 +790,18 @@ def _enhance_speaker_detection(
             labels = clustering.fit_predict(vectors_np)
 
             n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-            if expected_speakers and n_clusters > expected_speakers:
+            if n_clusters <= 1 and len(vectors_np) > 1:
+                # DBSCAN collapsed everything into one cluster or noise
+                # fallback to a simple Agglomerative approach to force
+                # multiple speaker groups
+                fallback_clusters = expected_speakers if expected_speakers else 2
+                clustering = AgglomerativeClustering(
+                    n_clusters=fallback_clusters,
+                    affinity="cosine",
+                    linkage="average",
+                )
+                labels = clustering.fit_predict(vectors_np)
+            elif expected_speakers and n_clusters > expected_speakers:
                 clustering = AgglomerativeClustering(
                     n_clusters=expected_speakers,
                     affinity="cosine",
