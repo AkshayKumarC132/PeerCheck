@@ -84,6 +84,7 @@ import spacy # python -m spacy download en_core_web_sm
 
 import os
 import logging
+from .speaker_utils import assign_speaker_profiles
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
@@ -493,6 +494,9 @@ def transcribe_with_speaker_diarization(
         
         # Step 7: Post-processing and quality checks
         final_transcription = _post_process_transcription(processed_transcription, audio_info)
+
+        # Step 8: Assign speaker profiles based on embeddings
+        final_transcription = assign_speaker_profiles(final_transcription)
         
         logger.info(f"Transcription completed successfully. Detected {len(set(t['speaker'] for t in final_transcription))} unique speakers")
         return final_transcription
@@ -792,7 +796,8 @@ def _enhance_speaker_detection(
             "text": segment["text"],
             "timestamp": segment["timestamp"],
             "confidence": segment.get("speaker_confidence", 0.0),
-            "word_details": segment.get("word_details", [])
+            "word_details": segment.get("word_details", []),
+            "speaker_vector": segment.get("speaker_vector")
         })
     
     return processed_transcription
@@ -816,6 +821,7 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
     current_text = ""
     current_timestamp = 0
     current_confidence = 0
+    current_vector = None
     
     for segment in filtered_transcription:
         speaker = segment["speaker"]
@@ -825,6 +831,8 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             # Merge with previous segment
             current_text += " " + text
             current_confidence = max(current_confidence, segment.get("confidence", 0))
+            if not current_vector:
+                current_vector = segment.get("speaker_vector")
         else:
             # Save previous segment if it exists
             if current_text:
@@ -832,7 +840,8 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
                     "speaker": current_speaker,
                     "text": current_text,
                     "timestamp": current_timestamp,
-                    "confidence": current_confidence
+                    "confidence": current_confidence,
+                    "speaker_vector": current_vector
                 })
             
             # Start new segment
@@ -840,6 +849,7 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             current_text = text
             current_timestamp = segment["timestamp"]
             current_confidence = segment.get("confidence", 0)
+            current_vector = segment.get("speaker_vector")
     
     # Don't forget the last segment
     if current_text:
@@ -847,7 +857,8 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             "speaker": current_speaker,
             "text": current_text,
             "timestamp": current_timestamp,
-            "confidence": current_confidence
+            "confidence": current_confidence,
+            "speaker_vector": current_vector
         })
     
     # Add metadata

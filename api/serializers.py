@@ -59,6 +59,12 @@ class AuditLogSerializer(serializers.ModelSerializer):
         model = AuditLog
         fields = ['id', 'action', 'user', 'timestamp', 'session', 'object_id', 'object_type', 'details']
 
+
+class SpeakerProfileSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SpeakerProfile
+        fields = ['id', 'name', 'embedding', 'created_at', 'updated_at']
+
 class LoginSerializer(serializers.Serializer):
     username = serializers.CharField()
     password = serializers.CharField()
