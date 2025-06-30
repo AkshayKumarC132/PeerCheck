@@ -1,6 +1,6 @@
 import numpy as np
 from numpy.linalg import norm
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from .models import SpeakerProfile
 
@@ -13,7 +13,7 @@ def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return float(np.dot(a, b) / (norm(a) * norm(b)))
 
 
-def match_speaker_embedding(embedding: List[float], threshold: float = 0.8) -> SpeakerProfile | None:
+def match_speaker_embedding(embedding: List[float], threshold: float = 0.8) -> Optional[SpeakerProfile]:
     """Return the best matching speaker profile or None."""
     best_profile = None
     best_score = 0.0

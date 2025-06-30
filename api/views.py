@@ -2477,3 +2477,17 @@ class SpeakerProfileUpdateView(APIView):
         profile.name = name
         profile.save()
         return Response(SpeakerProfileSerializer(profile).data, status=status.HTTP_200_OK)
+
+
+class SpeakerProfileListView(APIView):
+    """API to list all speaker profiles."""
+    permission_classes = [RoleBasedPermission]
+
+    def get(self, request, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        profiles = SpeakerProfile.objects.all().order_by('id')
+        serializer = SpeakerProfileSerializer(profiles, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
