@@ -769,14 +769,12 @@ def _enhance_speaker_detection(
 
     # Assign cluster ids using clustering if embeddings are available
     if vectors:
-        # Normalize vectors for cosine distance
         vectors_np = np.array(vectors, dtype=float)
         norms = np.linalg.norm(vectors_np, axis=1, keepdims=True)
         norms[norms == 0] = 1.0
         vectors_np = vectors_np / norms
 
         if expected_speakers and expected_speakers > 0:
-            # Use AgglomerativeClustering when the expected number of speakers is known
             clustering = AgglomerativeClustering(
                 n_clusters=expected_speakers,
                 affinity="cosine",
@@ -785,11 +783,20 @@ def _enhance_speaker_detection(
             labels = clustering.fit_predict(vectors_np)
         else:
             clustering = DBSCAN(
-                eps=1 - similarity_threshold,
-                min_samples=1,
+                eps=max(0.05, 1 - similarity_threshold),
+                min_samples=2,
                 metric="cosine",
             )
             labels = clustering.fit_predict(vectors_np)
+
+            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+            if expected_speakers and n_clusters > expected_speakers:
+                clustering = AgglomerativeClustering(
+                    n_clusters=expected_speakers,
+                    affinity="cosine",
+                    linkage="average",
+                )
+                labels = clustering.fit_predict(vectors_np)
 
         for i, label in zip(idx_map, labels):
             raw_transcription[i]["cluster_id"] = int(label)

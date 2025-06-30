@@ -63,9 +63,10 @@ The application will be accessible at `http://127.0.0.1:8000/`.
 
 ## Improved Speaker Diarization
 
-The transcription pipeline now clusters speaker embeddings to reduce
+The transcription pipeline clusters speaker embeddings to reduce
 over-segmentation and more accurately detect the true number of speakers.
 If the expected speaker count is known, it uses Agglomerative Clustering to
-produce that number of groups. Otherwise, DBSCAN groups embeddings based on
-similarity. Detected speaker embeddings are matched to stored profiles so the
+return exactly that many groups. Otherwise, DBSCAN groups embeddings by
+similarity and a fallback Agglomerative step merges clusters when too many are
+detected. Detected speaker embeddings are matched to stored profiles so the
 same real-world speaker receives a consistent label across recordings.
