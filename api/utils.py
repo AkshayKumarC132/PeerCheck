@@ -84,6 +84,7 @@ import spacy # python -m spacy download en_core_web_sm
 
 import os
 import logging
+from sklearn.cluster import DBSCAN
 from .speaker_utils import assign_speaker_profiles
 
 logger = logging.getLogger(__name__)
@@ -745,61 +746,78 @@ def _vector_to_speaker_id(vector: List[float], threshold: float = 0.85) -> int:
     return abs(vector_hash) % 10  # Limit to 10 possible speakers
 
 def _enhance_speaker_detection(
-    raw_transcription: List[Dict], 
-    speaker_map: Dict[str, str], 
+    raw_transcription: List[Dict],
+    speaker_map: Dict[str, str],
     expected_speakers: int,
     min_duration: float,
     similarity_threshold: float
 ) -> List[Dict]:
-    """Enhanced speaker detection with clustering and validation."""
-    
+    """Enhanced speaker detection using clustering and validation."""
+
     if not raw_transcription:
         return []
-    
-    # Group by raw speaker ID and analyze patterns
-    speaker_groups = defaultdict(list)
-    for segment in raw_transcription:
-        speaker_id = segment.get("raw_speaker_id")
-        if speaker_id is not None:
-            speaker_groups[speaker_id].append(segment)
-    
-    # Filter out speakers with insufficient content
-    valid_speakers = {}
-    for speaker_id, segments in speaker_groups.items():
-        total_duration = sum(len(seg["text"].split()) * 0.6 for seg in segments)  # Rough duration estimate
+
+    # Collect embeddings for clustering
+    vectors = []
+    idx_map = []
+    for idx, segment in enumerate(raw_transcription):
+        vec = segment.get("speaker_vector")
+        if isinstance(vec, list) and vec:
+            vectors.append(vec)
+            idx_map.append(idx)
+
+    # Assign cluster ids using DBSCAN if embeddings are available
+    if vectors:
+        clustering = DBSCAN(eps=1 - similarity_threshold, min_samples=1, metric="cosine")
+        labels = clustering.fit_predict(vectors)
+        for i, label in zip(idx_map, labels):
+            raw_transcription[i]["cluster_id"] = int(label)
+    else:
+        # Fallback to raw speaker IDs
+        for segment in raw_transcription:
+            segment["cluster_id"] = segment.get("raw_speaker_id")
+
+    # Group segments by cluster ID
+    clusters = defaultdict(list)
+    for seg in raw_transcription:
+        clusters[seg.get("cluster_id")].append(seg)
+
+    # Filter clusters with insufficient duration
+    valid_clusters = {}
+    for cid, segments in clusters.items():
+        total_duration = sum(len(s["text"].split()) * 0.6 for s in segments)
         if total_duration >= min_duration:
-            valid_speakers[speaker_id] = segments
-    
-    logger.info(f"Detected {len(valid_speakers)} valid speakers after filtering")
-    
-    # Assign final speaker labels
+            valid_clusters[cid] = segments
+
+    logger.info(f"Detected {len(valid_clusters)} valid speakers after clustering")
+
+    # Assign final speaker labels consistently
     processed_transcription = []
+    cluster_to_tag = {}
     speaker_counter = 1
-    speaker_id_mapping = {}
-    
+
     for segment in raw_transcription:
-        raw_speaker_id = segment.get("raw_speaker_id")
-        
-        if raw_speaker_id in valid_speakers:
-            if raw_speaker_id not in speaker_id_mapping:
-                speaker_tag = f"Speaker_{speaker_counter}"
-                speaker_id_mapping[raw_speaker_id] = speaker_tag
+        cid = segment.get("cluster_id")
+
+        if cid in valid_clusters:
+            if cid not in cluster_to_tag:
+                tag = f"Speaker_{speaker_counter}"
+                cluster_to_tag[cid] = tag
                 speaker_counter += 1
-            
-            final_speaker_tag = speaker_id_mapping[raw_speaker_id]
-            final_speaker_name = speaker_map.get(final_speaker_tag, final_speaker_tag)
+            final_tag = cluster_to_tag[cid]
+            speaker_name = speaker_map.get(final_tag, final_tag)
         else:
-            final_speaker_name = "Unknown"
-        
+            speaker_name = "Unknown"
+
         processed_transcription.append({
-            "speaker": final_speaker_name,
+            "speaker": speaker_name,
             "text": segment["text"],
             "timestamp": segment["timestamp"],
             "confidence": segment.get("speaker_confidence", 0.0),
             "word_details": segment.get("word_details", []),
             "speaker_vector": segment.get("speaker_vector")
         })
-    
+
     return processed_transcription
 
 def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> List[Dict]:
