@@ -84,7 +84,8 @@ import spacy # python -m spacy download en_core_web_sm
 
 import os
 import logging
-from sklearn.cluster import DBSCAN
+import numpy as np
+from sklearn.cluster import DBSCAN, AgglomerativeClustering
 from .speaker_utils import assign_speaker_profiles
 
 logger = logging.getLogger(__name__)
@@ -766,10 +767,30 @@ def _enhance_speaker_detection(
             vectors.append(vec)
             idx_map.append(idx)
 
-    # Assign cluster ids using DBSCAN if embeddings are available
+    # Assign cluster ids using clustering if embeddings are available
     if vectors:
-        clustering = DBSCAN(eps=1 - similarity_threshold, min_samples=1, metric="cosine")
-        labels = clustering.fit_predict(vectors)
+        # Normalize vectors for cosine distance
+        vectors_np = np.array(vectors, dtype=float)
+        norms = np.linalg.norm(vectors_np, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        vectors_np = vectors_np / norms
+
+        if expected_speakers and expected_speakers > 0:
+            # Use AgglomerativeClustering when the expected number of speakers is known
+            clustering = AgglomerativeClustering(
+                n_clusters=expected_speakers,
+                affinity="cosine",
+                linkage="average",
+            )
+            labels = clustering.fit_predict(vectors_np)
+        else:
+            clustering = DBSCAN(
+                eps=1 - similarity_threshold,
+                min_samples=1,
+                metric="cosine",
+            )
+            labels = clustering.fit_predict(vectors_np)
+
         for i, label in zip(idx_map, labels):
             raw_transcription[i]["cluster_id"] = int(label)
     else:

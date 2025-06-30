@@ -63,7 +63,9 @@ The application will be accessible at `http://127.0.0.1:8000/`.
 
 ## Improved Speaker Diarization
 
-The transcription pipeline now clusters speaker embeddings using DBSCAN to
-reduce over-segmentation and more accurately detect the true number of
-speakers. Detected speaker embeddings are matched to stored profiles so the
-same real-world speaker receives a consistent label across recordings
+The transcription pipeline now clusters speaker embeddings to reduce
+over-segmentation and more accurately detect the true number of speakers.
+If the expected speaker count is known, it uses Agglomerative Clustering to
+produce that number of groups. Otherwise, DBSCAN groups embeddings based on
+similarity. Detected speaker embeddings are matched to stored profiles so the
+same real-world speaker receives a consistent label across recordings.
