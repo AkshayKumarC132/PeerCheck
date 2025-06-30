@@ -72,4 +72,6 @@ single cluster, a fallback Agglomerative step re-clusters the embeddings to
 produce a more reasonable number of speakers. Clusters are no longer dropped
 based on short duration, ensuring every detected speaker receives a label.
 Detected speaker embeddings are matched to stored profiles so the same
-real-world speaker receives a consistent label across recordings.
+real-world speaker receives a consistent label across recordings. These
+profiles ensure that a familiar voice is labelled consistently across
+uploads.

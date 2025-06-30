@@ -809,8 +809,17 @@ def _enhance_speaker_detection(
                 )
                 labels = clustering.fit_predict(vectors_np)
 
-        for i, label in zip(idx_map, labels):
-            raw_transcription[i]["cluster_id"] = int(label)
+        max_label = max(labels) if len(labels) > 0 else -1
+        adjusted_labels = []
+        for label in labels:
+            if label == -1:
+                max_label += 1
+                adjusted_labels.append(max_label)
+            else:
+                adjusted_labels.append(int(label))
+
+        for i, label in zip(idx_map, adjusted_labels):
+            raw_transcription[i]["cluster_id"] = label
     else:
         # Fallback to raw speaker IDs
         for segment in raw_transcription:
