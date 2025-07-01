@@ -498,7 +498,10 @@ def transcribe_with_speaker_diarization(
         final_transcription = _post_process_transcription(processed_transcription, audio_info)
 
         # Step 8: Assign speaker profiles based on embeddings
-        final_transcription = assign_speaker_profiles(final_transcription)
+        allowed_speakers = list(speaker_map.values()) if speaker_map else None
+        final_transcription = assign_speaker_profiles(
+            final_transcription, allowed_speakers=allowed_speakers
+        )
         
         logger.info(f"Transcription completed successfully. Detected {len(set(t['speaker'] for t in final_transcription))} unique speakers")
         return final_transcription

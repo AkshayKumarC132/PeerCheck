@@ -27,19 +27,44 @@ def match_speaker_embedding(embedding: List[float], threshold: float = 0.8) -> O
     return None
 
 
-def assign_speaker_profiles(segments: List[Dict], threshold: float = 0.8) -> List[Dict]:
-    """Attach speaker profiles to transcription segments and create new profiles if needed."""
-    updated_segments = []
+def assign_speaker_profiles(
+    segments: List[Dict],
+    threshold: float = 0.8,
+    allowed_speakers: Optional[List[str]] = None,
+) -> List[Dict]:
+    """Attach speaker profiles to segments.
+
+    When ``allowed_speakers`` is provided, new profiles are only created for
+    those speaker names. This prevents saving embeddings for spurious speakers
+    that the diarization step may have introduced.
+    """
+
+    # Aggregate vectors by speaker label so each speaker generates at most one
+    # profile. This also allows averaging vectors from multiple segments.
+    speaker_vectors: Dict[str, List[List[float]]] = {}
     for seg in segments:
-        vector = seg.get("speaker_vector")
-        if vector is None:
-            updated_segments.append(seg)
+        vec = seg.get("speaker_vector")
+        name = seg.get("speaker")
+        if vec is not None and name:
+            speaker_vectors.setdefault(name, []).append(vec)
+
+    profiles: Dict[str, SpeakerProfile] = {}
+    for name, vecs in speaker_vectors.items():
+        if allowed_speakers is not None and name not in allowed_speakers:
             continue
-        profile = match_speaker_embedding(vector, threshold)
+        mean_vec = np.mean(np.array(vecs, dtype=float), axis=0).tolist()
+        profile = match_speaker_embedding(mean_vec, threshold)
         if profile is None:
-            profile = SpeakerProfile.objects.create(embedding=vector)
-        seg["speaker_profile_id"] = profile.id
-        seg["speaker"] = profile.name or seg.get("speaker")
+            profile = SpeakerProfile.objects.create(embedding=mean_vec, name=name)
+        profiles[name] = profile
+
+    updated_segments: List[Dict] = []
+    for seg in segments:
+        name = seg.get("speaker")
+        profile = profiles.get(name)
+        if profile:
+            seg["speaker_profile_id"] = profile.id
+            seg["speaker"] = profile.name or name
         updated_segments.append(seg)
     return updated_segments
 
