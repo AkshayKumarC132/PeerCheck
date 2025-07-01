@@ -60,3 +60,18 @@ python manage.py runserver
 ```
 
 The application will be accessible at `http://127.0.0.1:8000/`.
+
+## Improved Speaker Diarization
+
+The transcription pipeline clusters speaker embeddings to reduce
+over-segmentation and more accurately detect the true number of speakers.
+If the expected speaker count is known, it uses Agglomerative Clustering to
+return exactly that many groups. Otherwise, DBSCAN groups embeddings by
+similarity. When DBSCAN either over-splits or collapses all segments into a
+single cluster, a fallback Agglomerative step re-clusters the embeddings to
+produce a more reasonable number of speakers. Clusters are no longer dropped
+based on short duration, ensuring every detected speaker receives a label.
+Detected speaker embeddings are matched to stored profiles so the same
+real-world speaker receives a consistent label across recordings. These
+profiles ensure that a familiar voice is labelled consistently across
+uploads.

@@ -84,6 +84,9 @@ import spacy # python -m spacy download en_core_web_sm
 
 import os
 import logging
+import numpy as np
+from sklearn.cluster import DBSCAN, AgglomerativeClustering
+from .speaker_utils import assign_speaker_profiles
 
 logger = logging.getLogger(__name__)
 nlp = spacy.load("en_core_web_sm")
@@ -493,6 +496,12 @@ def transcribe_with_speaker_diarization(
         
         # Step 7: Post-processing and quality checks
         final_transcription = _post_process_transcription(processed_transcription, audio_info)
+
+        # Step 8: Assign speaker profiles based on embeddings
+        allowed_speakers = list(speaker_map.values()) if speaker_map else None
+        final_transcription = assign_speaker_profiles(
+            final_transcription, allowed_speakers=allowed_speakers
+        )
         
         logger.info(f"Transcription completed successfully. Detected {len(set(t['speaker'] for t in final_transcription))} unique speakers")
         return final_transcription
@@ -741,60 +750,122 @@ def _vector_to_speaker_id(vector: List[float], threshold: float = 0.85) -> int:
     return abs(vector_hash) % 10  # Limit to 10 possible speakers
 
 def _enhance_speaker_detection(
-    raw_transcription: List[Dict], 
-    speaker_map: Dict[str, str], 
+    raw_transcription: List[Dict],
+    speaker_map: Dict[str, str],
     expected_speakers: int,
     min_duration: float,
     similarity_threshold: float
 ) -> List[Dict]:
-    """Enhanced speaker detection with clustering and validation."""
-    
+    """Enhanced speaker detection using clustering and validation."""
+
     if not raw_transcription:
         return []
-    
-    # Group by raw speaker ID and analyze patterns
-    speaker_groups = defaultdict(list)
-    for segment in raw_transcription:
-        speaker_id = segment.get("raw_speaker_id")
-        if speaker_id is not None:
-            speaker_groups[speaker_id].append(segment)
-    
-    # Filter out speakers with insufficient content
-    valid_speakers = {}
-    for speaker_id, segments in speaker_groups.items():
-        total_duration = sum(len(seg["text"].split()) * 0.6 for seg in segments)  # Rough duration estimate
-        if total_duration >= min_duration:
-            valid_speakers[speaker_id] = segments
-    
-    logger.info(f"Detected {len(valid_speakers)} valid speakers after filtering")
-    
-    # Assign final speaker labels
-    processed_transcription = []
-    speaker_counter = 1
-    speaker_id_mapping = {}
-    
-    for segment in raw_transcription:
-        raw_speaker_id = segment.get("raw_speaker_id")
-        
-        if raw_speaker_id in valid_speakers:
-            if raw_speaker_id not in speaker_id_mapping:
-                speaker_tag = f"Speaker_{speaker_counter}"
-                speaker_id_mapping[raw_speaker_id] = speaker_tag
-                speaker_counter += 1
-            
-            final_speaker_tag = speaker_id_mapping[raw_speaker_id]
-            final_speaker_name = speaker_map.get(final_speaker_tag, final_speaker_tag)
+
+    # Collect embeddings for clustering
+    vectors = []
+    idx_map = []
+    for idx, segment in enumerate(raw_transcription):
+        vec = segment.get("speaker_vector")
+        if isinstance(vec, list) and vec:
+            vectors.append(vec)
+            idx_map.append(idx)
+
+    # Assign cluster ids using clustering if embeddings are available
+    if vectors:
+        vectors_np = np.array(vectors, dtype=float)
+        norms = np.linalg.norm(vectors_np, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        vectors_np = vectors_np / norms
+
+        if expected_speakers and expected_speakers > 0:
+            clustering = AgglomerativeClustering(
+                n_clusters=expected_speakers,
+                metric="cosine",
+                linkage="average",
+            )
+            labels = clustering.fit_predict(vectors_np)
         else:
-            final_speaker_name = "Unknown"
-        
+            clustering = DBSCAN(
+                eps=max(0.05, 1 - similarity_threshold),
+                min_samples=2,
+                metric="cosine",
+            )
+            labels = clustering.fit_predict(vectors_np)
+
+            n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
+            if n_clusters <= 1 and len(vectors_np) > 1:
+                # DBSCAN collapsed everything into one cluster or noise
+                # fallback to a simple Agglomerative approach to force
+                # multiple speaker groups
+                fallback_clusters = expected_speakers if expected_speakers else 2
+                clustering = AgglomerativeClustering(
+                    n_clusters=fallback_clusters,
+                    metric="cosine",
+                    linkage="average",
+                )
+                labels = clustering.fit_predict(vectors_np)
+            elif expected_speakers and n_clusters > expected_speakers:
+                clustering = AgglomerativeClustering(
+                    n_clusters=expected_speakers,
+                    metric="cosine",
+                    linkage="average",
+                )
+                labels = clustering.fit_predict(vectors_np)
+
+        max_label = max(labels) if len(labels) > 0 else -1
+        adjusted_labels = []
+        for label in labels:
+            if label == -1:
+                max_label += 1
+                adjusted_labels.append(max_label)
+            else:
+                adjusted_labels.append(int(label))
+
+        for i, label in zip(idx_map, adjusted_labels):
+            raw_transcription[i]["cluster_id"] = label
+    else:
+        # Fallback to raw speaker IDs
+        for segment in raw_transcription:
+            segment["cluster_id"] = segment.get("raw_speaker_id")
+
+    # Group segments by cluster ID
+    clusters = defaultdict(list)
+    for seg in raw_transcription:
+        clusters[seg.get("cluster_id")].append(seg)
+
+    # Evaluate cluster durations (approximate) but keep all clusters
+    cluster_durations = {
+        cid: sum(len(s["text"].split()) * 0.6 for s in segs)
+        for cid, segs in clusters.items()
+    }
+    logger.info(
+        f"Detected {len(clusters)} speaker clusters (min duration {min_duration}s)"
+    )
+
+    # Assign final speaker labels consistently
+    processed_transcription = []
+    cluster_to_tag = {}
+    speaker_counter = 1
+
+    for segment in raw_transcription:
+        cid = segment.get("cluster_id")
+
+        if cid not in cluster_to_tag:
+            tag = f"Speaker_{speaker_counter}"
+            cluster_to_tag[cid] = tag
+            speaker_counter += 1
+        final_tag = cluster_to_tag[cid]
+        speaker_name = speaker_map.get(final_tag, final_tag)
+
         processed_transcription.append({
-            "speaker": final_speaker_name,
+            "speaker": speaker_name,
             "text": segment["text"],
             "timestamp": segment["timestamp"],
             "confidence": segment.get("speaker_confidence", 0.0),
-            "word_details": segment.get("word_details", [])
+            "word_details": segment.get("word_details", []),
+            "speaker_vector": segment.get("speaker_vector")
         })
-    
+
     return processed_transcription
 
 def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> List[Dict]:
@@ -816,6 +887,7 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
     current_text = ""
     current_timestamp = 0
     current_confidence = 0
+    current_vector = None
     
     for segment in filtered_transcription:
         speaker = segment["speaker"]
@@ -825,6 +897,8 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             # Merge with previous segment
             current_text += " " + text
             current_confidence = max(current_confidence, segment.get("confidence", 0))
+            if not current_vector:
+                current_vector = segment.get("speaker_vector")
         else:
             # Save previous segment if it exists
             if current_text:
@@ -832,7 +906,8 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
                     "speaker": current_speaker,
                     "text": current_text,
                     "timestamp": current_timestamp,
-                    "confidence": current_confidence
+                    "confidence": current_confidence,
+                    "speaker_vector": current_vector
                 })
             
             # Start new segment
@@ -840,6 +915,7 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             current_text = text
             current_timestamp = segment["timestamp"]
             current_confidence = segment.get("confidence", 0)
+            current_vector = segment.get("speaker_vector")
     
     # Don't forget the last segment
     if current_text:
@@ -847,7 +923,8 @@ def _post_process_transcription(transcription: List[Dict], audio_info: Dict) -> 
             "speaker": current_speaker,
             "text": current_text,
             "timestamp": current_timestamp,
-            "confidence": current_confidence
+            "confidence": current_confidence,
+            "speaker_vector": current_vector
         })
     
     # Add metadata

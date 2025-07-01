@@ -168,3 +168,15 @@ class AuditLog(models.Model):
 
     def __str__(self):
         return f"{self.action} by {self.user.username if self.user else 'Unknown'} at {self.timestamp}"
+
+
+class SpeakerProfile(models.Model):
+    """Stores a speaker voice embedding and optional assigned name."""
+
+    name = models.CharField(max_length=255, null=True, blank=True)
+    embedding = models.JSONField()
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name or f"Speaker {self.id}"
