@@ -186,3 +186,36 @@ class RoleBasedAccessTests(TestCase):
     def test_get_audio_records_auditor(self):
         response = self.client.get(f'/api/audio-records/{self.auditor_token}/')
         self.assertEqual(response.status_code, 200)
+
+
+class SpeakerRenameTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = UserProfile.objects.create_user(username='renameuser', password='pass')
+        self.token = AuthToken.objects.create(self.user)[1]
+        transcription = [
+            {"speaker": "Speaker_1", "text": "hello", "speaker_vector": [0.1, 0.2]},
+            {"speaker": "Speaker_2", "text": "world", "speaker_vector": [0.2, 0.3]},
+        ]
+        self.audio = AudioFile.objects.create(
+            file_path='test.wav',
+            transcription=transcription,
+            status='processed',
+            duration=5,
+            user=self.user,
+        )
+
+    def test_rename_speakers(self):
+        data = {"speaker_names": {"Speaker_1": "Bob", "Speaker_2": "Alice"}}
+        response = self.client.put(
+            f'/api/audio-file/{self.audio.id}/rename-speakers/{self.token}/',
+            data,
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.audio.refresh_from_db()
+        speakers = {seg["speaker"] for seg in self.audio.transcription}
+        self.assertIn("Bob", speakers)
+        self.assertIn("Alice", speakers)
+        self.assertEqual(SpeakerProfile.objects.filter(name='Bob').count(), 1)
+        self.assertEqual(SpeakerProfile.objects.filter(name='Alice').count(), 1)
