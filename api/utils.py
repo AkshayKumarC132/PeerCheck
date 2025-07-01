@@ -777,7 +777,7 @@ def _enhance_speaker_detection(
         if expected_speakers and expected_speakers > 0:
             clustering = AgglomerativeClustering(
                 n_clusters=expected_speakers,
-                affinity="cosine",
+                metric="cosine",
                 linkage="average",
             )
             labels = clustering.fit_predict(vectors_np)
@@ -797,14 +797,14 @@ def _enhance_speaker_detection(
                 fallback_clusters = expected_speakers if expected_speakers else 2
                 clustering = AgglomerativeClustering(
                     n_clusters=fallback_clusters,
-                    affinity="cosine",
+                    metric="cosine",
                     linkage="average",
                 )
                 labels = clustering.fit_predict(vectors_np)
             elif expected_speakers and n_clusters > expected_speakers:
                 clustering = AgglomerativeClustering(
                     n_clusters=expected_speakers,
-                    affinity="cosine",
+                    metric="cosine",
                     linkage="average",
                 )
                 labels = clustering.fit_predict(vectors_np)
