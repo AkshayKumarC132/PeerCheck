@@ -48,7 +48,7 @@ except Exception as e:
     logger.error(f"Failed to initialize S3 client: {str(e)}")
     pass
 
-MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-small-en-us-0.15")
+MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-en-us-0.22")
 
 SPEAKER_MODEL_PATH = os.path.join(settings.BASE_DIR, "vosk-model-spk-0.4")
 
