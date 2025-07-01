@@ -10,6 +10,7 @@ from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings,
 from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
         SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
 from .utils import *
+from .speaker_utils import apply_custom_speaker_names
 from peercheck import settings
 from fuzzywuzzy import fuzz
 from Levenshtein import distance
@@ -2491,3 +2492,33 @@ class SpeakerProfileListView(APIView):
         profiles = SpeakerProfile.objects.all().order_by('id')
         serializer = SpeakerProfileSerializer(profiles, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class AudioSpeakerRenameView(APIView):
+    """Rename speakers within an audio file transcription."""
+
+    permission_classes = [RoleBasedPermission]
+
+    def put(self, request, audio_id, token):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        request.validated_user = user_data['user']
+        try:
+            audio_instance = AudioFile.objects.get(id=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({'error': 'AudioFile not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        user = request.validated_user
+        is_owner = audio_instance.user == user
+        is_in_session = audio_instance.sessions.filter(session_users__user=user).exists()
+        if not (user.role == 'admin' or is_owner or is_in_session):
+            return Response({'error': 'You do not have permission to modify this audio file.'}, status=status.HTTP_403_FORBIDDEN)
+
+        mapping = request.data.get('speaker_names')
+        if not isinstance(mapping, dict) or not mapping:
+            return Response({'error': 'speaker_names must be provided as a JSON object'}, status=status.HTTP_400_BAD_REQUEST)
+
+        updated = apply_custom_speaker_names(audio_instance, mapping)
+        return Response({'transcription': updated}, status=status.HTTP_200_OK)

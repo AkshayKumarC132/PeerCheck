@@ -68,3 +68,88 @@ def assign_speaker_profiles(
         updated_segments.append(seg)
     return updated_segments
 
+
+def apply_custom_speaker_names(
+    audio_instance,
+    name_mapping: Dict[str, str],
+    threshold: float = 0.8,
+) -> List[Dict]:
+    """Update transcription speaker labels with custom names.
+
+    For each ``old_label`` -> ``new_name`` pair in ``name_mapping`` this will:
+    - Aggregate the speaker vectors for ``old_label`` across the transcription.
+    - Find or create a :class:`SpeakerProfile` representing that speaker.
+    - Update the profile name to ``new_name``.
+    - Replace the ``speaker`` field and ``speaker_profile_id`` in the
+      transcription segments.
+
+    Parameters
+    ----------
+    audio_instance: AudioFile
+        The audio object whose transcription should be updated.
+    name_mapping: Dict[str, str]
+        Mapping of existing speaker labels (e.g. ``"Speaker_1"``) to the desired
+        custom names.
+    threshold: float
+        Similarity threshold when searching for an existing profile.
+
+    Returns
+    -------
+    List[Dict]
+        The updated transcription segments.
+    """
+
+    transcription = audio_instance.transcription or []
+    if not isinstance(transcription, list):
+        return transcription
+
+    # Collect vectors for each speaker label we are renaming
+    label_vectors: Dict[str, List[List[float]]] = {k: [] for k in name_mapping}
+    for seg in transcription:
+        label = seg.get("speaker")
+        if label in name_mapping and isinstance(seg.get("speaker_vector"), list):
+            label_vectors[label].append(seg["speaker_vector"])
+
+    profiles: Dict[str, SpeakerProfile] = {}
+    for old_label, new_name in name_mapping.items():
+        vectors = label_vectors.get(old_label, [])
+        profile = None
+
+        if vectors:
+            mean_vec = np.mean(np.array(vectors, dtype=float), axis=0).tolist()
+            profile = match_speaker_embedding(mean_vec, threshold)
+            if profile is None:
+                profile = SpeakerProfile.objects.create(embedding=mean_vec, name=new_name)
+            else:
+                if profile.name != new_name:
+                    profile.name = new_name
+                    profile.save()
+        else:
+            # Fallback to existing profile id if present
+            for seg in transcription:
+                if seg.get("speaker") == old_label and seg.get("speaker_profile_id"):
+                    try:
+                        profile = SpeakerProfile.objects.get(id=seg["speaker_profile_id"])
+                        if profile.name != new_name:
+                            profile.name = new_name
+                            profile.save()
+                    except SpeakerProfile.DoesNotExist:
+                        profile = None
+                    break
+            if profile is None:
+                profile = SpeakerProfile.objects.create(name=new_name, embedding=[])
+
+        profiles[old_label] = profile
+
+    # Apply updates to the transcription
+    for seg in transcription:
+        label = seg.get("speaker")
+        if label in name_mapping:
+            profile = profiles[label]
+            seg["speaker"] = name_mapping[label]
+            seg["speaker_profile_id"] = profile.id
+
+    audio_instance.transcription = transcription
+    audio_instance.save()
+    return transcription
+
