@@ -75,3 +75,24 @@ Detected speaker embeddings are matched to stored profiles so the same
 real-world speaker receives a consistent label across recordings. These
 profiles ensure that a familiar voice is labelled consistently across
 uploads.
+
+## Renaming Default Speakers
+
+Existing transcriptions may contain generic labels such as `Speaker_1` or
+`Speaker_2`. Use the `audio-file/<id>/rename-speakers/` endpoint to replace
+these labels with real names and update the underlying speaker profiles. Send a
+JSON object mapping the old label to the new name. The payload can include the
+mapping directly or under the `speaker_mapping`/`speaker_names` key:
+
+```bash
+PUT /api/audio-file/42/rename-speakers/<token>/
+{
+  "speaker_mapping": {
+    "Speaker_1": "Bob",
+    "Speaker_2": "Alice"
+  }
+}
+```
+The service calculates the average embedding for each labelled speaker,
+updates or creates a corresponding `SpeakerProfile`, storing the averaged
+speaker vector, and rewrites the transcription with the new names.

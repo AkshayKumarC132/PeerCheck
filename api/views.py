@@ -18,6 +18,7 @@ from .permissions import RoleBasedPermission
 from rest_framework.pagination import PageNumberPagination 
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
 from drf_spectacular.types import OpenApiTypes
+import numpy as np
 from .serializers import ( # Ensure all relevant serializers are imported
     AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
     SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
@@ -27,6 +28,7 @@ from .serializers import ( # Ensure all relevant serializers are imported
 import logging
 from django.db import models
 import ast
+from .speaker_utils import match_speaker_embedding
 
 logger = logging.getLogger(__name__)
 
@@ -2490,4 +2492,114 @@ class SpeakerProfileListView(APIView):
 
         profiles = SpeakerProfile.objects.all().order_by('id')
         serializer = SpeakerProfileSerializer(profiles, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class AudioFileSpeakerUpdateView(APIView):
+    """Rename speakers in an AudioFile's transcription and update profiles."""
+
+    permission_classes = [RoleBasedPermission]
+
+    def put(self, request, audio_id, token):
+        user_data = token_verification(token)
+        if user_data["status"] != 200:
+            return Response({"error": user_data["error"]}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = user_data["user"]
+        request.validated_user = user
+
+        try:
+            audio_file = AudioFile.objects.get(pk=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({"error": "AudioFile not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        is_owner = audio_file.user == user
+        is_in_session = audio_file.sessions.filter(session_users__user=user).exists()
+        if not (user.role == "admin" or is_owner or is_in_session):
+            return Response(
+                {"error": "You do not have permission to modify this audio file."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        mapping = (
+            request.data.get("speaker_mapping")
+            or request.data.get("speaker_names")
+            or request.data
+        )
+        if not isinstance(mapping, dict) or not mapping:
+            return Response(
+                {"error": "Provide a JSON object mapping old labels to new names."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        transcription = audio_file.transcription or []
+        if not isinstance(transcription, list):
+            return Response(
+                {"error": "Transcription data is missing or invalid."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        updated = False
+        for old_label, new_name in mapping.items():
+            if not new_name:
+                continue
+
+            possible_labels = {
+                old_label,
+                old_label.replace(" ", "_"),
+                old_label.replace("_", " "),
+            }
+            segments = [
+                seg for seg in transcription if seg.get("speaker") in possible_labels
+            ]
+            if not segments:
+                continue
+
+            vectors = [
+                seg.get("speaker_vector")
+                for seg in segments
+                if isinstance(seg.get("speaker_vector"), list)
+            ]
+            mean_vec = (
+                np.mean(np.array(vectors, dtype=float), axis=0).tolist() if vectors else None
+            )
+
+            profile = None
+            for seg in segments:
+                pid = seg.get("speaker_profile_id")
+                if pid:
+                    try:
+                        profile = SpeakerProfile.objects.get(id=pid)
+                        break
+                    except SpeakerProfile.DoesNotExist:
+                        pass
+
+            if profile is None:
+                try:
+                    profile = SpeakerProfile.objects.get(name=new_name)
+                except SpeakerProfile.DoesNotExist:
+                    profile = None
+
+            if profile is None and mean_vec is not None:
+                profile = match_speaker_embedding(mean_vec)
+            if profile is None:
+                profile = SpeakerProfile.objects.create(
+                    name=new_name, embedding=mean_vec or []
+                )
+
+            if mean_vec is not None:
+                profile.embedding = mean_vec
+            profile.name = new_name
+            profile.save()
+
+            for seg in segments:
+                seg["speaker"] = new_name
+                seg["speaker_profile_id"] = profile.id
+            updated = True
+
+        if updated:
+            audio_file.transcription = transcription
+            audio_file.save()
+
+        serializer = AudioFileSerializer(audio_file)
         return Response(serializer.data, status=status.HTTP_200_OK)
