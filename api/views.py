@@ -239,7 +239,7 @@ class ProcessAudioView(CreateAPIView):
                 "total_segments": len(transcription),
                 "average_confidence": sum(segment.get("confidence", 0) for segment in transcription) / len(transcription) if transcription else 0
             }
-            logger.info(f"Transcription segments: {transcription}")
+            # logger.info(f"Transcription segments: {transcription}")
         except Exception as e:
             logger.error(f"Enhanced transcription failed: {str(e)}")
             # Fallback to basic transcription if enhanced fails
@@ -262,6 +262,20 @@ class ProcessAudioView(CreateAPIView):
             user=user_data['user']  # Set the user
         )
         logger.info(f"Created AudioFile instance: {audio_instance.id}")
+
+        # --- AI Summarization Step ---
+        from .utils import generate_summary_from_transcription
+        if not audio_instance.summary:
+            summary = generate_summary_from_transcription(transcription_text)
+            audio_instance.summary = summary
+            audio_instance.save()
+        response_data = {
+            "transcription": transcription,
+            "transcription_text": transcription_text,  # For backward compatibility
+            "speaker_statistics": speaker_stats,
+            "status": "processed",
+            "audio_file": AudioFileSerializer(audio_instance).data
+        }
 
         # Log audit
         AuditLog.objects.create(
@@ -2491,3 +2505,37 @@ class SpeakerProfileListView(APIView):
         profiles = SpeakerProfile.objects.all().order_by('id')
         serializer = SpeakerProfileSerializer(profiles, many=True)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class GenerateSummaryFromAudioID(APIView):
+    """
+    API endpoint to generate a summary from an audio file ID.
+    """
+
+    def get(self, request, token, audio_id):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            # Fetch the audio instance by ID
+            audio_instance = AudioFile.objects.get(id=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({"error": "Audio file not found."}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if summary already exists
+        if not audio_instance.summary or audio_instance.summary == "" or audio_instance.summary is None:
+            transcription_text = audio_instance.transcription  # or fetch dynamically
+            
+            # Generate summary
+            summary = generate_summary_from_transcription(transcription_text)
+            # Save summary to the instance
+            audio_instance.summary = summary
+            audio_instance.save()
+
+        # Prepare response data
+        response_data = {
+            "audio_id": audio_id,
+            "summary": audio_instance.summary,
+        }
+        return Response(response_data, status=status.HTTP_200_OK)

@@ -153,7 +153,7 @@ class AudioFileSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = AudioFile
-        fields = ['id', 'file_path', 'transcription', 'status', 'keywords_detected', 'duration', 'sop']
+        fields = ['id', 'file_path', 'transcription', 'status', 'keywords_detected', 'duration', 'sop', 'summary']
 
 class FeedbackSerializer(serializers.ModelSerializer):
     created_by = UserProfileSerializer(read_only=True)

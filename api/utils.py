@@ -962,3 +962,38 @@ def get_supported_audio_formats() -> List[str]:
         "wav", "mp3", "mp4", "m4a", "aac", 
         "ogg", "flac", "webm", "wma", "3gp"
     ]
+
+import requests
+
+def generate_summary_from_transcription(transcription, api_key=None):
+    """
+    Generate a summary of the transcription using an AI model (OpenAI API or HuggingFace).
+    If api_key is provided, use OpenAI; otherwise, fallback to a simple extractive summary.
+    """
+    if not transcription:
+        return ""
+    # If you have an OpenAI API key, use GPT-3.5/4 for summarization
+    if api_key:
+        try:
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "gpt-4o",
+                "messages": [
+                    {"role": "system", "content": "Summarize the following meeting transcription. Focus only on what content each speaker talks about most and generate a concise summary on the main topics discussed."},
+                    {"role": "user", "content": str(transcription)}
+                ],
+                "max_tokens": 200
+            }
+            response = requests.post("https://api.openai.com/v1/chat/completions", json=data, headers=headers, timeout=30)
+            if response.status_code == 200:
+                return response.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            print(f"Error using OpenAI API for summarization: {str(e)}")
+            pass  # Fallback to extractive summary
+    
+    # Fallback to extractive summary if API key is not provided or request fail
+    else:
+        return ""

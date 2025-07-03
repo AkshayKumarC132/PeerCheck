@@ -7,7 +7,7 @@ from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDe
                     SessionReviewView, SessionStatusUpdateView, 
                     AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView, # Added AdminDashboardSummaryView
                     UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView,
-                    SpeakerProfileUpdateView, SpeakerProfileListView)
+                    SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
 
 urlpatterns = [
@@ -53,4 +53,6 @@ urlpatterns = [
     path('admin/dashboard-summary/<str:token>/', AdminDashboardSummaryView.as_view(), name='admin-dashboard-summary'), # New dashboard summary URL
     path('speakers/<str:token>/', SpeakerProfileListView.as_view(), name='speaker-list'),
     path('speaker/<int:profile_id>/<str:token>/', SpeakerProfileUpdateView.as_view(), name='speaker-update'),
+
+    path('audio/<str:token>/<int:audio_id>/generate-summary/', GenerateSummaryFromAudioID.as_view(), name='generate-summary-from-audio'),
 ]
