@@ -980,12 +980,12 @@ def generate_summary_from_transcription(transcription, api_key=None):
                 "Content-Type": "application/json"
             }
             data = {
-                "model": "gpt-4o",
+                "model": "gpt-4o",  # Correct model name
                 "messages": [
-                    {"role": "system", "content": "Summarize the following meeting transcription. Focus only on what content each speaker talks about most and generate a concise summary on the main topics discussed."},
+                    {"role": "system", "content": "Create a concise list of bullet points summarizing the key topics and important details discussed in the following meeting transcription."},
                     {"role": "user", "content": str(transcription)}
                 ],
-                "max_tokens": 200
+                "max_tokens": 2048,
             }
             response = requests.post("https://api.openai.com/v1/chat/completions", json=data, headers=headers, timeout=30)
             if response.status_code == 200:

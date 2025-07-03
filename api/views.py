@@ -2524,14 +2524,14 @@ class GenerateSummaryFromAudioID(APIView):
             return Response({"error": "Audio file not found."}, status=status.HTTP_404_NOT_FOUND)
         
         # Check if summary already exists
-        if not audio_instance.summary or audio_instance.summary == "" or audio_instance.summary is None:
-            transcription_text = audio_instance.transcription  # or fetch dynamically
-            
-            # Generate summary
-            summary = generate_summary_from_transcription(transcription_text)
-            # Save summary to the instance
-            audio_instance.summary = summary
-            audio_instance.save()
+        # if not audio_instance.summary or audio_instance.summary == "" or audio_instance.summary is None:
+        transcription_text = audio_instance.transcription  # or fetch dynamically
+        
+        # Generate summary
+        summary = generate_summary_from_transcription(transcription_text)
+        # Save summary to the instance
+        audio_instance.summary = summary
+        audio_instance.save()
 
         # Prepare response data
         response_data = {
