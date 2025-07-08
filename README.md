@@ -75,3 +75,22 @@ Detected speaker embeddings are matched to stored profiles so the same
 real-world speaker receives a consistent label across recordings. These
 profiles ensure that a familiar voice is labelled consistently across
 uploads.
+
+## Procedure Validation API
+
+The `validate-procedure/` endpoint allows you to upload an audio file along with
+the original procedure document (PDF, DOCX or plain text). After transcription,
+the API extracts the instructions, compares the conversation with each step and
+highlights any missed instructions.
+
+Example usage:
+
+```bash
+curl -X POST -F "file=@meeting.wav" \
+     -F "procedure_document=@procedure.pdf" \
+     http://localhost:8000/api/validate-procedure/<token>/
+```
+
+The response includes `procedure_comparison.results` for each step as well as
+`highlighted_document_markdown` and `highlighted_document_html` showing missed
+instructions in **bold** or in red.

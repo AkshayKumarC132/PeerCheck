@@ -22,7 +22,7 @@ from .serializers import ( # Ensure all relevant serializers are imported
     AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
     SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
     UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer,
-    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, SpeakerProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
+    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, SpeakerProfileSerializer, ProcedureValidationSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
 )
 import logging
 from django.db import models
@@ -330,6 +330,73 @@ class ProcessAudioView(CreateAPIView):
 
         logger.info("Audio processing completed successfully")
         return Response(response_data, status=status.HTTP_200_OK)
+
+
+class ProcedureValidationView(CreateAPIView):
+    """Validate an audio recording against a procedure document."""
+
+    serializer_class = ProcedureValidationSerializer
+    permission_classes = [RoleBasedPermission]
+
+    @extend_schema(
+        summary="Validate Procedure Compliance",
+        description="Uploads an audio file with a procedure document, transcribes the audio, and checks which procedure steps were mentioned.",
+        parameters=[
+            OpenApiParameter('token', OpenApiTypes.STR, OpenApiParameter.PATH, description='Authentication token.')
+        ],
+        request=ProcedureValidationSerializer,
+        responses={
+            200: OpenApiTypes.OBJECT,
+            400: ErrorResponseSerializer,
+            401: ErrorResponseSerializer,
+            500: ErrorResponseSerializer,
+        },
+        tags=['Audio Processing']
+    )
+    def post(self, request, token, format=None):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = ProcedureValidationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        audio_file = serializer.validated_data['file']
+        procedure_doc = serializer.validated_data['procedure_document']
+        procedure_text = serializer.validated_data.get('procedure_text')
+        if not procedure_text:
+            procedure_text = extract_text_from_document(procedure_doc)
+
+        file_name = f"peercheck_files/{uuid.uuid4()}_{audio_file.name}"
+        try:
+            file_url = upload_file_to_s3(audio_file, S3_BUCKET_NAME, file_name)
+        except Exception as e:
+            logger.error(f"S3 upload failed: {str(e)}")
+            return Response({"error": str(e)}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        try:
+            transcription = transcribe_with_speaker_diarization(
+                audio_url=file_url,
+                model_path=MODEL_PATH,
+                speaker_model_path=SPEAKER_MODEL_PATH,
+            )
+            transcription_text = " ".join([seg["text"] for seg in transcription])
+        except Exception as e:
+            logger.error(f"Transcription failed: {str(e)}")
+            return Response({"error": "Transcription failed"}, status=status.HTTP_400_BAD_REQUEST)
+
+        comparison = compare_procedure_with_transcription(procedure_text, transcription_text)
+
+        return Response(
+            {
+                "transcription": transcription,
+                "transcription_text": transcription_text,
+                "procedure_text": procedure_text,
+                "procedure_comparison": comparison,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class FeedbackView(APIView):

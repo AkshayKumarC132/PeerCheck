@@ -184,5 +184,34 @@ class RoleBasedAccessTests(TestCase):
         self.assertEqual(response.status_code, 403)
 
     def test_get_audio_records_auditor(self):
-        response = self.client.get(f'/api/audio-records/{self.auditor_token}/')
+        response = self.client.get(f'/api/audio-records/{self.auditor_token}/')        self.assertEqual(response.status_code, 200)
+
+
+class ProcedureValidationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = UserProfile.objects.create_user(username='procuser', email='proc@example.com', password='testpass')
+        self.token = AuthToken.objects.create(self.user)[1]
+        self.audio_file = SimpleUploadedFile('test.wav', b'dummy audio', content_type='audio/wav')
+        self.procedure_file = SimpleUploadedFile('procedure.txt', b'Step 1: say hello\nStep 2: say bye', content_type='text/plain')
+
+    @patch('api.views.upload_file_to_s3')
+    @patch('api.views.transcribe_with_speaker_diarization')
+    def test_validate_procedure(self, mock_transcribe, mock_upload):
+        mock_upload.return_value = 'https://s3.amazonaws.com/peercheck_files/test.wav'
+        mock_transcribe.return_value = [
+            {'speaker': 'Speaker_1', 'text': 'hello there'}
+        ]
+
+        data = {
+            'file': self.audio_file,
+            'procedure_document': self.procedure_file
+        }
+
+        response = self.client.post(f'/api/validate-procedure/{self.token}/', data, format='multipart')
         self.assertEqual(response.status_code, 200)
+        self.assertIn('procedure_comparison', response.json())
+        results = response.json()['procedure_comparison']['results']
+        self.assertEqual(len(results), 2)
+        self.assertFalse(results[1]['matched'])
+        self.assertIn('highlighted_document_html', response.json()['procedure_comparison'])

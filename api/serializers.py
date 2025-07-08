@@ -183,6 +183,12 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     keywords = serializers.CharField(required=False, allow_blank=True)
     session_user_ids = SessionUserIdsSerializer(required=False)
 
+class ProcedureValidationSerializer(serializers.Serializer):
+    """Serializer for validating a procedure document against an audio file."""
+    file = serializers.FileField(required=True)
+    procedure_document = serializers.FileField(required=True)
+    procedure_text = serializers.CharField(required=False, allow_blank=True, help_text="Optional plain text instructions if already extracted")
+
     def validate_session_user_ids(self, value):
         # If the nested object is provided as a string, attempt to parse it
         if isinstance(value, str):

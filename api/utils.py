@@ -995,5 +995,88 @@ def generate_summary_from_transcription(transcription, api_key=None):
             pass  # Fallback to extractive summary
     
     # Fallback to extractive summary if API key is not provided or request fail
-    else:
+    else:        return ""
+
+
+def extract_text_from_document(file_obj) -> str:
+    """Extract text from an uploaded procedure document.
+
+    Supports PDF, DOCX and plain text files. Falls back to reading the file as
+    UTF-8 text if specific extraction fails.
+    """
+    if not file_obj:
         return ""
+
+    name = getattr(file_obj, "name", "").lower()
+    extension = os.path.splitext(name)[1]
+    try:
+        if extension == ".pdf":
+            try:
+                from pdfminer.high_level import extract_text
+                file_obj.seek(0)
+                return extract_text(file_obj)
+            except Exception:
+                logger.exception("PDF extraction failed")
+        elif extension in [".docx", ".doc"]:
+            try:
+                import docx
+                file_obj.seek(0)
+                document = docx.Document(file_obj)
+                return "\n".join(p.text for p in document.paragraphs)
+            except Exception:
+                logger.exception("DOCX extraction failed")
+
+        file_obj.seek(0)
+        return file_obj.read().decode("utf-8", errors="ignore")
+    finally:
+        file_obj.seek(0)
+
+
+def compare_procedure_with_transcription(procedure_text: str, transcription_text: str) -> Dict[str, any]:
+    """Compare procedure instructions with transcription text.
+
+    Returns a dictionary containing step-by-step match details, the procedure
+    document with missed steps highlighted in markdown bold and HTML in red,
+    and a summary of the results.
+    """
+    if not procedure_text:
+        return {
+            "results": [],
+            "highlighted_document_markdown": "",
+            "highlighted_document_html": "",
+            "summary": "No procedure provided."
+        }
+
+    instructions = [line.strip() for line in procedure_text.splitlines() if line.strip()]
+    transcript_lower = transcription_text.lower() if transcription_text else ""
+    highlighted_lines_markdown: List[str] = []
+    highlighted_lines_html: List[str] = []
+    results = []
+
+    for idx, line in enumerate(instructions, start=1):
+        line_lower = line.lower()
+        exact = line_lower in transcript_lower
+        similarity = fuzz.partial_ratio(line_lower, transcript_lower) if transcript_lower else 0
+        matched = exact or similarity >= 80
+        results.append({
+            "step_number": idx,
+            "instruction": line,
+            "matched": matched,
+            "similarity": similarity
+        })
+        if matched:
+            highlighted_lines_markdown.append(line)
+            highlighted_lines_html.append(line)
+        else:
+            highlighted_lines_markdown.append(f"**{line}**")
+            highlighted_lines_html.append(f"<span style='color:red'>{line}</span>")
+
+    missing = [r for r in results if not r["matched"]]
+    summary = f"{len(missing)} of {len(results)} instructions were not mentioned in the conversation."
+
+    return {
+        "results": results,
+        "highlighted_document_markdown": "\n".join(highlighted_lines_markdown),
+        "highlighted_document_html": "<br>".join(highlighted_lines_html),
+        "summary": summary,
+    }
