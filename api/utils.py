@@ -993,7 +993,102 @@ def generate_summary_from_transcription(transcription, api_key=None):
         except Exception as e:
             print(f"Error using OpenAI API for summarization: {str(e)}")
             pass  # Fallback to extractive summary
-    
-    # Fallback to extractive summary if API key is not provided or request fail
-    else:
+
+    # Fallback to extractive summary if API key is not provided or request fails
+    # Simple extractive summary: return the first 3 sentences or 500 characters
+    import re
+    sentences = re.split(r'(?<=[.!?]) +', transcription)
+    summary = ' '.join(sentences[:3])
+    if not summary:
+        summary = transcription[:500] + ('...' if len(transcription) > 500 else '')
+    return summary
+
+def extract_text_from_document(file_obj) -> str:
+    """Extract text from an uploaded procedure document.
+
+    Supports PDF, DOCX and plain text files. Falls back to reading the file as
+    UTF-8 text if specific extraction fails.
+    """
+    if not file_obj:
         return ""
+
+    name = getattr(file_obj, "name", "").lower()
+    extension = os.path.splitext(name)[1]
+    try:
+        if extension == ".pdf":
+            try:
+                from pdfminer.high_level import extract_text
+                file_obj.seek(0)
+                pdf_source = getattr(file_obj, "file", file_obj)
+                pdf_path = getattr(pdf_source, "name", None)
+                if pdf_path and isinstance(pdf_path, str):
+                    return extract_text(pdf_path)
+                else:
+                    return extract_text(pdf_source)
+            except Exception:
+                logger.exception("PDF extraction failed")
+        elif extension in [".docx"]:
+            try:
+                import docx
+                file_obj.seek(0)
+                docx_source = getattr(file_obj, "file", file_obj)
+                # Always use the file-like object for docx extraction
+                document = docx.Document(docx_source)
+                return "\n".join(p.text for p in document.paragraphs)
+            except Exception:
+                logger.exception("DOCX extraction failed")
+
+        file_obj.seek(0)
+        return file_obj.read().decode("utf-8", errors="ignore")
+    finally:
+        file_obj.seek(0)
+
+
+def compare_procedure_with_transcription(procedure_text: str, transcription_text: str) -> Dict[str, any]:
+    """Compare procedure instructions with transcription text.
+
+    Returns a dictionary containing step-by-step match details, the procedure
+    document with missed steps highlighted in markdown bold and HTML in red,
+    and a summary of the results.
+    """
+    if not procedure_text:
+        return {
+            "results": [],
+            "highlighted_document_markdown": "",
+            "highlighted_document_html": "",
+            "summary": "No procedure provided."
+        }
+
+    instructions = [line.strip() for line in procedure_text.splitlines() if line.strip()]
+    transcript_lower = transcription_text.lower() if transcription_text else ""
+    highlighted_lines_markdown: List[str] = []
+    highlighted_lines_html: List[str] = []
+    results = []
+
+    for idx, line in enumerate(instructions, start=1):
+        line_lower = line.lower()
+        exact = line_lower in transcript_lower
+        similarity = fuzz.partial_ratio(line_lower, transcript_lower) if transcript_lower else 0
+        matched = exact or similarity >= 80
+        results.append({
+            "step_number": idx,
+            "instruction": line,
+            "matched": matched,
+            "similarity": similarity
+        })
+        if matched:
+            highlighted_lines_markdown.append(line)
+            highlighted_lines_html.append(line)
+        else:
+            highlighted_lines_markdown.append(f"**{line}**")
+            highlighted_lines_html.append(f"<span style='color:red'>{line}</span>")
+
+    missing = [r for r in results if not r["matched"]]
+    summary = f"{len(missing)} of {len(results)} instructions were not mentioned in the conversation."
+
+    return {
+        "results": results,
+        "highlighted_document_markdown": "\n".join(highlighted_lines_markdown),
+        "highlighted_document_html": "<br>".join(highlighted_lines_html),
+        "summary": summary,
+    }
