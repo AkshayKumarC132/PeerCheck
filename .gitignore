@@ -69,3 +69,6 @@ vosk-model-small-en-us-0.15
 vosk-model-en-us-0.22
 *.rar
 vosk-model-spk-0.4
+
+vosk-model-en-us-0.42-gigaspeech
+vosk-model-en-us-0.42-gigaspeech.zip

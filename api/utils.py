@@ -993,27 +993,15 @@ def generate_summary_from_transcription(transcription, api_key=None):
         except Exception as e:
             print(f"Error using OpenAI API for summarization: {str(e)}")
             pass  # Fallback to extractive summary
-    
-    # Fallback to extractive summary if API key is not provided or request fail
-                # TemporaryUploadedFile provides the underlying file via the
-                # ``file`` attribute. Pass it directly to pdfminer if present.
-                pdf_source = getattr(file_obj, "file", file_obj)
-                return extract_text(pdf_source)
 
-
-
-    # Detect where the conversation likely starts within the procedure
-    start_index = 0
-    best_score = 0
-    for idx, step in enumerate(instructions):
-        score = fuzz.partial_ratio(step.lower(), transcript_lower)
-        if score > best_score:
-            best_score = score
-            start_index = idx
-    if best_score < 60:
-        start_index = 0
-
-    instructions = instructions[start_index:]
+    # Fallback to extractive summary if API key is not provided or request fails
+    # Simple extractive summary: return the first 3 sentences or 500 characters
+    import re
+    sentences = re.split(r'(?<=[.!?]) +', transcription)
+    summary = ' '.join(sentences[:3])
+    if not summary:
+        summary = transcription[:500] + ('...' if len(transcription) > 500 else '')
+    return summary
 
 def extract_text_from_document(file_obj) -> str:
     """Extract text from an uploaded procedure document.
@@ -1031,14 +1019,21 @@ def extract_text_from_document(file_obj) -> str:
             try:
                 from pdfminer.high_level import extract_text
                 file_obj.seek(0)
-                return extract_text(file_obj)
+                pdf_source = getattr(file_obj, "file", file_obj)
+                pdf_path = getattr(pdf_source, "name", None)
+                if pdf_path and isinstance(pdf_path, str):
+                    return extract_text(pdf_path)
+                else:
+                    return extract_text(pdf_source)
             except Exception:
                 logger.exception("PDF extraction failed")
-        elif extension in [".docx", ".doc"]:
+        elif extension in [".docx"]:
             try:
                 import docx
                 file_obj.seek(0)
-                document = docx.Document(file_obj)
+                docx_source = getattr(file_obj, "file", file_obj)
+                # Always use the file-like object for docx extraction
+                document = docx.Document(docx_source)
                 return "\n".join(p.text for p in document.paragraphs)
             except Exception:
                 logger.exception("DOCX extraction failed")
