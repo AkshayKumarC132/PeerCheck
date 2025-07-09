@@ -80,8 +80,9 @@ uploads.
 
 The `validate-procedure/` endpoint allows you to upload an audio file along with
 the original procedure document (PDF, DOCX or plain text). After transcription,
-the API extracts the instructions, compares the conversation with each step and
-highlights any missed instructions.
+the API extracts the instructions, aligns the conversation to the first matching
+step and highlights any missed instructions. PDF and DOCX files are automatically
+converted to text before comparison.
 
 Example usage:
 

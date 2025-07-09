@@ -995,8 +995,23 @@ def generate_summary_from_transcription(transcription, api_key=None):
             pass  # Fallback to extractive summary
     
     # Fallback to extractive summary if API key is not provided or request fail
-    else:        return ""
+                pdf_source = getattr(file_obj, "file", file_obj)
+                return extract_text(pdf_source)
 
+
+
+    # Detect where the conversation likely starts within the procedure
+    start_index = 0
+    best_score = 0
+    for idx, step in enumerate(instructions):
+        score = fuzz.partial_ratio(step.lower(), transcript_lower)
+        if score > best_score:
+            best_score = score
+            start_index = idx
+    if best_score < 60:
+        start_index = 0
+
+    instructions = instructions[start_index:]
 
 def extract_text_from_document(file_obj) -> str:
     """Extract text from an uploaded procedure document.

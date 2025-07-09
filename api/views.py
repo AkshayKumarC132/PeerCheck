@@ -381,6 +381,8 @@ class ProcedureValidationView(CreateAPIView):
                 model_path=MODEL_PATH,
                 speaker_model_path=SPEAKER_MODEL_PATH,
             )
+            for seg in transcription:
+                seg.pop("speaker_vector", None)
             transcription_text = " ".join([seg["text"] for seg in transcription])
         except Exception as e:
             logger.error(f"Transcription failed: {str(e)}")

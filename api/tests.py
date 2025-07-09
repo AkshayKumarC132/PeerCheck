@@ -211,6 +211,7 @@ class ProcedureValidationTests(TestCase):
         response = self.client.post(f'/api/validate-procedure/{self.token}/', data, format='multipart')
         self.assertEqual(response.status_code, 200)
         self.assertIn('procedure_comparison', response.json())
+        self.assertNotIn('speaker_vector', response.json()['transcription'][0])
         results = response.json()['procedure_comparison']['results']
         self.assertEqual(len(results), 2)
         self.assertFalse(results[1]['matched'])

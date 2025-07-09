@@ -20,7 +20,7 @@ from .views import (
     SessionStatusUpdateView,
     AdminUserListView,
     AdminUserDetailView,
-    AdminDashboardSummaryView,  # Added AdminDashboardSummaryView
+    AdminDashboardSummaryView,
     UserSettingsView,
     SystemSettingsView,
     AuditLogView,
@@ -72,9 +72,8 @@ urlpatterns = [
     # Admin User Management URLs
     path('admin/users/<str:token>/', AdminUserListView.as_view(), name='admin-user-list'),
     path('admin/user/<int:user_id>/<str:token>/', AdminUserDetailView.as_view(), name='admin-user-detail'),
-    path('admin/dashboard-summary/<str:token>/', AdminDashboardSummaryView.as_view(), name='admin-dashboard-summary'), # New dashboard summary URL
+    path('admin/dashboard-summary/<str:token>/', AdminDashboardSummaryView.as_view(), name='admin-dashboard-summary'),
     path('speakers/<str:token>/', SpeakerProfileListView.as_view(), name='speaker-list'),
     path('speaker/<int:profile_id>/<str:token>/', SpeakerProfileUpdateView.as_view(), name='speaker-update'),
 
-    path('audio/<str:token>/<int:audio_id>/generate-summary/', GenerateSummaryFromAudioID.as_view(), name='generate-summary-from-audio'),
-]
+    path('audio/<str:token>/<int:audio_id>/generate-summary/', GenerateSummaryFromAudioID.as_view(), name='generate-summary-from-audio'),]
