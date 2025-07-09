@@ -388,7 +388,8 @@ class ProcedureValidationView(CreateAPIView):
             logger.error(f"Transcription failed: {str(e)}")
             return Response({"error": "Transcription failed"}, status=status.HTTP_400_BAD_REQUEST)
 
-        comparison = compare_procedure_with_transcription(procedure_text, transcription_text)
+        start_index = find_procedure_start_index(procedure_text, transcription_text)
+        comparison = compare_procedure_from_index(procedure_text, transcription_text, start_index)
 
         return Response(
             {
@@ -396,6 +397,7 @@ class ProcedureValidationView(CreateAPIView):
                 "transcription_text": transcription_text,
                 "procedure_text": procedure_text,
                 "procedure_comparison": comparison,
+                "start_step_index": start_index,
             },
             status=status.HTTP_200_OK,
         )

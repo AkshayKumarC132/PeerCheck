@@ -1092,3 +1092,98 @@ def compare_procedure_with_transcription(procedure_text: str, transcription_text
         "highlighted_document_html": "<br>".join(highlighted_lines_html),
         "summary": summary,
     }
+
+
+def find_procedure_start_index(procedure_text: str, transcription_text: str, threshold: int = 70) -> int:
+    """Determine which procedure step most closely matches the start of the transcription.
+
+    This helps align the comparison when the audio begins partway through the procedure.
+
+    Args:
+        procedure_text: Full text of the procedure document.
+        transcription_text: Transcribed speech from the uploaded audio.
+        threshold: Minimum fuzzy match score to consider a step as the starting point.
+
+    Returns:
+        The index (0-based) of the step that best matches the transcription start.
+        If no step meets the threshold, ``0`` is returned.
+    """
+    instructions = [line.strip() for line in procedure_text.splitlines() if line.strip()]
+    if not instructions or not transcription_text:
+        return 0
+
+    transcript_lower = transcription_text.lower()
+    best_idx = 0
+    best_score = 0
+
+    for idx, line in enumerate(instructions):
+        score = fuzz.partial_ratio(line.lower(), transcript_lower)
+        if score > best_score:
+            best_score = score
+            best_idx = idx
+
+    if best_score < threshold:
+        return 0
+    return best_idx
+
+
+def compare_procedure_from_index(
+    procedure_text: str,
+    transcription_text: str,
+    start_index: int = 0,
+) -> Dict[str, any]:
+    """Compare procedure instructions with transcription starting from ``start_index``.
+
+    Steps before ``start_index`` are treated as missed. The rest are matched
+    against the transcription text similarly to :func:`compare_procedure_with_transcription`.
+    """
+    if not procedure_text:
+        return {
+            "results": [],
+            "highlighted_document_markdown": "",
+            "highlighted_document_html": "",
+            "summary": "No procedure provided.",
+        }
+
+    instructions = [line.strip() for line in procedure_text.splitlines() if line.strip()]
+    transcript_lower = transcription_text.lower() if transcription_text else ""
+
+    highlighted_lines_markdown: List[str] = []
+    highlighted_lines_html: List[str] = []
+    results = []
+
+    for idx, line in enumerate(instructions, start=1):
+        line_lower = line.lower()
+        if idx - 1 >= start_index and transcript_lower:
+            exact = line_lower in transcript_lower
+            similarity = fuzz.partial_ratio(line_lower, transcript_lower)
+            matched = exact or similarity >= 80
+        else:
+            similarity = 0
+            matched = False
+
+        results.append(
+            {
+                "step_number": idx,
+                "instruction": line,
+                "matched": matched,
+                "similarity": similarity,
+            }
+        )
+
+        if matched:
+            highlighted_lines_markdown.append(line)
+            highlighted_lines_html.append(line)
+        else:
+            highlighted_lines_markdown.append(f"**{line}**")
+            highlighted_lines_html.append(f"<span style='color:red'>{line}</span>")
+
+    missing = [r for r in results if not r["matched"]]
+    summary = f"{len(missing)} of {len(results)} instructions were not mentioned in the conversation."
+
+    return {
+        "results": results,
+        "highlighted_document_markdown": "\n".join(highlighted_lines_markdown),
+        "highlighted_document_html": "<br>".join(highlighted_lines_html),
+        "summary": summary,
+    }

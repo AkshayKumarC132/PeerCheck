@@ -216,3 +216,28 @@ class ProcedureValidationTests(TestCase):
         self.assertEqual(len(results), 2)
         self.assertFalse(results[1]['matched'])
         self.assertIn('highlighted_document_html', response.json()['procedure_comparison'])
+
+    @patch('api.views.upload_file_to_s3')
+    @patch('api.views.transcribe_with_speaker_diarization')
+    def test_validate_procedure_partial_start(self, mock_transcribe, mock_upload):
+        """Audio may start from the second step; first should be marked missed."""
+        mock_upload.return_value = 'https://s3.amazonaws.com/peercheck_files/test.wav'
+        mock_transcribe.return_value = [
+            {'speaker': 'Speaker_1', 'text': 'say bye now'}
+        ]
+
+        data = {
+            'file': self.audio_file,
+            'procedure_document': self.procedure_file
+        }
+
+        response = self.client.post(f'/api/validate-procedure/{self.token}/', data, format='multipart')
+        self.assertEqual(response.status_code, 200)
+        comparison = response.json()['procedure_comparison']
+        results = comparison['results']
+        self.assertEqual(len(results), 2)
+        # first step not mentioned
+        self.assertFalse(results[0]['matched'])
+        # second step matches
+        self.assertTrue(results[1]['matched'])
+        self.assertEqual(response.json()['start_step_index'], 1)
