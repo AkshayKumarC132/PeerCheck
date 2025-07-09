@@ -995,6 +995,8 @@ def generate_summary_from_transcription(transcription, api_key=None):
             pass  # Fallback to extractive summary
     
     # Fallback to extractive summary if API key is not provided or request fail
+                # TemporaryUploadedFile provides the underlying file via the
+                # ``file`` attribute. Pass it directly to pdfminer if present.
                 pdf_source = getattr(file_obj, "file", file_obj)
                 return extract_text(pdf_source)
 
