@@ -4,6 +4,7 @@ openai-whisper
 torch
 torchaudio
 torchvision
+nemo_toolkit[asr]
 
 # Text Analysis/NLP
 spacy
@@ -33,6 +34,9 @@ ffmpeg-python
 fuzzywuzzy
 python-Levenshtein
 boto3
+pdfminer.six
+docx2txt
+requests
 
 drf-spectacular
 drf-yasg

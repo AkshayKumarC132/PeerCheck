@@ -5,10 +5,21 @@ from django.shortcuts import get_object_or_404
 from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
-from rest_framework import status
+from rest_framework import status, parsers
 from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile
-from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
-        SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
+from .serializers import (
+    AudioFileSerializer,
+    FeedbackSerializer,
+    ProcessAudioViewSerializer,
+    SOPSerializer,
+    SessionSerializer,
+    FeedbackReviewSerializer,
+    UserSettingsSerializer,
+    SystemSettingsSerializer,
+    AuditLogSerializer,
+    AdminUserProfileSerializer,
+    PeerCheckValidationSerializer,
+)
 from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
@@ -18,11 +29,22 @@ from .permissions import RoleBasedPermission
 from rest_framework.pagination import PageNumberPagination 
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
 from drf_spectacular.types import OpenApiTypes
-from .serializers import ( # Ensure all relevant serializers are imported
-    AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
-    SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
-    UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer,
-    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, SpeakerProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
+from .serializers import (  # Ensure all relevant serializers are imported
+    AudioFileSerializer,
+    FeedbackSerializer,
+    ProcessAudioViewSerializer,
+    SOPSerializer,
+    SessionSerializer,
+    FeedbackReviewSerializer,
+    UserSettingsSerializer,
+    SystemSettingsSerializer,
+    AuditLogSerializer,
+    AdminUserProfileSerializer,
+    ErrorResponseSerializer,
+    LoginSerializer,
+    UserProfileSerializer,
+    SpeakerProfileSerializer,
+    PeerCheckValidationSerializer,
 )
 import logging
 from django.db import models
@@ -2539,3 +2561,64 @@ class GenerateSummaryFromAudioID(APIView):
             "summary": audio_instance.summary,
         }
         return Response(response_data, status=status.HTTP_200_OK)
+
+
+class PeerCheckValidationView(APIView):
+    """Validate audio transcription against procedure document."""
+    parser_classes = [parsers.MultiPartParser, parsers.FormParser]
+
+    PROMPT_TEMPLATE = (
+        "### SYSTEM ROLE:\n"
+        "You are a nuclear QA compliance validation assistant.\n\n"
+        "You help ensure that spoken procedures performed by operators are in full alignment with documented safety-critical procedures. Your job is to evaluate whether the steps executed in a conversation match the steps in a technical procedure document.\n\n"
+        "This is used in the nuclear industry where accuracy must be 99% or higher. You must be strict, detailed, and precise.\n\n"
+        "---\n\n"
+        "### TASK:\n"
+        "Compare the document's procedural instructions with the spoken transcript extracted from the audio file.\n\n"
+        "Identify and report:\n"
+        "1. ✅ Matched Instructions — steps from the document that are correctly followed and stated.\n"
+        "2. ⚠️ Missing or Skipped Instructions — steps from the document that are not present in the transcript at all.\n"
+        "3. 🛑 Deviations or Discrepancies — where the step was mentioned but:\n"
+        "   - Key technical terms were altered or incorrect\n"
+        "   - Timing, sequencing, or parameters were missing\n"
+        "   - Safety terminology was skipped\n"
+        "4. 💬 Communication Issues — cases where three-way communication was unclear or incomplete\n"
+        "5. 🔐 Compliance Risks — any steps that could violate technical specifications (e.g., TS 3.7.5)\n\n"
+        "Return your findings in a structured format suitable for QA documentation.\n\n"
+        "---\n\n"
+        "### INPUTS:\n\n"
+        "#### 🧾 Documented Procedure:\n{doc}\n\n"
+        "#### 🎧 Transcript of Audio:\n{trans}\n\n"
+        "---\n"
+    )
+
+    def post(self, request):
+        serializer = PeerCheckValidationSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        audio_file = serializer.validated_data["audio_file"]
+        document_file = serializer.validated_data["document_file"]
+
+        try:
+            transcript_text = transcribe_audio_nemo(audio_file)
+        except Exception as e:
+            return Response({"error": f"Transcription failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            document_text = extract_text_from_document(document_file)
+        except Exception as e:
+            return Response({"error": f"Document extraction failed: {str(e)}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        prompt = self.PROMPT_TEMPLATE.format(doc=document_text, trans=transcript_text)
+
+        try:
+            analysis = call_llama(prompt)
+        except Exception as e:
+            return Response({"error": f"LLaMA analysis failed: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        return Response({
+            "transcript": transcript_text,
+            "procedure_text": document_text,
+            "analysis": analysis,
+        })
