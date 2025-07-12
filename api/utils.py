@@ -997,3 +997,59 @@ def generate_summary_from_transcription(transcription, api_key=None):
     # Fallback to extractive summary if API key is not provided or request fail
     else:
         return ""
+
+
+def transcribe_audio_nemo(file_obj, model_name="stt_en_conformer_ctc_large"):
+    """Transcribe an audio file using NVIDIA NeMo."""
+    import tempfile
+    try:
+        from nemo.collections.asr.models import EncDecCTCModel
+    except ImportError as e:
+        raise ImportError("NeMo is required for transcription") from e
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_obj.name)[1]) as tmp:
+        for chunk in file_obj.chunks():
+            tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        model = EncDecCTCModel.from_pretrained(model_name=model_name)
+        transcript = model.transcribe([tmp_path])[0]
+    finally:
+        os.remove(tmp_path)
+
+    return transcript
+
+
+def extract_text_from_document(file_obj):
+    """Extract text from a PDF or DOCX document."""
+    import tempfile
+    ext = os.path.splitext(file_obj.name)[1].lower()
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        for chunk in file_obj.chunks():
+            tmp.write(chunk)
+        tmp_path = tmp.name
+
+    try:
+        if ext == ".pdf":
+            from pdfminer.high_level import extract_text
+            text = extract_text(tmp_path)
+        elif ext in [".docx", ".doc"]:
+            import docx2txt
+            text = docx2txt.process(tmp_path)
+        else:
+            raise ValueError("Unsupported document format")
+    finally:
+        os.remove(tmp_path)
+
+    return text
+
+
+def call_llama(prompt, model="llama2", api_url="http://localhost:11434/api/generate"):
+    """Call a local or remote LLaMA model."""
+    payload = {"model": model, "prompt": prompt, "stream": False}
+    response = requests.post(api_url, json=payload, timeout=60)
+    response.raise_for_status()
+    data = response.json()
+    return data.get("response") or data.get("generated_text")

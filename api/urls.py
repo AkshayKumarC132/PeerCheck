@@ -1,13 +1,34 @@
 from django.urls import path
-from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDetailView, 
-                    FeedbackReviewListView, FeedbackReviewDetailView, 
-                    GetAudioRecordsView, AudioFileDetailView, ReAnalyzeAudioView,
-                    SOPCreateView, SOPListView, SOPDetailView, 
-                    SessionCreateView, SessionListView, SessionDetailView, 
-                    SessionReviewView, SessionStatusUpdateView, 
-                    AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView, # Added AdminDashboardSummaryView
-                    UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView,
-                    SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID)
+from .views import (
+    ProcessAudioView,
+    FeedbackView,
+    FeedbackListView,
+    FeedbackDetailView,
+    FeedbackReviewListView,
+    FeedbackReviewDetailView,
+    GetAudioRecordsView,
+    AudioFileDetailView,
+    ReAnalyzeAudioView,
+    SOPCreateView,
+    SOPListView,
+    SOPDetailView,
+    SessionCreateView,
+    SessionListView,
+    SessionDetailView,
+    SessionReviewView,
+    SessionStatusUpdateView,
+    AdminUserListView,
+    AdminUserDetailView,
+    AdminDashboardSummaryView,  # Added AdminDashboardSummaryView
+    UserSettingsView,
+    SystemSettingsView,
+    AuditLogView,
+    UserProfileDetailsView,
+    SpeakerProfileUpdateView,
+    SpeakerProfileListView,
+    GenerateSummaryFromAudioID,
+    PeerCheckValidationView,
+)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
 
 urlpatterns = [
@@ -55,4 +76,5 @@ urlpatterns = [
     path('speaker/<int:profile_id>/<str:token>/', SpeakerProfileUpdateView.as_view(), name='speaker-update'),
 
     path('audio/<str:token>/<int:audio_id>/generate-summary/', GenerateSummaryFromAudioID.as_view(), name='generate-summary-from-audio'),
+    path('peercheck/validate/', PeerCheckValidationView.as_view(), name='peercheck-validation'),
 ]

@@ -241,6 +241,13 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     #                 raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
     #     return value
 
+
+class PeerCheckValidationSerializer(serializers.Serializer):
+    """Serializer for PeerCheck validation endpoint."""
+    audio_file = serializers.FileField()
+    document_file = serializers.FileField()
+
+
 class SessionSerializer(serializers.ModelSerializer):
     audio_files = AudioFileSerializer(many=True, read_only=True)
     # sop = SOPSerializer(read_only=True) # Keep original for GET display
