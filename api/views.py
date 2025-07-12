@@ -7,19 +7,6 @@ from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status, parsers
 from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile
-from .serializers import (
-    AudioFileSerializer,
-    FeedbackSerializer,
-    ProcessAudioViewSerializer,
-    SOPSerializer,
-    SessionSerializer,
-    FeedbackReviewSerializer,
-    UserSettingsSerializer,
-    SystemSettingsSerializer,
-    AuditLogSerializer,
-    AdminUserProfileSerializer,
-    PeerCheckValidationSerializer,
-)
 from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
