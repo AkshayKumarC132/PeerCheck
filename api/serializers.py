@@ -1,6 +1,7 @@
 from rest_framework import serializers
 from .models import *
 import json
+import os
 import ast
 
 class UserProfileSerializer(serializers.ModelSerializer):
@@ -240,6 +241,25 @@ class ProcessAudioViewSerializer(serializers.Serializer):
     #             except (ValueError, SyntaxError):
     #                 raise serializers.ValidationError("Invalid session_user_ids format. Must be a list of integers.")
     #     return value
+
+
+class PeerCheckValidationSerializer(serializers.Serializer):
+    """Serializer for PeerCheck validation endpoint."""
+    audio_file = serializers.FileField()
+    document_file = serializers.FileField()
+
+    def validate_audio_file(self, value):
+        ext = os.path.splitext(value.name)[1].lower()
+        if ext not in [".mp3", ".wav", ".mp4"]:
+            raise serializers.ValidationError("Unsupported audio format")
+        return value
+
+    def validate_document_file(self, value):
+        ext = os.path.splitext(value.name)[1].lower()
+        if ext not in [".pdf", ".docx", ".doc"]:
+            raise serializers.ValidationError("Unsupported document format")
+        return value
+
 
 class SessionSerializer(serializers.ModelSerializer):
     audio_files = AudioFileSerializer(many=True, read_only=True)
