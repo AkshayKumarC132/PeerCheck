@@ -7,8 +7,18 @@ from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
 from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile
-from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
-        SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
+from .serializers import (
+    AudioFileSerializer,
+    FeedbackSerializer,
+    ProcessAudioViewSerializer,
+    SOPSerializer,
+    SessionSerializer,
+    FeedbackReviewSerializer,
+    UserSettingsSerializer,
+    SystemSettingsSerializer,
+    AuditLogSerializer,
+    AdminUserProfileSerializer,
+)
 from .utils import *
 from peercheck import settings
 from fuzzywuzzy import fuzz
@@ -18,12 +28,29 @@ from .permissions import RoleBasedPermission
 from rest_framework.pagination import PageNumberPagination 
 from drf_spectacular.utils import extend_schema, OpenApiParameter, OpenApiExample
 from drf_spectacular.types import OpenApiTypes
-from .serializers import ( # Ensure all relevant serializers are imported
-    AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
-    SOPSerializer, SessionSerializer, FeedbackReviewSerializer, 
-    UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer,
-    AdminUserProfileSerializer, ErrorResponseSerializer, LoginSerializer, UserProfileSerializer, SpeakerProfileSerializer, # Added ErrorResponseSerializer, LoginSerializer, UserProfileSerializer
+from .serializers import (  # Ensure all relevant serializers are imported
+    AudioFileSerializer,
+    FeedbackSerializer,
+    ProcessAudioViewSerializer,
+    SOPSerializer,
+    SessionSerializer,
+    FeedbackReviewSerializer,
+    UserSettingsSerializer,
+    SystemSettingsSerializer,
+    AuditLogSerializer,
+    AdminUserProfileSerializer,
+    ErrorResponseSerializer,
+    LoginSerializer,
+    UserProfileSerializer,
+    SpeakerProfileSerializer,
+    FileProcessingSerializer,
 )
+from .storage import S3Storage
+from .nemo_processing import NemoASR
+from .embedding_match import EmbeddingMatcher
+from .validators import TranscriptValidator
+from .llm_analysis import LlamaAnalyzer
+from .report_generator import ReportGenerator
 import logging
 from django.db import models
 import ast
@@ -330,6 +357,80 @@ class ProcessAudioView(CreateAPIView):
 
         logger.info("Audio processing completed successfully")
         return Response(response_data, status=status.HTTP_200_OK)
+
+
+class FileProcessingView(APIView):
+    """Endpoint to process an audio file with a reference document."""
+
+    def post(self, request, format=None):
+        serializer = FileProcessingSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        audio_file = serializer.validated_data["audio_file"]
+        doc_file = serializer.validated_data["document_file"]
+
+        storage = S3Storage(bucket=S3_BUCKET_NAME, region=S3_REGION)
+        try:
+            audio_url = storage.upload_file(audio_file.file, audio_file.name, "audio", {"orig": audio_file.name})
+            doc_url = storage.upload_file(doc_file.file, doc_file.name, "docs", {"orig": doc_file.name})
+        except Exception as e:
+            logger.error(f"S3 upload failed: {e}")
+            return Response({"error": "S3 upload failed"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        from tempfile import NamedTemporaryFile
+
+        with NamedTemporaryFile(suffix=os.path.splitext(audio_file.name)[1]) as tmp_audio:
+            storage.download_file(audio_url, tmp_audio.name)
+            transcript_segments = NemoASR().transcribe_with_diarization(tmp_audio.name)
+            transcript_text = " ".join([seg["text"] for seg in transcript_segments])
+
+        with NamedTemporaryFile(suffix=os.path.splitext(doc_file.name)[1]) as tmp_doc:
+            storage.download_file(doc_url, tmp_doc.name)
+            document_text = self._read_document(tmp_doc.name)
+
+        matcher = EmbeddingMatcher()
+        matches = matcher.match(transcript_text, document_text)
+
+        validator = TranscriptValidator()
+        validation = {
+            "confirm_phrases": validator.confirm_phrases(transcript_text),
+            "repetition": validator.detect_repetition(transcript_text),
+            "structural": validator.structural_coverage(matches, matcher._split_document(document_text)),
+        }
+
+        try:
+            analyzer = LlamaAnalyzer(settings.LLAMA_MODEL_PATH)
+            summary = analyzer.summarize(transcript_text)
+            sections = analyzer.score_sections(transcript_text, matcher._split_document(document_text))
+        except Exception as e:
+            logger.error(f"LLM analysis failed: {e}")
+            summary = ""
+            sections = []
+
+        report = ReportGenerator().create_report(
+            transcript_text,
+            matches,
+            matcher._split_document(document_text),
+            summary,
+            sections,
+        )
+
+        return Response(report, status=status.HTTP_200_OK)
+
+    def _read_document(self, path: str) -> str:
+        ext = os.path.splitext(path)[1].lower()
+        if ext == ".pdf":
+            import PyPDF2
+            with open(path, "rb") as f:
+                reader = PyPDF2.PdfReader(f)
+                return "\n".join([p.extract_text() or "" for p in reader.pages])
+        elif ext == ".docx":
+            from docx import Document
+            d = Document(path)
+            return "\n".join([p.text for p in d.paragraphs])
+        return ""
+
 
 
 class FeedbackView(APIView):
@@ -2539,3 +2640,4 @@ class GenerateSummaryFromAudioID(APIView):
             "summary": audio_instance.summary,
         }
         return Response(response_data, status=status.HTTP_200_OK)
+

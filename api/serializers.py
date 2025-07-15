@@ -207,6 +207,34 @@ class ProcessAudioViewSerializer(serializers.Serializer):
         except ValueError:
             raise serializers.ValidationError("All userIds must be integers.")
 
+
+class FileProcessingSerializer(serializers.Serializer):
+    """Serializer for the audio and reference document upload API."""
+    audio_file = serializers.FileField(required=True)
+    document_file = serializers.FileField(required=True)
+
+    SUPPORTED_AUDIO = [
+        "wav", "mp3", "mp4", "m4a", "aac",
+        "ogg", "flac", "webm", "wma", "3gp",
+    ]
+    SUPPORTED_DOCS = ["pdf", "docx"]
+
+    def validate_audio_file(self, value):
+        ext = value.name.split(".")[-1].lower()
+        if ext not in self.SUPPORTED_AUDIO:
+            raise serializers.ValidationError(
+                f"Unsupported audio format: {ext}. Supported: {', '.join(self.SUPPORTED_AUDIO)}"
+            )
+        return value
+
+    def validate_document_file(self, value):
+        ext = value.name.split(".")[-1].lower()
+        if ext not in self.SUPPORTED_DOCS:
+            raise serializers.ValidationError(
+                f"Unsupported document format: {ext}. Supported: {', '.join(self.SUPPORTED_DOCS)}"
+            )
+        return value
+
     # def validate_session_user_ids(self, value):
     #     if value in [None, '', [], {}]:
     #         return []

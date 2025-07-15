@@ -11,6 +11,14 @@ This project is an offline-capable, edge-deployed system designed to process aud
 - [Contributing](#contributing)
 - [License](#license)
 
+## Features
+- Secure S3 file storage with metadata and integrity checks
+- NVIDIA NeMo based transcription with clustered speaker diarization
+- Semantic document matching using sentence-transformers and FAISS
+- Transcript validation (confirmation phrases, repetition, structural coverage)
+- LLaMA powered summarization and compliance scoring
+- Final JSON report generation ready for audits
+
 ## Prerequisites
 
 Before you begin, ensure you have met the following requirements:

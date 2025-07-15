@@ -1,17 +1,39 @@
 from django.urls import path
-from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDetailView, 
-                    FeedbackReviewListView, FeedbackReviewDetailView, 
-                    GetAudioRecordsView, AudioFileDetailView, ReAnalyzeAudioView,
-                    SOPCreateView, SOPListView, SOPDetailView, 
-                    SessionCreateView, SessionListView, SessionDetailView, 
-                    SessionReviewView, SessionStatusUpdateView, 
-                    AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView, # Added AdminDashboardSummaryView
-                    UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView,
-                    SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID)
+from .views import (
+    ProcessAudioView,
+    FeedbackView,
+    FeedbackListView,
+    FeedbackDetailView,
+    FeedbackReviewListView,
+    FeedbackReviewDetailView,
+    GetAudioRecordsView,
+    AudioFileDetailView,
+    ReAnalyzeAudioView,
+    SOPCreateView,
+    SOPListView,
+    SOPDetailView,
+    SessionCreateView,
+    SessionListView,
+    SessionDetailView,
+    SessionReviewView,
+    SessionStatusUpdateView,
+    AdminUserListView,
+    AdminUserDetailView,
+    AdminDashboardSummaryView,  # Added AdminDashboardSummaryView
+    UserSettingsView,
+    SystemSettingsView,
+    AuditLogView,
+    UserProfileDetailsView,
+    SpeakerProfileUpdateView,
+    SpeakerProfileListView,
+    GenerateSummaryFromAudioID,
+    FileProcessingView,
+)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
 
 urlpatterns = [
     path('process-audio/<str:token>/', ProcessAudioView.as_view(), name='process-audio'),
+    path('file-processing/', FileProcessingView.as_view(), name='file-processing'),
     
     # Feedback URLs
     path('submit-feedback/<str:token>/', FeedbackView.as_view(), name='submit-feedback'), # Existing POST for create
