@@ -38,3 +38,11 @@ drf-spectacular
 drf-yasg
 speechbrain
 scikit-learn
+
+nemo_toolkit[nlp]
+sentence-transformers
+faiss-cpu
+soundfile
+librosa
+PyPDF2
+python-docx
