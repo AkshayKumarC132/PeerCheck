@@ -3,6 +3,7 @@ import io
 import re
 import logging
 import json
+import asyncio
 from tempfile import TemporaryDirectory
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
@@ -20,7 +21,16 @@ import torch
 import numpy as np
 from django.db import transaction
 from django.http import HttpResponse
-from api.models import (SOP, Session, AudioFile, ReferenceDocument, AuditLog, SOPStep, SessionUser, SpeakerProfile)
+from api.models import (
+    SOP,
+    Session,
+    AudioFile,
+    ReferenceDocument,
+    AuditLog,
+    SOPStep,
+    SessionUser,
+    SpeakerProfile,
+)
 from api.authentication import token_verification
 from api.permissions import RoleBasedPermission
 from .views import upload_file_to_s3, download_file_from_s3
@@ -35,6 +45,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import green, yellow, red, black
 import fitz  # PyMuPDF
 import zipfile
+from .pipeline import PeerCheckPipeline, TranscriptMetadata
 
 try:
     from pyannote.audio import Pipeline
@@ -1014,21 +1025,14 @@ class EnhancedTranscriptionValidationView(APIView):
                 if session_obj:
                     session_obj.audio_files.add(audio_file_obj)
 
-                # Process audio
-                logging.info("Processing audio...")
-                audio_processor = EnhancedAudioProcessor(hf_token)
-                content_validator = LLMContentValidator()
-                timeline_generator = SpeakerTimelineGenerator()
-                content_validator.load_models()
-
-                import requests
-
+                # Process audio using the asynchronous pipeline
+                logging.info("Processing audio through PeerCheck pipeline...")
+                pipeline = PeerCheckPipeline(hf_token)
                 try:
-                    response = requests.get(file_url, stream=True)
-                    response.raise_for_status()
-                    full_transcript, speaker_segments = audio_processor.transcribe_with_speaker_diarization(response)
+                    result: TranscriptMetadata = asyncio.run(
+                        pipeline.process(file_url, steps, procedure_text)
+                    )
                 except Exception as e:
-                    # Mark as failed if processing fails
                     if 'audio_file_obj' in locals() and audio_file_obj:
                         try:
                             audio_file_obj.status = "failed"
@@ -1037,17 +1041,23 @@ class EnhancedTranscriptionValidationView(APIView):
                             pass
                     return Response({"error": f"Audio processing failed: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+                full_transcript = result.transcript
+                speaker_segments = result.segments
+                matches = result.matches
+                final_coverage = result.coverage
+                summary = result.summary
+                timeline_img = io.BytesIO(result.timeline)
+
                 # Update duration
                 if speaker_segments:
                     max_dur = max(s.end_time for s in speaker_segments)
                     audio_file_obj.duration = max_dur
 
-                # Step matching
-                matches = content_validator.advanced_step_matching(steps, speaker_segments)
-                final_coverage = content_validator._calculate_coverage(matches)
-                matched_count = sum(1 for m in matches if m.status=='Matched')
-                partial_count = sum(1 for m in matches if m.status=='Partial')
-                missing_count = sum(1 for m in matches if m.status=='Missing')
+                matches = result.matches
+                final_coverage = result.coverage
+                matched_count = sum(1 for m in matches if m.status == 'Matched')
+                partial_count = sum(1 for m in matches if m.status == 'Partial')
+                missing_count = sum(1 for m in matches if m.status == 'Missing')
 
                 # Save results
                 transcription_data = {
@@ -1085,8 +1095,6 @@ class EnhancedTranscriptionValidationView(APIView):
                 # Save to audio record
                 audio_file_obj.transcription = transcription_data
                 audio_file_obj.status = "processed"
-                # Generate summary
-                summary = _generate_enhanced_summary(full_transcript, matches)
                 audio_file_obj.summary = summary
                 # Save keywords
                 all_keywords = []
@@ -1100,8 +1108,15 @@ class EnhancedTranscriptionValidationView(APIView):
 
                 # Generate report and timeline
                 logging.info("Generating report and timeline...")
-                pdf_buf = create_enhanced_pdf_report(steps, matches, full_transcript, summary, final_coverage, speaker_segments, procedure_text)
-                timeline_img = timeline_generator.create_speaker_timeline(speaker_segments, matches)
+                pdf_buf = create_enhanced_pdf_report(
+                    steps,
+                    matches,
+                    full_transcript,
+                    summary,
+                    final_coverage,
+                    speaker_segments,
+                    procedure_text,
+                )
 
                 # Package ZIP
                 zip_buf = io.BytesIO()
