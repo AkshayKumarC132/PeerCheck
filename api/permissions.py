@@ -55,6 +55,14 @@ class RoleBasedPermission(permissions.BasePermission):
                 'sessionstatusupdateview': ['patch'], 
                 'adminuserlistview': ['get'],
                 'userprofiledetailsview': ['get'],
+
+                # Add Reference Document views:
+                'referencedocumentuploadview': ['post', 'get'],  # Allow upload
+                'referencedocumentlistview': ['get'],    # Allow listing
+                'referencedocumentdetailview': ['get', 'delete'], # Allow retrieve & delete
+
+                'enhancedtranscriptionvalidationview': ['post', 'get'], # Allow enhanced validation
+
             },
             'reviewer': {
                 'soplistview': ['get'],

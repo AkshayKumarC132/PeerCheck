@@ -74,6 +74,17 @@ def download_file_from_s3(file_name, bucket_name):
     except Exception as e:
         raise Exception(f"Error downloading file from S3: {str(e)}")
 
+def download_reference_file_from_s3(file_name, bucket_name):
+    print("Downloading reference document from S3...", file_name, bucket_name, sep="\n ")
+    """
+    Download a reference document from an S3 bucket.
+    """
+    try:
+        file_path = f"/reference_documents/{uuid.uuid4()}_{os.path.basename(file_name)}"
+        s3_client.download_file(bucket_name, file_name, file_path)
+        return file_path
+    except Exception as e:
+        raise Exception(f"Error downloading reference document from S3: {str(e)}")
 
 class ProcessAudioView(CreateAPIView):
     """

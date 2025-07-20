@@ -125,7 +125,7 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'initial.sqlite3',
+        'NAME': BASE_DIR / 'testing.sqlite3',
     },
     'default1y': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
@@ -263,3 +263,13 @@ else: # Assuming Linux/Unix
             },
         },
     }
+
+STATIC_URL = '/static/'
+
+# During development
+STATICFILES_DIRS = [
+    BASE_DIR / "static",
+]
+
+# For production
+STATIC_ROOT = BASE_DIR / "staticfiles"

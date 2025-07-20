@@ -18,10 +18,40 @@ class UserProfile(AbstractUser):
     class Meta:
         db_table = "user_profile"
 
+class ReferenceDocument(models.Model):
+    DOCUMENT_TYPES = (
+        ('sop', 'Standard Operating Procedure'),
+        ('procedure', 'Procedure Document'),
+        ('manual', 'Manual'),
+        ('guideline', 'Guideline'),
+        ('checklist', 'Checklist'),
+        ('other', 'Other'),
+    )
+    
+    name = models.CharField(max_length=255)
+    document_type = models.CharField(max_length=20, choices=DOCUMENT_TYPES, default='sop')
+    file_path = models.CharField(max_length=500)  # S3 URL
+    original_filename = models.CharField(max_length=255)
+    file_size = models.BigIntegerField(null=True, blank=True)  # Size in bytes
+    content_type = models.CharField(max_length=100, null=True, blank=True)
+    extracted_text = models.TextField(null=True, blank=True)  # Store extracted text
+    upload_status = models.CharField(max_length=50, default='pending')  # pending, processed, failed
+    uploaded_by = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='reference_documents_uploaded')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "reference_documents"
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.name} ({self.document_type})"
+
 class SOP(models.Model):
     name = models.CharField(max_length=255)
     version = models.CharField(max_length=50)
     created_by = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='sops_created')
+    reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name='related_sops')  # New field
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -143,6 +173,9 @@ class SystemSettings(models.Model):
 class AuditLog(models.Model):
     ACTION_CHOICES = (
         ('audio_upload', 'Audio Upload'),
+        ('document_upload', 'Reference Document Upload'),  # New action
+        ('document_process', 'Reference Document Process'),  # New action
+        ('document_delete', 'Reference Document Delete'),  # New action
         ('feedback_submit', 'Feedback Submit'),
         ('sop_create', 'SOP Create'),
         ('sop_update', 'SOP Update'),

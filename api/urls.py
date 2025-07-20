@@ -7,12 +7,18 @@ from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDe
                     SessionReviewView, SessionStatusUpdateView, 
                     AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView, # Added AdminDashboardSummaryView
                     UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView,
-                    SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID)
+                    SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID,
+                    )
+from .new_enhanced import EnhancedTranscriptionValidationView
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
+from .reference_document_upload import ReferenceDocumentUploadView, ReferenceDocumentListView, ReferenceDocumentDetailView
+from .new_enhanced import EnhancedTranscriptionValidationView
 
 urlpatterns = [
     path('process-audio/<str:token>/', ProcessAudioView.as_view(), name='process-audio'),
-    
+
+    path('transcription_summary/<str:token>/', EnhancedTranscriptionValidationView.as_view(), name='new-whisper-transcription'),
+
     # Feedback URLs
     path('submit-feedback/<str:token>/', FeedbackView.as_view(), name='submit-feedback'), # Existing POST for create
     path('feedback/<str:token>/', FeedbackListView.as_view(), name='feedback-list'), # GET list
@@ -55,4 +61,13 @@ urlpatterns = [
     path('speaker/<int:profile_id>/<str:token>/', SpeakerProfileUpdateView.as_view(), name='speaker-update'),
 
     path('audio/<str:token>/<int:audio_id>/generate-summary/', GenerateSummaryFromAudioID.as_view(), name='generate-summary-from-audio'),
+
+    # Reference Document Upload URLs
+    path('reference-documents/upload/<str:token>/', ReferenceDocumentUploadView.as_view(), name='reference-document-upload'),
+    path('reference-documents/<str:token>/', ReferenceDocumentListView.as_view(), name='reference-document-list'),
+    path('reference-documents/<str:token>/<int:document_id>/', ReferenceDocumentDetailView.as_view(), name='reference-document-detail'),
+
+    # Enhanced validation endpoint
+    path('enhanced-validation/<str:token>/<int:document_id>/', EnhancedTranscriptionValidationView.as_view(), name='enhanced-validation'),
+
 ]
