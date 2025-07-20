@@ -22,7 +22,6 @@ import ffmpeg
 import torch
 import numpy as np
 from django.db import transaction
-from django.http import HttpResponse
 from api.models import (
     SOP,
     Session,
@@ -35,7 +34,7 @@ from api.models import (
 )
 from api.authentication import token_verification
 from api.permissions import RoleBasedPermission
-from .views import upload_file_to_s3, download_file_from_s3
+from .views import upload_file_to_s3
 import boto3
 import nltk
 from nltk.tokenize import sent_tokenize, word_tokenize
@@ -50,7 +49,6 @@ import zipfile
 
 try:
     from pyannote.audio import Pipeline
-    from pyannote.core import Segment
     import torchaudio
     DIARIZATION_AVAILABLE = True
 except ImportError:
@@ -63,7 +61,6 @@ try:
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
     from matplotlib.lines import Line2D
-    import seaborn as sns
     VISUALIZATION_AVAILABLE = True
 except ImportError:
     VISUALIZATION_AVAILABLE = False
@@ -1155,14 +1152,8 @@ class EnhancedTranscriptionValidationView(APIView):
                         }
                     )
 
-                # Save ZIP locally
                 report_name = f"validation_report_{uuid.uuid4()}.zip"
-                local_dir = os.path.join(settings.BASE_DIR, "reports")
-                os.makedirs(local_dir, exist_ok=True)
-                local_path = os.path.join(local_dir, report_name)
-                with open(local_path, "wb") as f:
-                    f.write(zip_buf.getvalue())
-
+                logger.info("Uploading report ZIP to S3: %s", report_name)
                 # Upload ZIP to S3
                 zip_buf.seek(0)
                 s3_key = f"reports/{report_name}"

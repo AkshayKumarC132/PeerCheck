@@ -38,3 +38,10 @@ drf-spectacular
 drf-yasg
 speechbrain
 scikit-learn
+sentence-transformers 
+reportlab 
+pymupdf 
+PyPDF2 
+pdfplumber 
+python-docx
+pyannote.audio
