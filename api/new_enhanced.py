@@ -422,6 +422,7 @@ class LLMContentValidator:
         return matches
 
     def _comprehensive_step_match(self, step_text, speaker_segments, segment_texts, segment_embeddings):
+        """Return best matching segments and scoring breakdown for one step."""
         # Semantic similarity
         step_embedding = self.embedder.encode([step_text], convert_to_tensor=True)
         semantic_similarities = util.pytorch_cos_sim(step_embedding, segment_embeddings)[0]
@@ -444,7 +445,7 @@ class LLMContentValidator:
         combined_scores = []
         for i in range(len(segment_texts)):
             score = (
-                semantic_similarities[i] * Config.SEMANTIC_WEIGHT +
+                float(semantic_similarities[i]) * Config.SEMANTIC_WEIGHT +
                 fuzzy_scores[i] * Config.FUZZY_WEIGHT +
                 keyword_scores[i] * Config.KEYWORD_WEIGHT +
                 technical_scores[i] * 0.20
@@ -453,12 +454,12 @@ class LLMContentValidator:
                 score *= 1.15
             if keyword_scores[i] >= Config.MIN_KEYWORD_OVERLAP:
                 score *= 1.10
-            combined_scores.append(score)
+            combined_scores.append(float(score))
 
         # Get top candidates
         top_indices = sorted(range(len(combined_scores)), key=lambda i: combined_scores[i], reverse=True)
         matched_segments = []
-        final_score = 0
+        final_score = 0.0
         status = 'Missing'
         llm_validation = ""
         speaker_attribution = []
@@ -467,7 +468,7 @@ class LLMContentValidator:
             score = combined_scores[idx]
             if score >= Config.PARTIAL_THRESHOLD:
                 matched_segments.append(speaker_segments[idx])
-                final_score = score
+                final_score = float(score)
                 # Determine status
                 if score >= Config.MATCH_THRESHOLD:
                     status = 'Matched'
@@ -486,7 +487,7 @@ class LLMContentValidator:
         if not matched_segments:
             return {
                 'matched_segments': [],
-                'final_score': 0,
+                'final_score': 0.0,
                 'status': 'Missing',
                 'llm_validation': "No matching segments",
                 'speaker_attribution': [],
@@ -501,16 +502,16 @@ class LLMContentValidator:
 
         return {
             'matched_segments': matched_segments,
-            'final_score': final_score,
+            'final_score': float(final_score),
             'status': status,
             'llm_validation': llm_validation,
             'speaker_attribution': speaker_attribution,
             'score_breakdown': {
-                'semantic': float(semantic_similarities[0]),
+                'semantic': float(max(semantic_similarities)),
                 'fuzzy': max(fuzzy_scores),
                 'keyword': max(keyword_scores),
                 'technical': max(technical_scores),
-                'final': final_score
+                'final': float(final_score)
             }
         }
 
