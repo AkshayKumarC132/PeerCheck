@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import time
 from datetime import datetime
 from peercheck import settings
+
+logger = logging.getLogger(__name__)
 from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -53,7 +55,7 @@ try:
     DIARIZATION_AVAILABLE = True
 except ImportError:
     DIARIZATION_AVAILABLE = False
-    logging.warning("pyannote.audio not available. Speaker diarization will be disabled.")
+    logger.warning("pyannote.audio not available. Speaker diarization will be disabled.")
 
 try:
     import matplotlib
@@ -65,7 +67,7 @@ try:
     VISUALIZATION_AVAILABLE = True
 except ImportError:
     VISUALIZATION_AVAILABLE = False
-    logging.warning("Matplotlib not available. Timeline generation disabled.")
+    logger.warning("Matplotlib not available. Timeline generation disabled.")
 
 from sentence_transformers import SentenceTransformer, util
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -165,7 +167,7 @@ class EnhancedModelLoader:
     def load_models(cls, hf_token: Optional[str] = None):
         if cls._audio_model is None:
             cls._audio_model = whisper.load_model(Config.WHISPER_MODEL, device=Config.DEVICE)
-            logging.info(f"Whisper {Config.WHISPER_MODEL} loaded on {Config.DEVICE}")
+            logger.info(f"Whisper {Config.WHISPER_MODEL} loaded on {Config.DEVICE}")
         if cls._diarization_pipeline is None and hf_token and DIARIZATION_AVAILABLE:
             try:
                 cls._diarization_pipeline = Pipeline.from_pretrained(
@@ -174,13 +176,13 @@ class EnhancedModelLoader:
                 )
                 if Config.USE_GPU:
                     cls._diarization_pipeline = cls._diarization_pipeline.to(torch.device(Config.DEVICE))
-                logging.info("Diarization pipeline loaded")
+                logger.info("Diarization pipeline loaded")
             except Exception as e:
-                logging.warning(f"Failed to load diarization: {e}")
+                logger.warning(f"Failed to load diarization: {e}")
                 cls._diarization_pipeline = None
         if cls._embedder is None:
             cls._embedder = SentenceTransformer(Config.SENTENCE_TRANSFORMER, device=Config.DEVICE)
-            logging.info("Sentence transformer loaded")
+            logger.info("Sentence transformer loaded")
         if cls._llm_model is None:
             try:
                 cls._llm_tokenizer = AutoTokenizer.from_pretrained(Config.LLM_MODEL, padding_side='left')
@@ -189,9 +191,9 @@ class EnhancedModelLoader:
                     cls._llm_model = cls._llm_model.to(Config.DEVICE)
                 if cls._llm_tokenizer.pad_token is None:
                     cls._llm_tokenizer.pad_token = cls._llm_tokenizer.eos_token
-                logging.info("LLM model loaded")
+                logger.info("LLM model loaded")
             except Exception as e:
-                logging.warning(f"Failed to load LLM: {e}")
+                logger.warning(f"Failed to load LLM: {e}")
                 cls._llm_model = None
                 cls._llm_tokenizer = None
         return cls._audio_model, cls._diarization_pipeline, cls._embedder, cls._llm_model, cls._llm_tokenizer
@@ -219,7 +221,7 @@ class EnhancedAudioProcessor:
                 .run(quiet=True, capture_stdout=True, capture_stderr=True)
             )
         except ffmpeg.Error as e:
-            logging.error(f"Audio conversion failed: {e.stderr.decode()}")
+            logger.error(f"Audio conversion failed: {e.stderr.decode()}")
             raise
 
     def transcribe_with_speaker_diarization(self, response):
@@ -252,7 +254,7 @@ class EnhancedAudioProcessor:
             max_samples = Config.MAX_AUDIO_LENGTH * 16000
             if len(audio_array) > max_samples:
                 audio_array = audio_array[:max_samples]
-                logging.warning(f"Audio truncated to {Config.MAX_AUDIO_LENGTH} seconds")
+                logger.warning(f"Audio truncated to {Config.MAX_AUDIO_LENGTH} seconds")
 
             # Transcribe
             transcription = audio_model.transcribe(
@@ -272,9 +274,9 @@ class EnhancedAudioProcessor:
                     if waveform.shape[0] > 1:
                         waveform = waveform.mean(dim=0, keepdim=True)
                     diarization = diarization_pipeline({"waveform": waveform, "sample_rate": sample_rate})
-                    logging.info(f"Diarization found {len(diarization.labels())} speakers")
+                    logger.info(f"Diarization found {len(diarization.labels())} speakers")
                 except Exception as e:
-                    logging.error(f"Diarization failed: {e}")
+                    logger.error(f"Diarization failed: {e}")
 
             # Align transcription with speakers
             speaker_segments = self._align_transcription_with_speakers(transcription, diarization)
@@ -754,7 +756,7 @@ class SpeakerTimelineGenerator:
             plt.close()
             return buf
         except Exception as e:
-            logging.error(f"Error in timeline creation: {e}")
+            logger.error(f"Error in timeline creation: {e}")
             return io.BytesIO()
 
     def _calculate_coverage_from_matches(self, matches):
@@ -881,7 +883,7 @@ def enhanced_annotate_pdf(input_path, steps, matches, output_path):
         doc.save(output_path)
         doc.close()
     except Exception as e:
-        logging.error(f"Failed to annotate PDF: {e}")
+        logger.error(f"Failed to annotate PDF: {e}")
         import shutil
         shutil.copy2(input_path, output_path)
 
@@ -892,6 +894,7 @@ class EnhancedTranscriptionValidationView(APIView):
 
     def post(self, request, token, document_id, format=None):
         start_time = time.time()
+        logger.info("Transcription request received for document %s", document_id)
 
         # Token validation
         user = token_verification(token)
@@ -1025,7 +1028,7 @@ class EnhancedTranscriptionValidationView(APIView):
                     session_obj.audio_files.add(audio_file_obj)
 
                 # Process audio using the asynchronous pipeline
-                logging.info("Processing audio through PeerCheck pipeline...")
+                logger.info("Processing audio through PeerCheck pipeline...")
                 # Local import to avoid circular dependency
                 from .pipeline import PeerCheckPipeline, TranscriptMetadata
                 pipeline = PeerCheckPipeline(hf_token)
@@ -1108,7 +1111,7 @@ class EnhancedTranscriptionValidationView(APIView):
                 _update_speaker_profiles(speaker_segments)
 
                 # Generate report and timeline
-                logging.info("Generating report and timeline...")
+                logger.info("Generating report and timeline...")
                 pdf_buf = create_enhanced_pdf_report(
                     steps,
                     matches,
@@ -1155,6 +1158,7 @@ class EnhancedTranscriptionValidationView(APIView):
                 response = HttpResponse(zip_buf.getvalue(), content_type='application/zip')
                 response['Content-Disposition'] = f'attachment; filename="validation_report_{int(final_coverage*100)}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip"'
                 total_time = time.time() - start_time
+                logger.info("Processing completed in %.2fs", total_time)
                 return response
 
         except Exception as e:
@@ -1162,7 +1166,7 @@ class EnhancedTranscriptionValidationView(APIView):
             if 'audio_file_obj' in locals() and audio_file_obj:
                 audio_file_obj.status = "failed"
                 audio_file_obj.save()
-            logging.exception("Processing failed")
+            logger.exception("Processing failed")
             return Response({"error": f"Processing failed: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 # Helper functions
@@ -1251,9 +1255,9 @@ def _update_speaker_profiles(speaker_segments):
                 defaults={'embedding': {}}
             )
             if created:
-                logging.info(f"Created speaker profile {s}")
+                logger.info(f"Created speaker profile {s}")
     except Exception as e:
-        logging.error(f"Error updating speaker profiles: {e}")
+        logger.error(f"Error updating speaker profiles: {e}")
 
 def _generate_enhanced_summary(full_text, matches):
     sentences = sent_tokenize(full_text)
