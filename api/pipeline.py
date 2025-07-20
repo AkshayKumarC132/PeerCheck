@@ -44,12 +44,20 @@ class PeerCheckPipeline:
         procedure_text: str,
     ) -> TranscriptMetadata:
         loop = asyncio.get_running_loop()
-        response = await asyncio.to_thread(requests.get, audio_url, stream=True)
-        response.raise_for_status()
+        try:
+            response = await asyncio.to_thread(
+                requests.get, audio_url, stream=True, timeout=30
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Failed to fetch audio: {exc}") from exc
 
-        transcript, segments = await asyncio.to_thread(
-            self.audio_processor.transcribe_with_speaker_diarization, response
-        )
+        from contextlib import closing
+
+        with closing(response):
+            transcript, segments = await asyncio.to_thread(
+                self.audio_processor.transcribe_with_speaker_diarization, response
+            )
 
         matches = await asyncio.to_thread(
             self.validator.advanced_step_matching, steps, segments

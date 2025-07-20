@@ -97,7 +97,7 @@ except Exception as e:
 
 @dataclass
 class Config:
-    WHISPER_MODEL: str = "base"
+    WHISPER_MODEL: str = "base.en"  # English-only model for efficiency
     DIARIZATION_MODEL: str = "pyannote/speaker-diarization-3.1"
     SENTENCE_TRANSFORMER: str = "all-mpnet-base-v2"
     LLM_MODEL: str = "microsoft/DialoGPT-large"
