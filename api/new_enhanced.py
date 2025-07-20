@@ -1155,12 +1155,36 @@ class EnhancedTranscriptionValidationView(APIView):
                         }
                     )
 
-                # Response
-                response = HttpResponse(zip_buf.getvalue(), content_type='application/zip')
-                response['Content-Disposition'] = f'attachment; filename="validation_report_{int(final_coverage*100)}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip"'
+                # Save ZIP locally
+                report_name = f"validation_report_{uuid.uuid4()}.zip"
+                local_dir = os.path.join(settings.BASE_DIR, "reports")
+                os.makedirs(local_dir, exist_ok=True)
+                local_path = os.path.join(local_dir, report_name)
+                with open(local_path, "wb") as f:
+                    f.write(zip_buf.getvalue())
+
+                # Upload ZIP to S3
+                zip_buf.seek(0)
+                s3_key = f"reports/{report_name}"
+                try:
+                    report_url = upload_file_to_s3(zip_buf, S3_BUCKET_NAME, s3_key)
+                except Exception as e:
+                    logger.error("Failed to upload report to S3: %s", e)
+                    report_url = None
+
+                # Update audio file record
+                audio_file_obj.report_path = report_url
+                audio_file_obj.coverage = final_coverage
+                audio_file_obj.save()
+
                 total_time = time.time() - start_time
                 logger.info("Processing completed in %.2fs", total_time)
-                return response
+
+                return Response({
+                    "report_url": report_url,
+                    "coverage": final_coverage,
+                    "audio_file_id": audio_file_obj.id,
+                })
 
         except Exception as e:
             # Mark as failed if possible
