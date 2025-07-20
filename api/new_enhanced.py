@@ -45,7 +45,6 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.colors import green, yellow, red, black
 import fitz  # PyMuPDF
 import zipfile
-from .pipeline import PeerCheckPipeline, TranscriptMetadata
 
 try:
     from pyannote.audio import Pipeline
@@ -1027,6 +1026,8 @@ class EnhancedTranscriptionValidationView(APIView):
 
                 # Process audio using the asynchronous pipeline
                 logging.info("Processing audio through PeerCheck pipeline...")
+                # Local import to avoid circular dependency
+                from .pipeline import PeerCheckPipeline, TranscriptMetadata
                 pipeline = PeerCheckPipeline(hf_token)
                 try:
                     result: TranscriptMetadata = asyncio.run(
