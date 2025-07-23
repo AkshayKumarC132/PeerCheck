@@ -38,3 +38,27 @@ drf-spectacular
 drf-yasg
 speechbrain
 scikit-learn
+
+#Database
+psycopg2-binary
+
+# Document Processing (MISSING - NOW ADDED)
+python-docx
+pdf2docx
+PyPDF2
+
+# Windows COM Support (MISSING - NOW ADDED)
+pywin32
+
+# General Utilities
+numpy
+pandas
+pydub
+ffmpeg-python
+fuzzywuzzy
+python-Levenshtein
+boto3
+drf-spectacular
+drf-yasg
+speechbrain
+scikit-learn

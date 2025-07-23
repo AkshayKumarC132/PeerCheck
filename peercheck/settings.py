@@ -125,7 +125,7 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'initial.sqlite3',
+        'NAME': BASE_DIR / 'new_peercheck.sqlite3',
     },
     'default1y': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
@@ -220,46 +220,11 @@ CORS_ALLOW_HEADERS = [
 
 
 
-if os.name == 'nt':  # Windows-specific settings
-    LOGGING = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'handlers': {
-            'console': {
-                'class': 'logging.StreamHandler',
-            },
-            'file': {
-                'class': 'logging.FileHandler',
-                'filename': 'debug.log',
-            },
-        },
-        'loggers': {
-            'api.views': {
-                'handlers': ['console', 'file'],
-                'level': 'DEBUG',
-                'propagate': True,
-            },
-        },
-    }
-else: # Assuming Linux/Unix
-    LOGGING = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'handlers': {
-            'console': {
-                'class': 'logging.StreamHandler',
-            },
-            'file': {
-                'level': 'DEBUG',
-                'class': 'logging.FileHandler',
-                'filename': '/var/www/PeerCheck/logs/debug.log',  # Updated path for Linux
-            },
-        },
-        'loggers': {
-            'api.views': {
-                'handlers': ['console', 'file'],
-                'level': 'DEBUG',
-                'propagate': True,
-            },
-        },
-    }
+# File Upload Settings
+FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
+
+# Audio processing settings
+WHISPER_MODEL = "base.en"
+ALLOWED_TEXT_EXTENSIONS = {'pdf', 'docx', 'txt'}
+ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'mpeg', 'mp4'}

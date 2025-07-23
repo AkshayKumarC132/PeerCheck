@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractUser
-
+import uuid
+from django.utils import timezone
 
 class UserProfile(AbstractUser):
     ROLE_CHOICES = (
@@ -17,6 +18,36 @@ class UserProfile(AbstractUser):
 
     class Meta:
         db_table = "user_profile"
+
+class ReferenceDocument(models.Model):
+    DOCUMENT_TYPES = (
+        ('sop', 'Standard Operating Procedure'),
+        ('procedure', 'Procedure Document'),
+        ('manual', 'Manual'),
+        ('guideline', 'Guideline'),
+        ('checklist', 'Checklist'),
+        ('other', 'Other'),
+    )
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    name = models.CharField(max_length=255)
+    document_type = models.CharField(max_length=20, choices=DOCUMENT_TYPES, default='sop')
+    file_path = models.CharField(max_length=500)  # S3 URL or local path
+    original_filename = models.CharField(max_length=255)
+    file_size = models.BigIntegerField(null=True, blank=True)
+    content_type = models.CharField(max_length=100, null=True, blank=True)
+    extracted_text = models.TextField(null=True, blank=True)
+    upload_status = models.CharField(max_length=50, default='pending')  # pending, processing, processed, failed
+    uploaded_by = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='reference_documents_uploaded')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = "reference_documents"
+        ordering = ['-created_at']
+    
+    def __str__(self):
+        return f"{self.name} ({self.document_type})"
 
 class SOP(models.Model):
     name = models.CharField(max_length=255)
@@ -41,29 +72,37 @@ class SOPStep(models.Model):
     def __str__(self):
         return f"Step {self.step_number}: {self.instruction_text[:50]}..."
 
-
 class AudioFile(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     file_path = models.CharField(max_length=255)
+    original_filename = models.CharField(max_length=255, null=True, blank=True)
     transcription = models.JSONField(null=True, blank=True)
-    status = models.CharField(max_length=50, default="pending")  # pending, processed
+    status = models.CharField(max_length=50, default="pending")  # pending, processing, processed, failed
     keywords_detected = models.TextField(null=True, blank=True)
     duration = models.FloatField(null=True, blank=True)  # Duration in seconds
     sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files')
-    user = models.ForeignKey('UserProfile', on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files_uploaded')  # New field
+    user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files_uploaded')
     summary = models.TextField(null=True, blank=True)  # Summary of the transcription
+    report_path = models.CharField(max_length=255, null=True, blank=True)
+    coverage = models.FloatField(null=True, blank=True)
+    reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_comparisons')
+    created_at = models.DateTimeField(auto_now_add=True)  # Fixed: was auto_now=True
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-created_at']
+    
     def __str__(self):
-        return self.file_path
+        return f"Audio: {self.original_filename or self.file_path}"
 
 # Feedback Model
-
 class Feedback(models.Model):
     audio_file = models.ForeignKey(AudioFile, on_delete=models.CASCADE)
     feedback = models.CharField(max_length=50)  # complete, incomplete, needs review
     comments = models.TextField(null=True, blank=True)
     created_by = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='feedbacks_submitted')
-    created_at = models.DateTimeField(auto_now_add=True, null=True) # Add default for existing rows
-    updated_at = models.DateTimeField(auto_now=True, null=True) # Add default for existing rows
-
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+    updated_at = models.DateTimeField(auto_now=True, null=True)
 
     def __str__(self):
         return f"Feedback for {self.audio_file.id}"
@@ -153,8 +192,8 @@ class AuditLog(models.Model):
         ('review_submit', 'Review Submit'),
         ('feedbackreview_update', 'FeedbackReview Update'), 
         ('feedbackreview_delete', 'FeedbackReview Delete'), 
-        ('userprofile_update', 'UserProfile Update'), # Added UserProfile Update
-        ('userprofile_delete', 'UserProfile Delete'), # Added UserProfile Delete
+        ('userprofile_update', 'UserProfile Update'),
+        ('userprofile_delete', 'UserProfile Delete'),
         ('session_status_update', 'Session Status Update'),
         ('session_update', 'Session Update'), 
         ('session_delete', 'Session Delete'), 
@@ -170,10 +209,8 @@ class AuditLog(models.Model):
     def __str__(self):
         return f"{self.action} by {self.user.username if self.user else 'Unknown'} at {self.timestamp}"
 
-
 class SpeakerProfile(models.Model):
     """Stores a speaker voice embedding and optional assigned name."""
-
     name = models.CharField(max_length=255, null=True, blank=True)
     embedding = models.JSONField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -181,3 +218,18 @@ class SpeakerProfile(models.Model):
 
     def __str__(self):
         return self.name or f"Speaker {self.id}"
+
+class ProcessingSession(models.Model):
+    """Track processing sessions for download tokens"""
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.CASCADE)
+    audio_file = models.ForeignKey(AudioFile, on_delete=models.CASCADE)
+    matched_words = models.IntegerField(default=0)
+    total_words = models.IntegerField(default=0)
+    coverage = models.FloatField(default=0.0)
+    processed_docx_path = models.CharField(max_length=500, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()  # Set expiration for cleanup
+    
+    def __str__(self):
+        return f"Session {self.id}"
