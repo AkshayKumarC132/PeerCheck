@@ -28,6 +28,7 @@ from .new_serializers import (
 import requests
 from pyannote.audio import Pipeline
 import subprocess
+import threading
 
 class UploadAndProcessView(CreateAPIView):
     """
@@ -138,6 +139,27 @@ class UploadAndProcessView(CreateAPIView):
             #     print(f"Diarization error: {diarization_error}")
             # audio_obj.diarization = diarization_segments if diarization_segments else None
             # audio_obj.save()
+            # --- End Speaker Diarization ---
+            
+            # --- Speaker Diarization in Background Thread ---
+            def diarization_background(audio_file_id, audio_s3_url, transcript_segments, transcript_words):
+                try:
+                    diarization_segments = diarization_from_audio(audio_s3_url, transcript_segments, transcript_words)
+                    audio_file = AudioFile.objects.get(id=audio_file_id)
+                    audio_file.diarization = diarization_segments
+                    audio_file.save()
+                except Exception as diar_err:
+                    audio_file = AudioFile.objects.get(id=audio_file_id)
+                    audio_file.diarization = None
+                    audio_file.save()
+                    print(f"Diarization error (background): {str(diar_err)}")
+
+            diarization_thread = threading.Thread(
+                target=diarization_background,
+                args=(audio_obj.id, audio_s3_url, transcript_segments, transcript_words),
+                daemon=True
+            )
+            diarization_thread.start()
             # --- End Speaker Diarization ---
             
             # Perform comparison analysis
