@@ -906,7 +906,7 @@ class GetAudioRecordsView(APIView):
                 audio_records = AudioFile.objects.filter(
                     sessions__session_users__user=user
                 ).distinct()
-            audio_records = audio_records.order_by("-id")
+            audio_records = audio_records.order_by("-created_at")
             
             paginator = PageNumberPagination()
             paginated_queryset = paginator.paginate_queryset(audio_records, request, view=self)
