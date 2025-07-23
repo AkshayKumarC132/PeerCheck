@@ -13,9 +13,11 @@ from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 import traceback
 from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile
-from .new_utils import (extract_text_from_s3, transcribe_audio_from_s3, 
-                       find_missing, create_highlighted_docx_from_s3, upload_file_to_s3,
-                        get_s3_key_from_url, s3_client)
+from .new_utils import (
+    extract_text_from_s3, transcribe_audio_from_s3, diarization_from_audio,  # <-- add diarization_from_audio
+    find_missing, create_highlighted_docx_from_s3, upload_file_to_s3,
+    get_s3_key_from_url, s3_client
+)
 from .authentication import token_verification
 from .new_serializers import (
     UploadAndProcessSerializer, ProcessingResultSerializer,
@@ -23,6 +25,9 @@ from .new_serializers import (
     CleanupRequestSerializer, CleanupResponseSerializer,
     ErrorResponseSerializer, ProcessingSessionDetailSerializer
 )
+import requests
+from pyannote.audio import Pipeline
+import subprocess
 
 class UploadAndProcessView(CreateAPIView):
     """
@@ -116,9 +121,24 @@ class UploadAndProcessView(CreateAPIView):
             reference_doc.save()
             
             # Transcribe audio
-            transcript = transcribe_audio_from_s3(audio_s3_url)
-            audio_obj.transcription = {'text': transcript}
+            transcript_result = transcribe_audio_from_s3(audio_s3_url)
+            transcript = transcript_result["text"]
+            transcript_segments = transcript_result.get("segments", [])
+            transcript_words = transcript_result.get("words", [])
+            audio_obj.transcription = transcript_result
             audio_obj.save()
+
+            # --- Speaker Diarization (using diarization_from_audio) ---
+            diarization_segments = []
+            diarization_error = None
+            # try:
+            #     diarization_segments = diarization_from_audio(audio_s3_url, transcript_segments, transcript_words)
+            # except Exception as diar_err:
+            #     diarization_error = str(diar_err)
+            #     print(f"Diarization error: {diarization_error}")
+            # audio_obj.diarization = diarization_segments if diarization_segments else None
+            # audio_obj.save()
+            # --- End Speaker Diarization ---
             
             # Perform comparison analysis
             matched_html, missing_html, matched_words, total_words, entire_html = find_missing(
@@ -146,22 +166,24 @@ class UploadAndProcessView(CreateAPIView):
             
             processing_time = time.time() - start_time
             
-            # Prepare response data - FIXED: Convert UUIDs to strings
+            # Prepare response data - include diarization
             response_data = {
-                'session_id': str(session.id),  # Convert UUID to string
+                'session_id': str(session.id),
                 'matched_words': matched_words,
                 'total_words': total_words,
                 'coverage': round(coverage, 2),
-                'reference_document_id': str(reference_doc.id),  # Convert UUID to string
-                'audio_file_id': str(audio_obj.id),  # Convert UUID to string
+                'reference_document_id': str(reference_doc.id),
+                'audio_file_id': str(audio_obj.id),
                 'matched_content': matched_html,
                 'missing_content': missing_html,
                 'entire_document': entire_html,
-                'processing_time': round(processing_time, 2)
+                'processing_time': round(processing_time, 2),
+                'diarization': diarization_segments if diarization_segments else None,
+                'diarization_error': diarization_error
             }
             
             # Debug: Print response data to see what's being returned
-            print(f"Response data being returned: {response_data}")
+            # print(f"Response data being returned: {response_data}")
             
             # Don't validate response data with serializer, just return it directly
             return Response(response_data, status=status.HTTP_200_OK)

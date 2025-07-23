@@ -218,7 +218,10 @@ CORS_ALLOW_HEADERS = [
     'origin', 'user-agent', 'x-csrftoken', 'x-requested-with'
 ]
 
-
+AWS_S3_ACCESS_KEY_ID = ''
+AWS_S3_SECRET_ACCESS_KEY = ''
+AWS_STORAGE_BUCKET_NAME = ''
+AWS_S3_REGION_NAME = ''
 
 # File Upload Settings
 FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
@@ -228,3 +231,6 @@ DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
 WHISPER_MODEL = "base.en"
 ALLOWED_TEXT_EXTENSIONS = {'pdf', 'docx', 'txt'}
 ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'mpeg', 'mp4'}
+
+# Hugging Face Token
+HF_TOKEN =''

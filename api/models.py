@@ -84,6 +84,7 @@ class AudioFile(models.Model):
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files_uploaded')
     summary = models.TextField(null=True, blank=True)  # Summary of the transcription
     report_path = models.CharField(max_length=255, null=True, blank=True)
+    diarization = models.JSONField(null=True, blank=True)
     coverage = models.FloatField(null=True, blank=True)
     reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_comparisons')
     created_at = models.DateTimeField(auto_now_add=True)  # Fixed: was auto_now=True
