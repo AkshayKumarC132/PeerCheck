@@ -23,7 +23,8 @@ from .new_serializers import (
     UploadAndProcessSerializer, ProcessingResultSerializer,
     DownloadRequestSerializer, UserDocumentsSerializer,
     CleanupRequestSerializer, CleanupResponseSerializer,
-    ErrorResponseSerializer, ProcessingSessionDetailSerializer
+    ErrorResponseSerializer, ProcessingSessionDetailSerializer,
+    ReferenceDocumentSerializer
 )
 import requests
 from pyannote.audio import Pipeline
@@ -77,30 +78,51 @@ class UploadAndProcessView(CreateAPIView):
         audio_obj = None
         
         try:
-            # Get validated data
-            text_file = serializer.validated_data['text_file']
-            audio_file = serializer.validated_data['audio_file']
-            document_type = serializer.validated_data.get('document_type', 'sop')
-            document_name = serializer.validated_data.get('document_name', '')
-            
-            # Since UserProfile extends AbstractUser, the user IS the UserProfile
+            validated_data = serializer.validated_data
             user_profile = user
+            audio_file = validated_data['audio_file']
+
+            # --- MODIFIED LOGIC: Handle document creation/fetching ---
             
-            # Upload text file to S3
-            text_s3_key = f'documents/{user.id}/{uuid.uuid4()}_{text_file.name}'
-            text_s3_url = upload_file_to_s3(text_file, text_s3_key)
+            if 'text_file' in validated_data:
+                # --- PATH 1: A new text file was uploaded ---
+                text_file = validated_data['text_file']
+                document_type = validated_data.get('document_type', 'sop')
+                document_name = validated_data.get('document_name', '')
+
+                # Upload text file to S3
+                text_s3_key = f'documents/{user.id}/{uuid.uuid4()}_{text_file.name}'
+                text_s3_url = upload_file_to_s3(text_file, text_s3_key)
+                
+                # Create ReferenceDocument
+                reference_doc = ReferenceDocument.objects.create(
+                    name=document_name or text_file.name,
+                    document_type=document_type,
+                    file_path=text_s3_url,
+                    original_filename=text_file.name,
+                    file_size=text_file.size,
+                    content_type=text_file.content_type or 'application/octet-stream',
+                    uploaded_by=user_profile,
+                    upload_status='processing'
+                )
+                
+                # Extract text from the newly uploaded document
+                text_content = extract_text_from_s3(text_s3_url)
+                reference_doc.extracted_text = text_content
+                reference_doc.upload_status = 'processed'
+                reference_doc.save()
             
-            # Create ReferenceDocument
-            reference_doc = ReferenceDocument.objects.create(
-                name=document_name or text_file.name,
-                document_type=document_type,
-                file_path=text_s3_url,
-                original_filename=text_file.name,
-                file_size=text_file.size,
-                content_type=text_file.content_type or 'application/octet-stream',
-                uploaded_by=user_profile,
-                upload_status='processing'
-            )
+            else:
+                # --- PATH 2: An existing document ID was provided ---
+                doc_id = validated_data['existing_document_id']
+                reference_doc = ReferenceDocument.objects.get(id=doc_id)
+                
+                # Optional: Ensure text is extracted if it was missed before
+                if not reference_doc.extracted_text and reference_doc.file_path:
+                    print(f"Extracting missing text for existing document: {reference_doc.id}")
+                    text_content = extract_text_from_s3(reference_doc.file_path)
+                    reference_doc.extracted_text = text_content
+                    reference_doc.save(update_fields=['extracted_text'])
             
             # Upload audio file to S3
             audio_s3_key = f'audio/{user.id}/{uuid.uuid4()}_{audio_file.name}'
@@ -115,8 +137,8 @@ class UploadAndProcessView(CreateAPIView):
                 status='processing'
             )
             
-            # Extract text from document
-            text_content = extract_text_from_s3(text_s3_url)
+            # # Extract text from document
+            text_content = extract_text_from_s3(reference_doc.file_path)
             reference_doc.extracted_text = text_content
             reference_doc.upload_status = 'processed'
             reference_doc.save()
@@ -549,3 +571,83 @@ class GetProcessingSessionView(GenericAPIView):
             error_serializer = ErrorResponseSerializer(data=error_data)
             error_serializer.is_valid()
             return Response(error_serializer.data, status=status.HTTP_404_NOT_FOUND)
+
+class UploadReferenceDocumentView(CreateAPIView):
+    """
+    Upload Reference Document files to S3, process them and return analysis results
+    """
+    serializer_class = ReferenceDocumentSerializer
+
+    @swagger_auto_schema(
+        operation_description="Upload Reference Document files to S3, process them and return analysis results",
+        responses={
+            200: ReferenceDocumentSerializer,
+            400: ErrorResponseSerializer,
+            401: ErrorResponseSerializer,
+            500: ErrorResponseSerializer
+        }
+    )
+    def create(self, request, token, *args, **kwargs):
+        # Verify token manually since authentication might not work with URL token
+        auth_result = token_verification(token)
+        if auth_result['status'] != 200:
+            error_data = {
+                'error': auth_result['error'],
+                'timestamp': timezone.now()
+            }
+            error_serializer = ErrorResponseSerializer(data=error_data)
+            error_serializer.is_valid()
+            return Response(error_serializer.data, status=status.HTTP_401_UNAUTHORIZED)
+        
+        user = auth_result['user']
+        
+        # Validate input data
+        serializer = self.get_serializer(data=request.data)
+        if not serializer.is_valid():
+            error_data = {
+                'error': 'Invalid input data',
+                'details': serializer.errors,
+                'timestamp': timezone.now()
+            }
+            error_serializer = ErrorResponseSerializer(data=error_data)
+            error_serializer.is_valid()
+            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            # Get validated data
+            text_file = serializer.validated_data['file_path']
+            document_type = serializer.validated_data.get('document_type', 'sop')
+            document_name = serializer.validated_data.get('document_name', '')
+            
+            # Since UserProfile extends AbstractUser, the user IS the UserProfile
+            user_profile = user
+            
+            # Upload text file to S3
+            text_s3_key = f'documents/{user.id}/{uuid.uuid4()}_{text_file.name}'
+            text_s3_url = upload_file_to_s3(text_file, text_s3_key)
+            
+            # Create ReferenceDocument
+            reference_doc = ReferenceDocument.objects.create(
+                name=document_name or text_file.name,
+                document_type=document_type,
+                file_path=text_s3_url,
+                original_filename=text_file.name,
+                file_size=text_file.size,
+                content_type=text_file.content_type or 'application/octet-stream',
+                uploaded_by=user_profile,
+                upload_status='processing'
+            )
+            # Extract text from document
+            text_content = extract_text_from_s3(text_s3_url)
+            reference_doc.extracted_text = text_content
+            reference_doc.upload_status = 'processed'
+            reference_doc.save()
+            return Response({"message":"Docuemnt Upload Success"}, status=status.HTTP_200_OK)    
+
+        except Exception as e:
+            print(f"Error in UploadAndProcessView: {str(e)}")
+            print(traceback.format_exc())
+            return Response({
+                'error': f'Processing failed: {str(e)}',
+                'timestamp': timezone.now().isoformat()  # Convert datetime to string
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

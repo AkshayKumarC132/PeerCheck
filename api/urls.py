@@ -67,6 +67,8 @@ urlpatterns = [
          new_enhnaced.DownloadProcessedDocumentView.as_view(), 
          name='download_processed'),
     
+    path('documents/upload/<str:token>/', new_enhnaced.UploadReferenceDocumentView.as_view(), name='document-upload'),
+
     # Get user's documents and audio files
     path('documents/<str:token>/', 
          new_enhnaced.GetUserDocumentsView.as_view(), 

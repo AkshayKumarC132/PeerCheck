@@ -6,7 +6,7 @@ from rest_framework.views import APIView
 from rest_framework.generics import CreateAPIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile
+from .models import AudioFile, SOP, SOPStep, Session, SessionUser, UserSettings, SystemSettings, AuditLog, Feedback, FeedbackReview, UserProfile, SpeakerProfile, ReferenceDocument
 from .serializers import (AudioFileSerializer, FeedbackSerializer, ProcessAudioViewSerializer, 
         SOPSerializer, SessionSerializer,FeedbackReviewSerializer, UserSettingsSerializer, SystemSettingsSerializer, AuditLogSerializer, AdminUserProfileSerializer)
 from .utils import *
@@ -1669,15 +1669,17 @@ class AdminDashboardSummaryView(APIView):
 
         try:
             total_users = UserProfile.objects.count()
-            total_sops = SOP.objects.count()
-            active_sessions = Session.objects.filter(status='active').count()
-            pending_reviews = FeedbackReview.objects.filter(resolved_flag=False).count()
+            total_audio_files = AudioFile.objects.count()
+            processed_audio_files = AudioFile.objects.filter(status='processed').count()
+            failed_audio_files = AudioFile.objects.filter(status='failed').count()
+            total_documents = ReferenceDocument.objects.count()
 
             data = {
                 "total_users": total_users,
-                "total_sops": total_sops,
-                "active_sessions": active_sessions,
-                "pending_reviews": pending_reviews
+                "total_audio_files": total_audio_files,
+                "total_documents": total_documents,
+                "processed_audio_files": processed_audio_files,
+                "failed_audio_files": failed_audio_files
             }
             return Response(data, status=status.HTTP_200_OK)
         except Exception as e:
