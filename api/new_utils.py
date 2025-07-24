@@ -2,12 +2,12 @@ import os
 import re
 import string
 import tempfile
-import pythoncom
+# import pythoncom
 import boto3
 from peercheck import settings
-from docx import Document as DocxDocument
+# from docx import Document as DocxDocument
 from pdf2docx import Converter
-import win32com.client
+# import win32com.client
 import whisper
 import PyPDF2
 import docx
