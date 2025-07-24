@@ -14,6 +14,8 @@ import docx
 from difflib import SequenceMatcher
 from fuzzywuzzy import fuzz
 from io import BytesIO
+from docx.shared import RGBColor
+import uuid
 
 # Load Whisper model once
 model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'base.en'))
@@ -30,6 +32,7 @@ def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
 
 def upload_file_to_s3(file_obj, s3_key):
+    print("Upload File to S3 ", file_obj, s3_key)
     """Upload file to S3 and return the S3 URL"""
     try:
         s3_client.upload_fileobj(
@@ -175,95 +178,130 @@ def find_missing(text, transcript, threshold=0.6):
     
     return m_html, x_html, matched_words, total_words, entire_html
 
+def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=0.6):
+    """
+    Highlights text in a DOCX file using python-docx (cross-platform).
+
+    Args:
+        docx_path (str): Path to the input DOCX file.
+        norm_trans (list): A list of normalized transcript strings.
+        output_path (str): Path to save the highlighted DOCX.
+        threshold (float): Similarity threshold for highlighting.
+    """
+    document = docx.Document(docx_path)
+    
+    # Define colors
+    GREEN = RGBColor(0, 176, 80)
+    RED = RGBColor(255, 0, 0)
+
+    # 1. Highlight regular paragraphs
+    for para in document.paragraphs:
+        if not para.text.strip():
+            continue
+        norm_para_text = normalize_line(para.text)
+        best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
+        color = GREEN if best_score >= threshold else RED
+        for run in para.runs:
+            run.font.color.rgb = color
+
+    # 2. Highlight text within shapes and text boxes by manipulating the underlying XML
+    tree = document.element.body
+    text_runs_in_shapes = tree.xpath('.//w:txbxContent//w:t') # Find all text runs in text boxes
+
+    for text_run in text_runs_in_shapes:
+        parent_paragraph = text_run.getparent().getparent()
+        texts_in_p = parent_paragraph.xpath('.//w:t/text()')
+        full_text = "".join(texts_in_p).strip()
+
+        if not full_text:
+            continue
+        
+        norm_shape_text = normalize_line(full_text)
+        best_score = max((fuzz.token_set_ratio(norm_shape_text, t) for t in norm_trans), default=0) / 100.0
+        color = GREEN if best_score >= threshold else RED
+        
+        # Apply color by creating/updating XML properties
+        run_properties = text_run.getparent().find(docx.oxml.ns.qn('w:rPr'))
+        if run_properties is None:
+            run_properties = docx.oxml.OxmlElement('w:rPr')
+            text_run.getparent().insert(0, run_properties)
+        
+        color_element = run_properties.find(docx.oxml.ns.qn('w:color'))
+        if color_element is None:
+            color_element = docx.oxml.OxmlElement('w:color')
+            run_properties.append(color_element)
+            
+        color_element.set(docx.oxml.ns.qn('w:val'), color.hex_str)
+
+    document.save(output_path)
+
+
 def create_highlighted_docx_from_s3(text_s3_url, transcript, threshold=0.6):
-    """Create a DOCX with highlighted text and upload to S3"""
+    """
+    Create a DOCX with highlighted text and upload to S3 (Cross-Platform Version).
+    """
     s3_key = get_s3_key_from_url(text_s3_url)
-    temp_input = download_file_from_s3(s3_key)
+    temp_input_path = download_file_from_s3(s3_key)
+    docx_in_path = None
+    output_path = None
     
     try:
         norm_trans = [normalize_line(ln) for ln in transcript.splitlines() if ln.strip()]
         
-        ext = s3_key.rsplit('.', 1)[1].lower()
+        ext = s3_key.rsplit('.', 1)[-1].lower()
         
-        # Convert to DOCX if needed
+        # --- Convert to DOCX if needed (all cross-platform) ---
         if ext == 'docx':
-            docx_in = temp_input
+            docx_in_path = temp_input_path
         elif ext == 'pdf':
-            docx_in = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
-            Converter(temp_input).convert(docx_in, start=0, end=None)
+            docx_in_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
+            # Use pdf2docx Converter
+            cv = Converter(temp_input_path)
+            cv.convert(docx_in_path, start=0, end=None)
+            cv.close()
         else:  # txt
-            docx_in = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
-            d = DocxDocument()
-            with open(temp_input, 'r', encoding='utf-8', errors='ignore') as f:
+            docx_in_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
+            d = docx.Document()
+            with open(temp_input_path, 'r', encoding='utf-8', errors='ignore') as f:
                 for line in f:
                     if line.strip():
                         d.add_paragraph(line.strip())
-            d.save(docx_in)
+            d.save(docx_in_path)
         
-        # Create output file
+        # Create a path for the final highlighted output file
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
         
-        # Use Word COM to highlight text
-        pythoncom.CoInitialize()
-        try:
-            word = win32com.client.Dispatch('Word.Application')
-            word.Visible = False
-            word.DisplayAlerts = False
-            
-            wdoc = word.Documents.Open(os.path.abspath(docx_in))
-            
-            RED = 255
-            GREEN = 65280
-            
-            # Highlight paragraphs
-            for para in wdoc.Paragraphs:
-                txt = para.Range.Text.strip()
-                if not txt:
-                    continue
-                norm = normalize_line(txt)
-                best = max((fuzz.token_set_ratio(norm, t) for t in norm_trans), default=0) / 100.0
-                para.Range.Font.Color = GREEN if best >= threshold else RED
-            
-            # Highlight shapes/text boxes
-            for shp in wdoc.Shapes:
-                if shp.TextFrame.HasText:
-                    for p2 in shp.TextFrame.TextRange.Paragraphs:
-                        txt = p2.Range.Text.strip()
-                        if not txt:
-                            continue
-                        norm = normalize_line(txt)
-                        best = max((fuzz.token_set_ratio(norm, t) for t in norm_trans), default=0) / 100.0
-                        p2.Range.Font.Color = GREEN if best >= threshold else RED
-            
-            wdoc.SaveAs(os.path.abspath(output_path), FileFormat=12)
-            wdoc.Close(False)
-            word.Quit()
-            
-        finally:
-            pythoncom.CoUninitialize()
+        # --- HIGHLIGHTING LOGIC (NOW CROSS-PLATFORM) ---
+        # Replace the entire win32com block with a call to our new function.
+        highlight_docx_cross_platform(
+            docx_path=docx_in_path,
+            norm_trans=norm_trans,
+            output_path=output_path,
+            threshold=threshold
+        )
         
-        # Upload to S3
-        import uuid
-        output_s3_key = f"processed/{uuid.uuid4()}_{os.path.basename(output_path)}"
+        # # --- Upload to S3 (Unchanged) ---
+        # output_s3_key = f"processed/{uuid.uuid4()}_{os.path.basename(s3_key).rsplit('.', 1)[0]}.docx"
+        # output_s3_url = upload_file_to_s3(output_path, output_s3_key)
+        
+        # return output_s3_url
+        # --- Upload to S3 (CORRECTED SECTION) ---
+        output_s3_key = f"processed/{uuid.uuid4()}_{os.path.basename(s3_key).rsplit('.', 1)[0]}.docx"
+        
+        # Open the generated file in binary read mode ('rb') and pass the file object
         with open(output_path, 'rb') as f:
             output_s3_url = upload_file_to_s3(f, output_s3_key)
         
-        # Clean up temporary files
-        os.unlink(temp_input)
-        if docx_in != temp_input:
-            os.unlink(docx_in)
-        os.unlink(output_path)
-        
         return output_s3_url
         
-    except Exception as e:
-        # Clean up on error
-        os.unlink(temp_input)
-        if 'docx_in' in locals() and docx_in != temp_input:
-            os.unlink(docx_in)
-        if 'output_path' in locals():
+    finally:
+        # --- Clean up all temporary files ---
+        if temp_input_path and os.path.exists(temp_input_path):
+            os.unlink(temp_input_path)
+        if docx_in_path and docx_in_path != temp_input_path and os.path.exists(docx_in_path):
+            os.unlink(docx_in_path)
+        if output_path and os.path.exists(output_path):
             os.unlink(output_path)
-        raise e
 
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
     import requests, tempfile, os, subprocess

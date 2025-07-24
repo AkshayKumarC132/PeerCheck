@@ -12,7 +12,7 @@ from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 import traceback
-from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile
+from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, AuditLog
 from .new_utils import (
     extract_text_from_s3, transcribe_audio_from_s3, diarization_from_audio,  # <-- add diarization_from_audio
     find_missing, create_highlighted_docx_from_s3, upload_file_to_s3,
@@ -209,6 +209,9 @@ class UploadAndProcessView(CreateAPIView):
             )
             
             processing_time = time.time() - start_time
+
+            audio_obj.processing_session = session.id
+            audio_obj.save()
             
             # Prepare response data - include diarization
             response_data = {
@@ -225,10 +228,7 @@ class UploadAndProcessView(CreateAPIView):
                 'diarization': diarization_segments if diarization_segments else None,
                 'diarization_error': diarization_error
             }
-            
-            # Debug: Print response data to see what's being returned
-            # print(f"Response data being returned: {response_data}")
-            
+
             # Don't validate response data with serializer, just return it directly
             return Response(response_data, status=status.HTTP_200_OK)
             
@@ -348,6 +348,22 @@ class DownloadProcessedDocumentView(GenericAPIView):
             # Save the S3 link to AudioFile.report_path
             audio_file.report_path = processed_s3_url
             audio_file.save()
+
+            # AuditLog.objects.create(
+            #     action='Download Report',
+            #     user=user_data['user'],
+            #     # user = user_data['user'],
+            #     # session_id=session_id,
+            #     object_id=session.id,
+            #     object_type='AudioFile',
+            #     details={
+            #         "session_id": session.id
+            #             # 'file_name': audio_file.name,
+            #             # 'file_size': audio_file.size,
+            #             # 'speaker_stats': speaker_stats,
+            #             # 'processing_method': 'enhanced_diarization'
+            #         }
+            # )
             
             # Option 1: Return S3 URL (Current implementation)
             return Response({
@@ -642,6 +658,17 @@ class UploadReferenceDocumentView(CreateAPIView):
             reference_doc.extracted_text = text_content
             reference_doc.upload_status = 'processed'
             reference_doc.save()
+            # AuditLog.objects.create(
+            #     action='Upload Document',
+            #     user=auth_result['user'],
+            #     # object_id=str(reference_doc.id).replace('-',''),
+            #     object_type='DocumentFile',
+            #     details={
+            #         "document_id":str(reference_doc.id).replace('-',''),
+            #         "name":reference_doc.name,
+            #         "size":reference_doc.file_size
+            #         }
+            # )
             return Response({"message":"Docuemnt Upload Success"}, status=status.HTTP_200_OK)    
 
         except Exception as e:

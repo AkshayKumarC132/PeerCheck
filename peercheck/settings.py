@@ -125,11 +125,11 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'new_peercheck.sqlite3',
+        'NAME': BASE_DIR / 'new_peercheck1.sqlite3',
     },
-    'default1y': {
+    'development': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'Peer Check',
+        'NAME': 'peercheck_dev',
         'USER': 'postgres',
         'PASSWORD': 'QP3HeJel62BPzPaq07uETezy',
         'HOST': 'e-commerce.cj3oddyv0bsk.us-west-1.rds.amazonaws.com',
@@ -196,21 +196,25 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = True  # Enable all origins for development
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
+    "http://localhost:4222",
     "http://localhost:4400",
     "http://127.0.0.1:8000",
     'https://api.hask.app',
     'https://peercheck.hask.app',
     'http://192.168.56.1:8000',
-    'http://172.16.16.126:8000'
+    'http://172.16.16.126:8000',
+    'http://172.16.16.126:5000'
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:4200',
+    "http://localhost:4222",
     "http://localhost:4400",
-    'http://13.52.99.241:80'
+    'http://13.52.99.241:80',
     'https://api.hask.app',
     'https://peercheck.hask.app',
     'http://192.168.56.1:8000',
-    'http://172.16.16.126:8000'
+    'http://172.16.16.126:8000',
+    'http://172.16.16.126:5000'
 ]
 CORS_ALLOW_METHODS = ['DELETE', 'OPTIONS', 'PATCH', 'GET', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [

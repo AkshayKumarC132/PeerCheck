@@ -110,7 +110,7 @@ class ProcessingResultSerializer(serializers.Serializer):
     processing_time = serializers.FloatField(read_only=True, required=False)
 
 class DownloadRequestSerializer(serializers.Serializer):
-    session_id = serializers.UUIDField(
+    session_id = serializers.CharField(
         help_text="Processing session ID received from upload response"
     )
 

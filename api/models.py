@@ -86,6 +86,7 @@ class AudioFile(models.Model):
     report_path = models.CharField(max_length=255, null=True, blank=True)
     diarization = models.JSONField(null=True, blank=True)
     coverage = models.FloatField(null=True, blank=True)
+    processing_session = models.CharField(max_length=100, default = '')
     reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_comparisons')
     created_at = models.DateTimeField(auto_now_add=True)  # Fixed: was auto_now=True
     updated_at = models.DateTimeField(auto_now=True)
@@ -195,14 +196,14 @@ class AuditLog(models.Model):
         ('feedbackreview_delete', 'FeedbackReview Delete'), 
         ('userprofile_update', 'UserProfile Update'),
         ('userprofile_delete', 'UserProfile Delete'),
-        ('session_status_update', 'Session Status Update'),
-        ('session_update', 'Session Update'), 
-        ('session_delete', 'Session Delete'), 
+        # ('session_status_update', 'Session Status Update'),
+        # ('session_update', 'Session Update'), 
+        # ('session_delete', 'Session Delete'), 
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
     timestamp = models.DateTimeField(auto_now_add=True)
-    session = models.ForeignKey(Session, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
+    # session = models.ForeignKey(Session, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
     object_id = models.IntegerField()
     object_type = models.CharField(max_length=50)  # e.g., AudioFile, SOP, FeedbackReview
     details = models.JSONField(default=dict)  # Additional context
