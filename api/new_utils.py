@@ -15,10 +15,12 @@ from difflib import SequenceMatcher
 from fuzzywuzzy import fuzz
 from io import BytesIO
 from docx.shared import RGBColor
+from docx.oxml.ns import qn
+import docx.oxml
 import uuid
 
 # Load Whisper model once
-model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'base.en'))
+model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
 
 # Initialize S3 client
 s3_client = boto3.client(

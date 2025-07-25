@@ -232,9 +232,18 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
 DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
 
 # Audio processing settings
-WHISPER_MODEL = "base.en"
+WHISPER_MODEL = "small.en"
 ALLOWED_TEXT_EXTENSIONS = {'pdf', 'docx', 'txt'}
 ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'mpeg', 'mp4'}
 
 # Hugging Face Token
 HF_TOKEN =''
+
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_BEAT_SCHEDULE = {
+    'process-missing-diarizations-every-15-mins': {
+        'task': 'api.tasks.process_missing_diarizations',
+        'schedule': 900,  # 900 seconds = 15 minutes
+    },
+}

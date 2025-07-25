@@ -18,7 +18,7 @@ class UploadAndProcessSerializer(serializers.Serializer):
     )
     
     # --- NEW: Field for existing document ID ---
-    existing_document_id = serializers.CharField(
+    existing_document_id = serializers.UUIDField(
         help_text="ID of an existing reference document to use. Required if 'text_file' is not provided.",
         required=False
     )

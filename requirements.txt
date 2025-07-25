@@ -62,3 +62,7 @@ drf-spectacular
 drf-yasg
 speechbrain
 scikit-learn
+
+# Background Task 
+celery
+redis

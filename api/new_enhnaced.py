@@ -57,7 +57,7 @@ class UploadAndProcessView(CreateAPIView):
             }
             error_serializer = ErrorResponseSerializer(data=error_data)
             error_serializer.is_valid()
-            return Response(error_serializer.data, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(error_data, status=status.HTTP_401_UNAUTHORIZED)
         
         user = auth_result['user']
         
@@ -71,7 +71,7 @@ class UploadAndProcessView(CreateAPIView):
             }
             error_serializer = ErrorResponseSerializer(data=error_data)
             error_serializer.is_valid()
-            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+            return Response(error_data, status=status.HTTP_400_BAD_REQUEST)
         
         start_time = time.time()
         reference_doc = None
@@ -294,11 +294,11 @@ class DownloadProcessedDocumentView(GenericAPIView):
             print(f"Session found: {session.id}")
             
             # Verify user has access
-            if session.audio_file.user != user:
-                return Response({
-                    'error': 'Access denied - You can only access your own sessions',
-                    'timestamp': timezone.now().isoformat()
-                }, status=status.HTTP_403_FORBIDDEN)
+            # if (session.audio_file.user != user or session.audio_file.user.role != 'reviewer'):
+            #     return Response({
+            #         'error': 'Access denied - You can only access your own sessions',
+            #         'timestamp': timezone.now().isoformat()
+            #     }, status=status.HTTP_403_FORBIDDEN)
             
             reference_doc = session.reference_document
             audio_file = session.audio_file
@@ -493,9 +493,7 @@ class CleanupExpiredSessionsView(CreateAPIView):
                 'error': 'Permission denied - Admin access required',
                 'timestamp': timezone.now()
             }
-            error_serializer = ErrorResponseSerializer(data=error_data)
-            error_serializer.is_valid()
-            return Response(error_serializer.data, status=status.HTTP_403_FORBIDDEN)
+            return Response(error_data, status=status.HTTP_403_FORBIDDEN)
         
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -584,9 +582,7 @@ class GetProcessingSessionView(GenericAPIView):
                 'error': 'Processing session not found',
                 'timestamp': timezone.now()
             }
-            error_serializer = ErrorResponseSerializer(data=error_data)
-            error_serializer.is_valid()
-            return Response(error_serializer.data, status=status.HTTP_404_NOT_FOUND)
+            return Response(error_data, status=status.HTTP_404_NOT_FOUND)
 
 class UploadReferenceDocumentView(CreateAPIView):
     """
@@ -611,9 +607,7 @@ class UploadReferenceDocumentView(CreateAPIView):
                 'error': auth_result['error'],
                 'timestamp': timezone.now()
             }
-            error_serializer = ErrorResponseSerializer(data=error_data)
-            error_serializer.is_valid()
-            return Response(error_serializer.data, status=status.HTTP_401_UNAUTHORIZED)
+            return Response(error_data, status=status.HTTP_401_UNAUTHORIZED)
         
         user = auth_result['user']
         
@@ -625,9 +619,7 @@ class UploadReferenceDocumentView(CreateAPIView):
                 'details': serializer.errors,
                 'timestamp': timezone.now()
             }
-            error_serializer = ErrorResponseSerializer(data=error_data)
-            error_serializer.is_valid()
-            return Response(error_serializer.data, status=status.HTTP_400_BAD_REQUEST)
+            return Response(error_data, status=status.HTTP_400_BAD_REQUEST)
         
         try:
             # Get validated data
