@@ -289,7 +289,7 @@ class DownloadProcessedDocumentView(GenericAPIView):
             # Get processing session
             session = ProcessingSession.objects.get(
                 id=session_id,
-                expires_at__gt=timezone.now()
+                # expires_at__gt=timezone.now()
             )
             print(f"Session found: {session.id}")
             
@@ -321,9 +321,6 @@ class DownloadProcessedDocumentView(GenericAPIView):
                             'error': 'No transcript available for processing',
                             'timestamp': timezone.now().isoformat()
                         }, status=status.HTTP_400_BAD_REQUEST)
-                    
-                    print(f"Transcript length: {len(transcript)} characters")
-                    print(f"Reference doc path: {reference_doc.file_path}")
                     
                     # Create highlighted document
                     processed_s3_url = create_highlighted_docx_from_s3(

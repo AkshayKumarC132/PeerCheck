@@ -233,76 +233,74 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
             color_element = docx.oxml.OxmlElement('w:color')
             run_properties.append(color_element)
             
-        color_element.set(docx.oxml.ns.qn('w:val'), color.hex_str)
+        color_element.set(docx.oxml.ns.qn('w:val'), str(color))
 
     document.save(output_path)
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, threshold=0.6):
+def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
     """
-    Create a DOCX with highlighted text and upload to S3 (Cross-Platform Version).
+    Generates a highlighted DOCX report from a reference document (PDF or DOCX)
+    and a transcript, then uploads it to S3.
     """
-    s3_key = get_s3_key_from_url(text_s3_url)
-    temp_input_path = download_file_from_s3(s3_key)
+    # Use dummy S3 functions for local paths if not using actual S3
+    # Detect if the input is an S3 URL (either s3:// or https://...amazonaws.com/)
+    is_s3_url = text_s3_url.startswith("s3://") or (
+        text_s3_url.startswith("https://") and ".amazonaws.com/" in text_s3_url
+    )
+    s3_key = get_s3_key_from_url(text_s3_url) if is_s3_url else text_s3_url
+    
+    # Always download if it's an S3 URL (s3:// or https://...amazonaws.com/)
+    temp_input_path = download_file_from_s3(s3_key) if is_s3_url else s3_key
+    
     docx_in_path = None
     output_path = None
     
     try:
         norm_trans = [normalize_line(ln) for ln in transcript.splitlines() if ln.strip()]
-        
         ext = s3_key.rsplit('.', 1)[-1].lower()
         
-        # --- Convert to DOCX if needed (all cross-platform) ---
+        # --- CONVERT INPUT FILE TO DOCX IF NECESSARY ---
         if ext == 'docx':
+            print("Input is a DOCX file. No conversion needed.")
             docx_in_path = temp_input_path
         elif ext == 'pdf':
+            print("Input is a PDF file. Converting to DOCX...")
             docx_in_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
-            # Use pdf2docx Converter
             cv = Converter(temp_input_path)
             cv.convert(docx_in_path, start=0, end=None)
             cv.close()
-        else:  # txt
-            docx_in_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
-            d = docx.Document()
-            with open(temp_input_path, 'r', encoding='utf-8', errors='ignore') as f:
-                for line in f:
-                    if line.strip():
-                        d.add_paragraph(line.strip())
-            d.save(docx_in_path)
-        
-        # Create a path for the final highlighted output file
+            print(f"Conversion complete. Temporary DOCX at: {docx_in_path}")
+        else:
+            raise ValueError(f"Unsupported file type for reference document: '{ext}'")
+
+        # --- HIGHLIGHT THE DOCX AND CREATE THE FINAL REPORT ---
         output_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
         
-        # --- HIGHLIGHTING LOGIC (NOW CROSS-PLATFORM) ---
-        # Replace the entire win32com block with a call to our new function.
-        highlight_docx_cross_platform(
+        highlight_docx_three_color(
             docx_path=docx_in_path,
             norm_trans=norm_trans,
             output_path=output_path,
-            threshold=threshold
+            high_threshold=high_threshold,
+            low_threshold=low_threshold
         )
         
-        # # --- Upload to S3 (Unchanged) ---
-        # output_s3_key = f"processed/{uuid.uuid4()}_{os.path.basename(s3_key).rsplit('.', 1)[0]}.docx"
-        # output_s3_url = upload_file_to_s3(output_path, output_s3_key)
+        # --- UPLOAD THE FINAL REPORT TO S3 ---
+        output_filename = os.path.basename(s3_key).rsplit('.', 1)[0]
+        output_s3_key = f"processed/{uuid.uuid4()}_{output_filename}.docx"
         
-        # return output_s3_url
-        # --- Upload to S3 (CORRECTED SECTION) ---
-        output_s3_key = f"processed/{uuid.uuid4()}_{os.path.basename(s3_key).rsplit('.', 1)[0]}.docx"
-        
-        # Open the generated file in binary read mode ('rb') and pass the file object
         with open(output_path, 'rb') as f:
-            output_s3_url = upload_file_to_s3(f, output_s3_key)
+            output_s3_url = upload_file_to_s3(f, output_s3_key) if is_s3_url else output_path
         
         return output_s3_url
         
     finally:
         # --- Clean up all temporary files ---
-        if temp_input_path and os.path.exists(temp_input_path):
+        if is_s3_url and temp_input_path and os.path.exists(temp_input_path):
             os.unlink(temp_input_path)
         if docx_in_path and docx_in_path != temp_input_path and os.path.exists(docx_in_path):
             os.unlink(docx_in_path)
-        if output_path and os.path.exists(output_path):
+        if output_path and os.path.exists(output_path) and is_s3_url: # Keep local file if not using S3
             os.unlink(output_path)
 
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
@@ -478,3 +476,55 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
     os.unlink(wav_path)
     
     return diarization_segments
+
+
+# --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---
+
+def _apply_color_to_paragraph_runs(p_element, color_hex_str):
+    """Applies a color to all text runs within a paragraph's XML element."""
+    for r_element in p_element.xpath('.//w:r'):
+        rPr = r_element.find(qn('w:rPr'))
+        if rPr is None:
+            rPr = docx.oxml.OxmlElement('w:rPr')
+            r_element.insert(0, rPr)
+        
+        color_element = docx.oxml.OxmlElement('w:color')
+        color_element.set(qn('w:val'), color_hex_str)
+        rPr.append(color_element)
+
+def _process_element_three_color(element, norm_trans, thresholds, colors):
+    """Finds all paragraphs in an XML element and applies color based on the two-threshold system."""
+    if element is None:
+        return
+        
+    for p_element in element.xpath('.//w:p'):
+        full_text = "".join(p_element.xpath('.//w:t/text()')).strip()
+        if not full_text:
+            continue
+            
+        norm_para_text = normalize_line(full_text)
+        best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
+        
+        color_to_apply = None
+        if best_score >= thresholds['high']:
+            color_to_apply = colors['GREEN']
+        elif best_score >= thresholds['low']:
+            color_to_apply = colors['RED']
+        
+        if color_to_apply:
+            _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+
+def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
+    """Highlights text in a DOCX using the Green/Red/Black system."""
+    document = docx.Document(docx_path)
+    colors = {"GREEN": RGBColor(0, 176, 80), "RED": RGBColor(255, 0, 0)}
+    thresholds = {'high': high_threshold, 'low': low_threshold}
+
+    # Process main body, headers, and footers for complete coverage
+    _process_element_three_color(document.element.body, norm_trans, thresholds, colors)
+    for section in document.sections:
+        for part in [section.header, section.footer, section.first_page_header, 
+                     section.first_page_footer, section.even_page_header, section.even_page_footer]:
+            _process_element_three_color(part._element, norm_trans, thresholds, colors)
+
+    document.save(output_path)
