@@ -20,9 +20,10 @@ from peercheck import settings
 from pdf2docx import Converter
 
 try:
-    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import SentenceTransformer, CrossEncoder
 except Exception:  # pragma: no cover - optional dependency
     SentenceTransformer = None
+    CrossEncoder = None
 
 try:
     import spacy
@@ -52,6 +53,14 @@ elif spacy is not None:
         _embedding_model = spacy.load('en_core_web_sm')
     except Exception:
         _embedding_model = None
+
+# Optional cross-encoder for pairwise similarity
+_cross_encoder = None
+if CrossEncoder is not None:
+    try:
+        _cross_encoder = CrossEncoder('cross-encoder/stsb-roberta-base')
+    except Exception:
+        _cross_encoder = None
 
 # Separate lightweight spaCy model for lemmatization
 _nlp = None
@@ -173,15 +182,16 @@ def lemmatize_text(text: str) -> str:
 _embed_cache = {}
 
 # Default weighting for similarity metrics used when matching transcript
-# segments to document paragraphs. Embedding similarity typically provides
-# the strongest signal, followed by phrase and n-gram overlap. Sequence and
-# fuzzy matching are fallback signals for noisy text.
+# segments to document paragraphs. If available, the cross‑encoder provides a
+# strong semantic signal, followed by embeddings, phrase and n‑gram overlap.
+# Sequence and fuzzy matching are fallback signals for noisy text.
 _DEFAULT_SIM_WEIGHTS = {
-    'embed': 0.45,
-    'phrase': 0.25,
+    'ce': 0.20,
+    'embed': 0.35,
+    'phrase': 0.20,
     'ngram': 0.15,
-    'seq': 0.10,
-    'fuzz': 0.05,
+    'seq': 0.07,
+    'fuzz': 0.03,
 }
 
 def _embed(text: str):
@@ -212,6 +222,25 @@ def _embedding_similarity(a: str, b: str) -> float:
     if va is None or vb is None:
         return 0.0
     return float(np.dot(va, vb))
+
+
+_ce_cache = {}
+
+def _crossencoder_similarity(a: str, b: str) -> float:
+    """Return semantic similarity from a cross-encoder model if available."""
+    if _cross_encoder is None:
+        return 0.0
+    key = (a, b)
+    if key in _ce_cache:
+        return _ce_cache[key]
+    try:
+        score = float(_cross_encoder.predict([(a, b)])[0])
+        if score > 5.0:
+            score /= 5.0
+    except Exception:
+        score = 0.0
+    _ce_cache[key] = score
+    return score
 
 
 def _jaccard_similarity(a: str, b: str) -> float:
@@ -367,10 +396,11 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.70
     """Generate a highlighted DOCX report from a reference document and transcript.
 
     The transcript can be either a plain string or a Whisper result dictionary.
-    Multi-word phrase and n-gram comparisons are used to reduce spurious
-    matches. Text is highlighted in GREEN for strong matches, RED for partial
-    matches and BLACK for no match. Timestamp annotations are currently ignored
-    in the output but retained internally for future use.
+    Multi-word phrase and n-gram comparisons, semantic embeddings and an
+    optional cross-encoder model are used to reduce spurious matches. Text is
+    highlighted in GREEN for strong matches, RED for partial matches and BLACK
+    for no match. Timestamp annotations are currently ignored in the output but
+    retained internally for future use.
     """
     # Use dummy S3 functions for local paths if not using actual S3
     # Detect if the input is an S3 URL (either s3:// or https://...amazonaws.com/)
@@ -665,12 +695,14 @@ def _find_best_segment(norm_para_text, segments, weights=None):
         score_seq = SequenceMatcher(None, norm_para_text, seg['norm_text']).ratio()
         score_phrase = _phrase_similarity(norm_para_text, seg['norm_text'])
         score_ngram = _ngram_jaccard(norm_para_text, seg['norm_text'])
+        score_ce = _crossencoder_similarity(norm_para_text, seg['norm_text'])
         if para_vec is not None and seg.get('embedding') is not None:
             score_embed = float(np.dot(para_vec, seg['embedding']))
         else:
             score_embed = _embedding_similarity(norm_para_text, seg['norm_text'])
         score = (
-            weights['fuzz'] * score_fuzz
+            weights.get('ce', 0.0) * score_ce
+            + weights['fuzz'] * score_fuzz
             + weights['seq'] * score_seq
             + weights['phrase'] * score_phrase
             + weights['ngram'] * score_ngram
@@ -727,9 +759,10 @@ def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=
 
     Notes
     -----
-    Multi-word phrase comparison, n-gram overlap and semantic embeddings are
-    used together to minimise false positives. Timestamp annotations remain
-    disabled but the structure is ready for later inclusion.
+    Multi-word phrase comparison, n-gram overlap, semantic embeddings and an
+    optional cross-encoder model are used together to minimise false positives
+    and capture deeper semantic matches. Timestamp annotations remain disabled
+    but the structure is ready for later inclusion.
     """
     document = docx.Document(docx_path)
     colors = {
