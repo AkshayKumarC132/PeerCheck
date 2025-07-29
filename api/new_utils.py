@@ -715,17 +715,36 @@ def _find_best_segment(norm_para_text, segments, weights=None):
 
 
 def _process_element_three_color(element, segments, thresholds, colors, weights=None):
-    """Find all paragraphs and apply color and timestamps based on transcript matching."""
+    """Find all paragraphs and apply color and timestamps based on transcript matching.
+
+    Parameters
+    ----------
+    element : docx.oxml.CT_P
+        The XML element to process.
+    segments : list
+        Transcript segments with pre-computed normalised text.
+    thresholds : dict
+        ``high`` and ``low`` similarity thresholds.
+    colors : dict
+        Mapping of color names to ``RGBColor`` objects.
+    weights : dict, optional
+        Weighting scheme for the similarity metrics.
+    """
     if element is None:
         return
 
+    seg_idx = 0
     for p_element in element.xpath('.//w:p'):
         full_text = "".join(p_element.xpath('.//w:t/text()')).strip()
         if not full_text:
             continue
 
         norm_para_text = lemmatize_text(full_text)
-        best_score, best_seg = _find_best_segment(norm_para_text, segments, weights)
+        # Search transcript segments in order to reduce repeated matches
+        search_space = segments[seg_idx:]
+        best_score, best_seg = _find_best_segment(norm_para_text, search_space, weights)
+        if best_seg:
+            seg_idx += search_space.index(best_seg)
 
         if best_score >= thresholds['high']:
             color_to_apply = colors['GREEN']
