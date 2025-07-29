@@ -53,6 +53,18 @@ elif spacy is not None:
     except Exception:
         _embedding_model = None
 
+# Separate lightweight spaCy model for lemmatization
+_nlp = None
+if spacy is not None:
+    try:
+        _nlp = spacy.load('en_core_web_sm', disable=['ner'])
+    except Exception:
+        _nlp = None
+
+# Reuse embedding model for lemmatization when possible
+if _nlp is None and hasattr(_embedding_model, 'pipe'):
+    _nlp = _embedding_model
+
 def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
 
@@ -143,6 +155,19 @@ def normalize_line(s: str) -> str:
     s = re.sub(r"[\[\]\(\)\{\}\<\>]", "", s)
     s = s.translate(str.maketrans('', '', string.punctuation))
     return ' '.join(s.split())
+
+
+def lemmatize_text(text: str) -> str:
+    """Return a lemmatized version of the provided text."""
+    norm = normalize_line(text)
+    if _nlp is None:
+        return norm
+    try:
+        doc = _nlp(norm)
+        tokens = [tok.lemma_ for tok in doc if tok.is_alpha]
+        return ' '.join(tokens)
+    except Exception:
+        return norm
 
 
 _embed_cache = {}
@@ -293,13 +318,13 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
     document.save(output_path)
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.85, low_threshold=0.5):
+def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.75, low_threshold=0.45):
     """Generate a highlighted DOCX report from a reference document and transcript.
 
     The transcript can be either a plain string or a Whisper result dictionary.
     Text is highlighted in GREEN for strong matches, RED for partial matches and
-    BLACK for no match. Matched segments also receive timestamp annotations in
-    BLUE.
+    BLACK for no match. Timestamp annotations are currently ignored in the
+    output but retained internally for future use.
     """
     # Use dummy S3 functions for local paths if not using actual S3
     # Detect if the input is an S3 URL (either s3:// or https://...amazonaws.com/)
@@ -321,7 +346,7 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.85
                     'text': seg.get('text', ''),
                     'start': seg.get('start', 0.0),
                     'end': seg.get('end', 0.0),
-                    'norm_text': normalize_line(seg.get('text', '')),
+                    'norm_text': lemmatize_text(seg.get('text', '')),
                 }
                 for seg in transcript.get('segments', [])
                 if seg.get('text')
@@ -332,7 +357,7 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.85
                     'text': ln,
                     'start': 0.0,
                     'end': 0.0,
-                    'norm_text': normalize_line(ln),
+                    'norm_text': lemmatize_text(ln),
                 }
                 for ln in transcript.splitlines() if ln.strip()
             ]
@@ -585,7 +610,7 @@ def _find_best_segment(norm_para_text, segments):
             score_embed = float(np.dot(para_vec, seg['embedding']))
         else:
             score_embed = _embedding_similarity(norm_para_text, seg['norm_text'])
-        score = max(score_fuzz, score_seq, score_embed)
+        score = (score_fuzz + score_seq + score_embed) / 3.0
         if score > best_score:
             best_score = score
             best_seg = seg
@@ -602,7 +627,7 @@ def _process_element_three_color(element, segments, thresholds, colors):
         if not full_text:
             continue
 
-        norm_para_text = normalize_line(full_text)
+        norm_para_text = lemmatize_text(full_text)
         best_score, best_seg = _find_best_segment(norm_para_text, segments)
 
         if best_score >= thresholds['high']:
@@ -614,21 +639,14 @@ def _process_element_three_color(element, segments, thresholds, colors):
 
         _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
 
-        if best_seg and best_score >= thresholds['low']:
-            ts_text = f" [{best_seg['start']:.2f}-{best_seg['end']:.2f}]"
-            r_element = docx.oxml.OxmlElement('w:r')
-            t_element = docx.oxml.OxmlElement('w:t')
-            t_element.text = ts_text
-            rPr = docx.oxml.OxmlElement('w:rPr')
-            color_el = docx.oxml.OxmlElement('w:color')
-            color_el.set(qn('w:val'), str(colors['BLUE']))
-            rPr.append(color_el)
-            r_element.append(rPr)
-            r_element.append(t_element)
-            p_element.append(r_element)
+        # Timestamp annotations can be added here in the future
 
-def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=0.85, low_threshold=0.5):
-    """Highlight a DOCX using transcript segments with timestamps."""
+def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=0.75, low_threshold=0.45):
+    """Highlight a DOCX document using transcript segments.
+
+    Timestamps are not currently written to the document but the infrastructure
+    remains for future use.
+    """
     document = docx.Document(docx_path)
     colors = {
         "GREEN": RGBColor(0, 176, 80),
