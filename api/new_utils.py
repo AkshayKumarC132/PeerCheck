@@ -2,22 +2,32 @@ import os
 import re
 import string
 import tempfile
-# import pythoncom
+import uuid
+from io import BytesIO
+
 import boto3
-from peercheck import settings
-# from docx import Document as DocxDocument
-from pdf2docx import Converter
-# import win32com.client
-import whisper
-import PyPDF2
 import docx
+import PyPDF2
+import whisper
 from difflib import SequenceMatcher
 from fuzzywuzzy import fuzz
-from io import BytesIO
 from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
-import uuid
+import numpy as np
+
+from peercheck import settings
+from pdf2docx import Converter
+
+try:
+    from sentence_transformers import SentenceTransformer
+except Exception:  # pragma: no cover - optional dependency
+    SentenceTransformer = None
+
+try:
+    import spacy
+except Exception:  # pragma: no cover - optional dependency
+    spacy = None
 
 # Load Whisper model once
 model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
@@ -29,6 +39,19 @@ s3_client = boto3.client(
     aws_secret_access_key=settings.AWS_S3_SECRET_ACCESS_KEY,
     region_name=settings.AWS_S3_REGION_NAME
 )
+
+# --- Optional semantic embedding model ---
+_embedding_model = None
+if SentenceTransformer is not None:
+    try:
+        _embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    except Exception:
+        _embedding_model = None
+elif spacy is not None:
+    try:
+        _embedding_model = spacy.load('en_core_web_sm')
+    except Exception:
+        _embedding_model = None
 
 def allowed_file(filename, allowed_extensions):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in allowed_extensions
@@ -120,6 +143,38 @@ def normalize_line(s: str) -> str:
     s = re.sub(r"[\[\]\(\)\{\}\<\>]", "", s)
     s = s.translate(str.maketrans('', '', string.punctuation))
     return ' '.join(s.split())
+
+
+_embed_cache = {}
+
+def _embed(text: str):
+    """Return a normalized embedding vector for the given text or None."""
+    if _embedding_model is None or not text:
+        return None
+    if text in _embed_cache:
+        return _embed_cache[text]
+    try:
+        if hasattr(_embedding_model, 'encode'):
+            vec = _embedding_model.encode(text, convert_to_numpy=True, normalize_embeddings=True)
+        else:
+            doc = _embedding_model(text)
+            if not doc.has_vector:
+                return None
+            v = doc.vector
+            vec = v / (np.linalg.norm(v) + 1e-8)
+        _embed_cache[text] = vec
+        return vec
+    except Exception:
+        return None
+
+
+def _embedding_similarity(a: str, b: str) -> float:
+    """Cosine similarity between embeddings of ``a`` and ``b``."""
+    va = _embed(a)
+    vb = _embed(b)
+    if va is None or vb is None:
+        return 0.0
+    return float(np.dot(va, vb))
 
 def find_missing(text, transcript, threshold=0.6):
     """
@@ -281,6 +336,10 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.85
                 }
                 for ln in transcript.splitlines() if ln.strip()
             ]
+
+        # Pre-compute embeddings for segments if model available
+        for seg in segments:
+            seg['embedding'] = _embed(seg['norm_text'])
         ext = s3_key.rsplit('.', 1)[-1].lower()
         
         # --- CONVERT INPUT FILE TO DOCX IF NECESSARY ---
@@ -518,10 +577,15 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
 def _find_best_segment(norm_para_text, segments):
     """Return the best matching transcript segment for a given paragraph."""
     best_score, best_seg = 0.0, None
+    para_vec = _embed(norm_para_text)
     for seg in segments:
         score_fuzz = fuzz.token_set_ratio(norm_para_text, seg['norm_text']) / 100.0
         score_seq = SequenceMatcher(None, norm_para_text, seg['norm_text']).ratio()
-        score = max(score_fuzz, score_seq)
+        if para_vec is not None and seg.get('embedding') is not None:
+            score_embed = float(np.dot(para_vec, seg['embedding']))
+        else:
+            score_embed = _embedding_similarity(norm_para_text, seg['norm_text'])
+        score = max(score_fuzz, score_seq, score_embed)
         if score > best_score:
             best_score = score
             best_seg = seg
