@@ -173,13 +173,14 @@ def lemmatize_text(text: str) -> str:
 _embed_cache = {}
 
 # Default weighting for similarity metrics used when matching transcript
-# segments to document paragraphs. The embedding similarity typically
-# provides the strongest signal, followed by phrase-level overlap and
-# sequence matching. Fuzzy token ratio is given a smaller weight.
+# segments to document paragraphs. Embedding similarity typically provides
+# the strongest signal, followed by phrase and n-gram overlap. Sequence and
+# fuzzy matching are fallback signals for noisy text.
 _DEFAULT_SIM_WEIGHTS = {
-    'embed': 0.5,
-    'phrase': 0.3,
-    'seq': 0.15,
+    'embed': 0.45,
+    'phrase': 0.25,
+    'ngram': 0.15,
+    'seq': 0.10,
     'fuzz': 0.05,
 }
 
@@ -216,6 +217,18 @@ def _embedding_similarity(a: str, b: str) -> float:
 def _jaccard_similarity(a: str, b: str) -> float:
     """Simple Jaccard similarity between sets of words."""
     sa, sb = set(a.split()), set(b.split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
+
+
+def _ngram_jaccard(a: str, b: str, n: int = 3) -> float:
+    """Jaccard similarity over n-gram sets."""
+    def ngrams(text):
+        tokens = text.split()
+        return {" ".join(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+    sa, sb = ngrams(a), ngrams(b)
     if not sa or not sb:
         return 0.0
     return len(sa & sb) / len(sa | sb)
@@ -354,10 +367,10 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.70
     """Generate a highlighted DOCX report from a reference document and transcript.
 
     The transcript can be either a plain string or a Whisper result dictionary.
-    Multi-word phrase matching is used to reduce spurious matches. Text is
-    highlighted in GREEN for strong matches, RED for partial matches and BLACK
-    for no match. Timestamp annotations are currently ignored in the output but
-    retained internally for future use.
+    Multi-word phrase and n-gram comparisons are used to reduce spurious
+    matches. Text is highlighted in GREEN for strong matches, RED for partial
+    matches and BLACK for no match. Timestamp annotations are currently ignored
+    in the output but retained internally for future use.
     """
     # Use dummy S3 functions for local paths if not using actual S3
     # Detect if the input is an S3 URL (either s3:// or https://...amazonaws.com/)
@@ -651,6 +664,7 @@ def _find_best_segment(norm_para_text, segments, weights=None):
         score_fuzz = fuzz.token_set_ratio(norm_para_text, seg['norm_text']) / 100.0
         score_seq = SequenceMatcher(None, norm_para_text, seg['norm_text']).ratio()
         score_phrase = _phrase_similarity(norm_para_text, seg['norm_text'])
+        score_ngram = _ngram_jaccard(norm_para_text, seg['norm_text'])
         if para_vec is not None and seg.get('embedding') is not None:
             score_embed = float(np.dot(para_vec, seg['embedding']))
         else:
@@ -659,6 +673,7 @@ def _find_best_segment(norm_para_text, segments, weights=None):
             weights['fuzz'] * score_fuzz
             + weights['seq'] * score_seq
             + weights['phrase'] * score_phrase
+            + weights['ngram'] * score_ngram
             + weights['embed'] * score_embed
         )
         if score > best_score:
@@ -712,9 +727,9 @@ def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=
 
     Notes
     -----
-    Multi-word phrase comparison and semantic embeddings are used to minimise
-    false positives. Timestamp annotations remain disabled but the structure is
-    ready for later inclusion.
+    Multi-word phrase comparison, n-gram overlap and semantic embeddings are
+    used together to minimise false positives. Timestamp annotations remain
+    disabled but the structure is ready for later inclusion.
     """
     document = docx.Document(docx_path)
     colors = {
