@@ -391,7 +391,16 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.75
             high_threshold=high_threshold,
             low_threshold=low_threshold,
         )
-        
+
+        # --- Post-process to remove low-confidence highlights ---
+        fine_tune_highlighted_docx(
+            docx_path=output_path,
+            segments=segments,
+            high_threshold=high_threshold,
+            low_threshold=low_threshold,
+            margin=0.05,
+        )
+
         # --- UPLOAD THE FINAL REPORT TO S3 ---
         output_filename = os.path.basename(s3_key).rsplit('.', 1)[0]
         output_s3_key = f"processed/{uuid.uuid4()}_{output_filename}.docx"
@@ -663,3 +672,22 @@ def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=
             _process_element_three_color(part._element, segments, thresholds, colors)
 
     document.save(output_path)
+
+
+def fine_tune_highlighted_docx(docx_path, segments, high_threshold=0.75, low_threshold=0.45,
+                               margin=0.05):
+    """Refine an already highlighted DOCX by applying stricter thresholds.
+
+    This post-processing step helps remove false positives after the initial
+    highlight pass. Timestamps remain ignored in the output, but the logic is
+    ready for future inclusion.
+    """
+    refined_high = min(1.0, high_threshold + margin)
+    refined_low = min(refined_high, low_threshold + margin)
+    highlight_docx_three_color(
+        docx_path=docx_path,
+        segments=segments,
+        output_path=docx_path,
+        high_threshold=refined_high,
+        low_threshold=refined_low,
+    )
