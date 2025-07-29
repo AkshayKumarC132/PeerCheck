@@ -238,10 +238,13 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
     document.save(output_path)
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
-    """
-    Generates a highlighted DOCX report from a reference document (PDF or DOCX)
-    and a transcript, then uploads it to S3.
+def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.85, low_threshold=0.5):
+    """Generate a highlighted DOCX report from a reference document and transcript.
+
+    The transcript can be either a plain string or a Whisper result dictionary.
+    Text is highlighted in GREEN for strong matches, RED for partial matches and
+    BLACK for no match. Matched segments also receive timestamp annotations in
+    BLUE.
     """
     # Use dummy S3 functions for local paths if not using actual S3
     # Detect if the input is an S3 URL (either s3:// or https://...amazonaws.com/)
@@ -257,7 +260,27 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
     output_path = None
     
     try:
-        norm_trans = [normalize_line(ln) for ln in transcript.splitlines() if ln.strip()]
+        if isinstance(transcript, dict) and 'segments' in transcript:
+            segments = [
+                {
+                    'text': seg.get('text', ''),
+                    'start': seg.get('start', 0.0),
+                    'end': seg.get('end', 0.0),
+                    'norm_text': normalize_line(seg.get('text', '')),
+                }
+                for seg in transcript.get('segments', [])
+                if seg.get('text')
+            ]
+        else:
+            segments = [
+                {
+                    'text': ln,
+                    'start': 0.0,
+                    'end': 0.0,
+                    'norm_text': normalize_line(ln),
+                }
+                for ln in transcript.splitlines() if ln.strip()
+            ]
         ext = s3_key.rsplit('.', 1)[-1].lower()
         
         # --- CONVERT INPUT FILE TO DOCX IF NECESSARY ---
@@ -279,10 +302,10 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
         
         highlight_docx_three_color(
             docx_path=docx_in_path,
-            norm_trans=norm_trans,
+            segments=segments,
             output_path=output_path,
             high_threshold=high_threshold,
-            low_threshold=low_threshold
+            low_threshold=low_threshold,
         )
         
         # --- UPLOAD THE FINAL REPORT TO S3 ---
@@ -492,39 +515,69 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
         color_element.set(qn('w:val'), color_hex_str)
         rPr.append(color_element)
 
-def _process_element_three_color(element, norm_trans, thresholds, colors):
-    """Finds all paragraphs in an XML element and applies color based on the two-threshold system."""
+def _find_best_segment(norm_para_text, segments):
+    """Return the best matching transcript segment for a given paragraph."""
+    best_score, best_seg = 0.0, None
+    for seg in segments:
+        score_fuzz = fuzz.token_set_ratio(norm_para_text, seg['norm_text']) / 100.0
+        score_seq = SequenceMatcher(None, norm_para_text, seg['norm_text']).ratio()
+        score = max(score_fuzz, score_seq)
+        if score > best_score:
+            best_score = score
+            best_seg = seg
+    return best_score, best_seg
+
+
+def _process_element_three_color(element, segments, thresholds, colors):
+    """Find all paragraphs and apply color and timestamps based on transcript matching."""
     if element is None:
         return
-        
+
     for p_element in element.xpath('.//w:p'):
         full_text = "".join(p_element.xpath('.//w:t/text()')).strip()
         if not full_text:
             continue
-            
+
         norm_para_text = normalize_line(full_text)
-        best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
-        
-        color_to_apply = None
+        best_score, best_seg = _find_best_segment(norm_para_text, segments)
+
         if best_score >= thresholds['high']:
             color_to_apply = colors['GREEN']
         elif best_score >= thresholds['low']:
             color_to_apply = colors['RED']
-        
-        if color_to_apply:
-            _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+        else:
+            color_to_apply = colors['BLACK']
 
-def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
-    """Highlights text in a DOCX using the Green/Red/Black system."""
+        _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+
+        if best_seg and best_score >= thresholds['low']:
+            ts_text = f" [{best_seg['start']:.2f}-{best_seg['end']:.2f}]"
+            r_element = docx.oxml.OxmlElement('w:r')
+            t_element = docx.oxml.OxmlElement('w:t')
+            t_element.text = ts_text
+            rPr = docx.oxml.OxmlElement('w:rPr')
+            color_el = docx.oxml.OxmlElement('w:color')
+            color_el.set(qn('w:val'), str(colors['BLUE']))
+            rPr.append(color_el)
+            r_element.append(rPr)
+            r_element.append(t_element)
+            p_element.append(r_element)
+
+def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=0.85, low_threshold=0.5):
+    """Highlight a DOCX using transcript segments with timestamps."""
     document = docx.Document(docx_path)
-    colors = {"GREEN": RGBColor(0, 176, 80), "RED": RGBColor(255, 0, 0)}
+    colors = {
+        "GREEN": RGBColor(0, 176, 80),
+        "RED": RGBColor(255, 0, 0),
+        "BLACK": RGBColor(0, 0, 0),
+        "BLUE": RGBColor(0, 0, 255),
+    }
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
-    # Process main body, headers, and footers for complete coverage
-    _process_element_three_color(document.element.body, norm_trans, thresholds, colors)
+    _process_element_three_color(document.element.body, segments, thresholds, colors)
     for section in document.sections:
-        for part in [section.header, section.footer, section.first_page_header, 
+        for part in [section.header, section.footer, section.first_page_header,
                      section.first_page_footer, section.even_page_header, section.even_page_footer]:
-            _process_element_three_color(part._element, norm_trans, thresholds, colors)
+            _process_element_three_color(part._element, segments, thresholds, colors)
 
     document.save(output_path)

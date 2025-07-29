@@ -314,8 +314,8 @@ class DownloadProcessedDocumentView(GenericAPIView):
                 print("Creating new processed document...")
                 try:
                     # Create highlighted DOCX and upload to S3
-                    transcript = audio_file.transcription.get('text', '') if audio_file.transcription else ''
-                    
+                    transcript = audio_file.transcription or {}
+
                     if not transcript:
                         return Response({
                             'error': 'No transcript available for processing',
@@ -324,7 +324,7 @@ class DownloadProcessedDocumentView(GenericAPIView):
                     
                     # Create highlighted document
                     processed_s3_url = create_highlighted_docx_from_s3(
-                        reference_doc.file_path, 
+                        reference_doc.file_path,
                         transcript
                     )
                     
