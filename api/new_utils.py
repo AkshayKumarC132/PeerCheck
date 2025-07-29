@@ -201,6 +201,19 @@ def _embedding_similarity(a: str, b: str) -> float:
         return 0.0
     return float(np.dot(va, vb))
 
+
+def _phrase_similarity(a: str, b: str, min_len: int = 2) -> float:
+    """Return similarity based on longest common phrase of ``min_len`` words."""
+    a_tokens = a.split()
+    b_tokens = b.split()
+    if len(a_tokens) < min_len or len(b_tokens) < min_len:
+        return 0.0
+    sm = SequenceMatcher(None, a_tokens, b_tokens)
+    longest = max((m.size for m in sm.get_matching_blocks()), default=0)
+    if longest < min_len:
+        return 0.0
+    return longest / min(len(a_tokens), len(b_tokens))
+
 def find_missing(text, transcript, threshold=0.6):
     """
     Fuzzy-match each original text line against all transcript lines.
@@ -322,9 +335,10 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.75
     """Generate a highlighted DOCX report from a reference document and transcript.
 
     The transcript can be either a plain string or a Whisper result dictionary.
-    Text is highlighted in GREEN for strong matches, RED for partial matches and
-    BLACK for no match. Timestamp annotations are currently ignored in the
-    output but retained internally for future use.
+    Multi-word phrase matching is used to reduce spurious matches. Text is
+    highlighted in GREEN for strong matches, RED for partial matches and BLACK
+    for no match. Timestamp annotations are currently ignored in the output but
+    retained internally for future use.
     """
     # Use dummy S3 functions for local paths if not using actual S3
     # Detect if the input is an S3 URL (either s3:// or https://...amazonaws.com/)
@@ -615,11 +629,12 @@ def _find_best_segment(norm_para_text, segments):
     for seg in segments:
         score_fuzz = fuzz.token_set_ratio(norm_para_text, seg['norm_text']) / 100.0
         score_seq = SequenceMatcher(None, norm_para_text, seg['norm_text']).ratio()
+        score_phrase = _phrase_similarity(norm_para_text, seg['norm_text'])
         if para_vec is not None and seg.get('embedding') is not None:
             score_embed = float(np.dot(para_vec, seg['embedding']))
         else:
             score_embed = _embedding_similarity(norm_para_text, seg['norm_text'])
-        score = (score_fuzz + score_seq + score_embed) / 3.0
+        score = (score_fuzz + score_seq + score_embed + score_phrase) / 4.0
         if score > best_score:
             best_score = score
             best_seg = seg
@@ -653,6 +668,7 @@ def _process_element_three_color(element, segments, thresholds, colors):
 def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=0.75, low_threshold=0.45):
     """Highlight a DOCX document using transcript segments.
 
+    Matching uses multi-word phrase comparison to minimize false positives.
     Timestamps are not currently written to the document but the infrastructure
     remains for future use.
     """
