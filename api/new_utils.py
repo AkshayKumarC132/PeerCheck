@@ -172,6 +172,17 @@ def lemmatize_text(text: str) -> str:
 
 _embed_cache = {}
 
+# Default weighting for similarity metrics used when matching transcript
+# segments to document paragraphs. The embedding similarity typically
+# provides the strongest signal, followed by phrase-level overlap and
+# sequence matching. Fuzzy token ratio is given a smaller weight.
+_DEFAULT_SIM_WEIGHTS = {
+    'embed': 0.5,
+    'phrase': 0.3,
+    'seq': 0.15,
+    'fuzz': 0.05,
+}
+
 def _embed(text: str):
     """Return a normalized embedding vector for the given text or None."""
     if _embedding_model is None or not text:
@@ -200,6 +211,14 @@ def _embedding_similarity(a: str, b: str) -> float:
     if va is None or vb is None:
         return 0.0
     return float(np.dot(va, vb))
+
+
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Simple Jaccard similarity between sets of words."""
+    sa, sb = set(a.split()), set(b.split())
+    if not sa or not sb:
+        return 0.0
+    return len(sa & sb) / len(sa | sb)
 
 
 def _phrase_similarity(a: str, b: str, min_len: int = 2) -> float:
@@ -331,7 +350,7 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
     document.save(output_path)
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.75, low_threshold=0.45):
+def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.70, low_threshold=0.40):
     """Generate a highlighted DOCX report from a reference document and transcript.
 
     The transcript can be either a plain string or a Whisper result dictionary.
@@ -404,6 +423,7 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.75
             output_path=output_path,
             high_threshold=high_threshold,
             low_threshold=low_threshold,
+            weights=_DEFAULT_SIM_WEIGHTS,
         )
 
         # --- Post-process to remove low-confidence highlights ---
@@ -412,7 +432,7 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.75
             segments=segments,
             high_threshold=high_threshold,
             low_threshold=low_threshold,
-            margin=0.05,
+            margin=0.1,
         )
 
         # --- UPLOAD THE FINAL REPORT TO S3 ---
@@ -622,8 +642,9 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
         color_element.set(qn('w:val'), color_hex_str)
         rPr.append(color_element)
 
-def _find_best_segment(norm_para_text, segments):
-    """Return the best matching transcript segment for a given paragraph."""
+def _find_best_segment(norm_para_text, segments, weights=None):
+    """Return the best matching transcript segment for a paragraph."""
+    weights = weights or _DEFAULT_SIM_WEIGHTS
     best_score, best_seg = 0.0, None
     para_vec = _embed(norm_para_text)
     for seg in segments:
@@ -634,14 +655,19 @@ def _find_best_segment(norm_para_text, segments):
             score_embed = float(np.dot(para_vec, seg['embedding']))
         else:
             score_embed = _embedding_similarity(norm_para_text, seg['norm_text'])
-        score = (score_fuzz + score_seq + score_embed + score_phrase) / 4.0
+        score = (
+            weights['fuzz'] * score_fuzz
+            + weights['seq'] * score_seq
+            + weights['phrase'] * score_phrase
+            + weights['embed'] * score_embed
+        )
         if score > best_score:
             best_score = score
             best_seg = seg
     return best_score, best_seg
 
 
-def _process_element_three_color(element, segments, thresholds, colors):
+def _process_element_three_color(element, segments, thresholds, colors, weights=None):
     """Find all paragraphs and apply color and timestamps based on transcript matching."""
     if element is None:
         return
@@ -652,7 +678,7 @@ def _process_element_three_color(element, segments, thresholds, colors):
             continue
 
         norm_para_text = lemmatize_text(full_text)
-        best_score, best_seg = _find_best_segment(norm_para_text, segments)
+        best_score, best_seg = _find_best_segment(norm_para_text, segments, weights)
 
         if best_score >= thresholds['high']:
             color_to_apply = colors['GREEN']
@@ -665,12 +691,30 @@ def _process_element_three_color(element, segments, thresholds, colors):
 
         # Timestamp annotations can be added here in the future
 
-def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=0.75, low_threshold=0.45):
-    """Highlight a DOCX document using transcript segments.
+def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=0.70, low_threshold=0.40, weights=None):
+    """Highlight a DOCX document based on transcript segments.
 
-    Matching uses multi-word phrase comparison to minimize false positives.
-    Timestamps are not currently written to the document but the infrastructure
-    remains for future use.
+    Parameters
+    ----------
+    docx_path : str
+        Path to the reference DOCX file.
+    segments : list
+        Transcript segments preprocessed with ``lemmatize_text`` and optional
+        embeddings.
+    output_path : str
+        Where to save the highlighted document.
+    high_threshold : float, optional
+        Similarity threshold for a GREEN highlight.
+    low_threshold : float, optional
+        Similarity threshold for a RED highlight.
+    weights : dict, optional
+        Custom weights for the similarity metrics used in matching.
+
+    Notes
+    -----
+    Multi-word phrase comparison and semantic embeddings are used to minimise
+    false positives. Timestamp annotations remain disabled but the structure is
+    ready for later inclusion.
     """
     document = docx.Document(docx_path)
     colors = {
@@ -681,22 +725,22 @@ def highlight_docx_three_color(docx_path, segments, output_path, high_threshold=
     }
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
-    _process_element_three_color(document.element.body, segments, thresholds, colors)
+    _process_element_three_color(document.element.body, segments, thresholds, colors, weights)
     for section in document.sections:
         for part in [section.header, section.footer, section.first_page_header,
                      section.first_page_footer, section.even_page_header, section.even_page_footer]:
-            _process_element_three_color(part._element, segments, thresholds, colors)
+            _process_element_three_color(part._element, segments, thresholds, colors, weights)
 
     document.save(output_path)
 
 
-def fine_tune_highlighted_docx(docx_path, segments, high_threshold=0.75, low_threshold=0.45,
-                               margin=0.05):
+def fine_tune_highlighted_docx(docx_path, segments, high_threshold=0.70, low_threshold=0.40,
+                               margin=0.1):
     """Refine an already highlighted DOCX by applying stricter thresholds.
 
-    This post-processing step helps remove false positives after the initial
-    highlight pass. Timestamps remain ignored in the output, but the logic is
-    ready for future inclusion.
+    Parameters mirror :func:`highlight_docx_three_color`. ``margin`` controls how
+    much the thresholds are tightened during this clean-up pass. The function
+    keeps timestamp hooks in place for potential future use.
     """
     refined_high = min(1.0, high_threshold + margin)
     refined_low = min(refined_high, low_threshold + margin)
