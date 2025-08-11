@@ -423,8 +423,26 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
                 )
 
     dark_green = (0, 0.5, 0)
-    for page_num in range(target_doc.page_count):
+    light_red = (1, 0.6, 0.6)
+
+    def _is_light_red(color, target=light_red, tol=0.05):
+        return all(abs(color[i] - target[i]) <= tol for i in range(3))
+
+    for page_num in relevant_page_nums:
         page = target_doc.load_page(page_num)
+
+        red_annots = []
+        annot = page.first_annot
+        while annot:
+            colors = annot.colors or {}
+            stroke = colors.get("stroke")
+            if stroke and _is_light_red(stroke):
+                red_annots.append((annot, fitz.Rect(annot.rect)))
+            annot = annot.next
+
+        if not red_annots:
+            continue
+
         words_on_page = page.get_text("words")
         for w in words_on_page:
             word_text = w[4].strip()
@@ -433,19 +451,18 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
             if not data:
                 continue
             rect = fitz.Rect(w[:4])
-            annot = page.first_annot
-            while annot:
-                next_annot = annot.next
-                if fitz.Rect(annot.rect).intersects(rect):
+            for annot, a_rect in list(red_annots):
+                if a_rect.intersects(rect):
                     page.delete_annot(annot)
-                annot = next_annot
-            new_annot = page.add_highlight_annot(rect)
-            new_annot.set_colors(stroke=dark_green)
-            new_annot.set_opacity(0.6)
-            new_annot.update()
-            logging.info(
-                f"Validated and highlighted abbreviation '{data['abbr']}' on page {page_num + 1}"
-            )
+                    red_annots.remove((annot, a_rect))
+                    new_annot = page.add_highlight_annot(rect)
+                    new_annot.set_colors(stroke=dark_green)
+                    new_annot.set_opacity(0.6)
+                    new_annot.update()
+                    logging.info(
+                        f"Validated and highlighted abbreviation '{data['abbr']}' on page {page_num + 1}"
+                    )
+                    break
     # --- 4. Save the Output ---
     try:
         target_doc.save(output_path, garbage=4, deflate=True)
