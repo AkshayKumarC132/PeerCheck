@@ -383,18 +383,24 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
     logging.info("Starting abbreviation cleanup pass")
     abbreviations = {}
     csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
-    try:
-        with open(csv_path, newline="", encoding="utf-8") as csvfile:
-            reader = csv.reader(csvfile)
-            for row in reader:
-                if len(row) >= 2:
-                    abbr = row[0].strip()
-                    full = row[1].strip()
-                    if abbr and full:
-                        abbreviations[abbr] = full
-        logging.info(f"Loaded {len(abbreviations)} abbreviations from CSV")
-    except Exception as e:
-        logging.warning(f"Acronyms CSV could not be loaded: {e}")
+    for enc in ("utf-8", "cp1252"):
+        try:
+            with open(csv_path, newline="", encoding=enc) as csvfile:
+                reader = csv.reader(csvfile)
+                for row in reader:
+                    if len(row) >= 2:
+                        abbr = row[0].strip()
+                        full = row[1].strip()
+                        if abbr and full:
+                            abbreviations[abbr] = full
+            logging.info(
+                f"Loaded {len(abbreviations)} abbreviations from CSV using {enc}"
+            )
+            break
+        except Exception as e:
+            logging.warning(f"Failed to load acronyms CSV with {enc}: {e}")
+    if not abbreviations:
+        logging.warning("Acronyms CSV could not be loaded; skipping abbreviation cleanup")
 
     transcript_lower = query_text.lower()
 
