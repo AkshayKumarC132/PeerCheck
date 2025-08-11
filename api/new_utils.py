@@ -3,6 +3,7 @@ import re
 import string
 import tempfile
 import csv
+import logging
 import boto3
 from peercheck import settings
 from pdf2docx import Converter
@@ -321,7 +322,6 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
     query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
 
     # --- 3. Apply Highlighting to Relevant Pages ---
-    red_candidates = []
     for page_num in relevant_page_nums:
         page = target_doc.load_page(page_num)
         page_text = page.get_text("text")
@@ -369,15 +369,6 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
                     highlight.set_colors(stroke=light_red)
                     highlight.set_opacity(0.3)
                     highlight.update()
-                    red_candidates.append(
-                        {
-                            "page": page,
-                            "page_num": page_num,
-                            "rect": rect,
-                            "annot": highlight,
-                            "token": word_text,
-                        }
-                    )
 
     # --- Post-highlight Cleanup Pass for Abbreviations ---
     logging.info("Starting abbreviation cleanup pass")
@@ -389,10 +380,19 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
                 reader = csv.reader(csvfile)
                 for row in reader:
                     if len(row) >= 2:
-                        abbr = row[0].strip()
+                        abbr_raw = row[0].strip()
                         full = row[1].strip()
-                        if abbr and full:
-                            abbreviations[abbr] = full
+                        if (
+                            abbr_raw
+                            and full
+                            and abbr_raw.upper() != "ABBREVIATION"
+                        ):
+                            norm = re.sub(r"[^A-Za-z0-9]", "", abbr_raw).upper()
+                            if len(norm) >= 2:
+                                abbreviations[norm] = {
+                                    "abbr": abbr_raw,
+                                    "full": full,
+                                }
             logging.info(
                 f"Loaded {len(abbreviations)} abbreviations from CSV using {enc}"
             )
@@ -400,76 +400,60 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
         except Exception as e:
             logging.warning(f"Failed to load acronyms CSV with {enc}: {e}")
     if not abbreviations:
-        logging.warning("Acronyms CSV could not be loaded; skipping abbreviation cleanup")
+        logging.warning(
+            "Acronyms CSV could not be loaded; skipping abbreviation cleanup"
+        )
 
     transcript_lower = query_text.lower()
 
     validated_abbrs = {}
-    for abbr, full in abbreviations.items():
+    for norm, data in abbreviations.items():
+        full = data["full"]
         if full.lower() in transcript_lower:
-            validated_abbrs[abbr] = full
-            logging.debug(f"Exact transcript match for abbreviation '{abbr}' -> '{full}'")
+            validated_abbrs[norm] = data
+            logging.debug(
+                f"Exact transcript match for abbreviation '{data['abbr']}' -> '{full}'"
+            )
         else:
             ratio = fuzz.partial_ratio(full.lower(), transcript_lower)
             if ratio >= 70:
-                validated_abbrs[abbr] = full
+                validated_abbrs[norm] = data
                 logging.debug(
-                    f"Fuzzy transcript match for abbreviation '{abbr}' -> '{full}' with ratio {ratio}"
+                    f"Fuzzy transcript match for abbreviation '{data['abbr']}' -> '{full}' with ratio {ratio}"
                 )
 
-    for item in red_candidates:
-        raw_token = item["token"]
-        token = re.sub(r"[^A-Za-z0-9]", "", raw_token).upper()
-        page = item["page"]
-        rect = item["rect"]
-        annot = item["annot"]
-        page_num = item["page_num"]
-
-        logging.debug(f"Evaluating red token '{raw_token}' (normalized '{token}') on page {page_num}")
-
-        if token not in validated_abbrs:
-            logging.debug(f"Token '{token}' not validated against transcript or CSV")
-            continue
-
-        page.delete_annot(annot)
-        dark_green = (0, 0.5, 0)
-        new_annot = page.add_highlight_annot(rect)
-        new_annot.set_colors(stroke=dark_green)
-        new_annot.set_opacity(0.6)
-        new_annot.update()
-        logging.info(
-            f"Replaced red highlight with dark green for abbreviation '{token}' on page {page_num}"
-        )
-
-    # Highlight any validated abbreviations appearing elsewhere in the PDF
     dark_green = (0, 0.5, 0)
     for page_num in range(target_doc.page_count):
         page = target_doc.load_page(page_num)
-        page_text = page.get_text("text").upper()
-        for abbr in validated_abbrs:
-            if abbr not in page_text:
+        words_on_page = page.get_text("words")
+        for w in words_on_page:
+            word_text = w[4].strip()
+            norm_word = re.sub(r"[^A-Za-z0-9]", "", word_text).upper()
+            data = validated_abbrs.get(norm_word)
+            if not data:
                 continue
-            for rect in page.search_for(abbr):
-                annot = page.first_annot
-                while annot:
-                    next_annot = annot.next
-                    if fitz.Rect(annot.rect).intersects(rect):
-                        page.delete_annot(annot)
-                    annot = next_annot
-                new_annot = page.add_highlight_annot(rect)
-                new_annot.set_colors(stroke=dark_green)
-                new_annot.set_opacity(0.6)
-                new_annot.update()
-                logging.info(
-                    f"Validated and highlighted abbreviation '{abbr}' on page {page_num + 1}"
-                )
+            rect = fitz.Rect(w[:4])
+            annot = page.first_annot
+            while annot:
+                next_annot = annot.next
+                if fitz.Rect(annot.rect).intersects(rect):
+                    page.delete_annot(annot)
+                annot = next_annot
+            new_annot = page.add_highlight_annot(rect)
+            new_annot.set_colors(stroke=dark_green)
+            new_annot.set_opacity(0.6)
+            new_annot.update()
+            logging.info(
+                f"Validated and highlighted abbreviation '{data['abbr']}' on page {page_num + 1}"
+            )
     # --- 4. Save the Output ---
-    target_doc.save(output_path, garbage=4, deflate=True)
-    target_doc.close()
+    try:
+        target_doc.save(output_path, garbage=4, deflate=True)
+    finally:
+        target_doc.close()
+        if doc_path.lower().endswith('.docx') and os.path.exists(pdf_path):
+            os.unlink(pdf_path)
 
-    if doc_path.lower().endswith('.docx'):
-        os.unlink(pdf_path)
-        
     return output_path
 
 def create_highlighted_pdf_document(text_s3_url, transcript):
@@ -488,17 +472,21 @@ def create_highlighted_pdf_document(text_s3_url, transcript):
             temp_output_path = temp_file.name
 
         generate_highlighted_pdf(temp_input_path, transcript, temp_output_path)
-        
+
         with open(temp_output_path, 'rb') as f_out:
             output_s3_url = upload_file_to_s3(f_out, output_filename)
-        
+
         return output_s3_url
 
     finally:
-        if os.path.exists(temp_input_path):
-            os.unlink(temp_input_path)
-        if temp_output_path and os.path.exists(temp_output_path):
-            os.unlink(temp_output_path)
+        for path in (temp_input_path, temp_output_path):
+            if not path:
+                continue
+            try:
+                if os.path.exists(path):
+                    os.unlink(path)
+            except PermissionError:
+                logging.warning(f"Temp file in use, skipping deletion: {path}")
 
 
 def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
