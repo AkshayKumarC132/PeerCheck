@@ -404,38 +404,31 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
 
     transcript_lower = query_text.lower()
 
+    validated_abbrs = {}
+    for abbr, full in abbreviations.items():
+        if full.lower() in transcript_lower:
+            validated_abbrs[abbr] = full
+            logging.debug(f"Exact transcript match for abbreviation '{abbr}' -> '{full}'")
+        else:
+            ratio = fuzz.partial_ratio(full.lower(), transcript_lower)
+            if ratio >= 70:
+                validated_abbrs[abbr] = full
+                logging.debug(
+                    f"Fuzzy transcript match for abbreviation '{abbr}' -> '{full}' with ratio {ratio}"
+                )
+
     for item in red_candidates:
-        token = item["token"]
+        raw_token = item["token"]
+        token = re.sub(r"[^A-Za-z0-9]", "", raw_token).upper()
         page = item["page"]
         rect = item["rect"]
         annot = item["annot"]
         page_num = item["page_num"]
 
-        logging.debug(f"Evaluating red token '{token}' on page {page_num}")
+        logging.debug(f"Evaluating red token '{raw_token}' (normalized '{token}') on page {page_num}")
 
-        if not token.isupper() or token not in abbreviations:
-            logging.debug(f"Token '{token}' is not a known abbreviation")
-            continue
-
-        full_form = abbreviations[token]
-        logging.debug(f"Token '{token}' maps to '{full_form}'")
-
-        if full_form.lower() in transcript_lower:
-            transcript_match = True
-            logging.debug("Exact match found in transcript")
-        else:
-            ratio = fuzz.partial_ratio(full_form.lower(), transcript_lower)
-            transcript_match = ratio > 80
-            logging.debug(f"Fuzzy match ratio for '{full_form}': {ratio}")
-
-        if not transcript_match:
-            logging.debug(f"Full form for '{token}' not found in transcript")
-            continue
-
-        found_intersection = any(fitz.Rect(r).intersects(rect) for r in page.search_for(token))
-        logging.debug(f"Intersection check for '{token}': {found_intersection}")
-
-        if not found_intersection:
+        if token not in validated_abbrs:
+            logging.debug(f"Token '{token}' not validated against transcript or CSV")
             continue
 
         page.delete_annot(annot)
@@ -447,6 +440,29 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
         logging.info(
             f"Replaced red highlight with dark green for abbreviation '{token}' on page {page_num}"
         )
+
+    # Highlight any validated abbreviations appearing elsewhere in the PDF
+    dark_green = (0, 0.5, 0)
+    for page_num in range(target_doc.page_count):
+        page = target_doc.load_page(page_num)
+        page_text = page.get_text("text").upper()
+        for abbr in validated_abbrs:
+            if abbr not in page_text:
+                continue
+            for rect in page.search_for(abbr):
+                annot = page.first_annot
+                while annot:
+                    next_annot = annot.next
+                    if fitz.Rect(annot.rect).intersects(rect):
+                        page.delete_annot(annot)
+                    annot = next_annot
+                new_annot = page.add_highlight_annot(rect)
+                new_annot.set_colors(stroke=dark_green)
+                new_annot.set_opacity(0.6)
+                new_annot.update()
+                logging.info(
+                    f"Validated and highlighted abbreviation '{abbr}' on page {page_num + 1}"
+                )
     # --- 4. Save the Output ---
     target_doc.save(output_path, garbage=4, deflate=True)
     target_doc.close()
