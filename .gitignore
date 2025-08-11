@@ -69,3 +69,8 @@ vosk-model-small-en-us-0.15
 vosk-model-en-us-0.22
 *.rar
 vosk-model-spk-0.4
+
+# File Extensions
+*.txt
+*.pdf
+*.docx

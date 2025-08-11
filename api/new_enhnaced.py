@@ -15,8 +15,8 @@ import traceback
 from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, AuditLog
 from .new_utils import (
     extract_text_from_s3, transcribe_audio_from_s3, diarization_from_audio,  # <-- add diarization_from_audio
-    find_missing, create_highlighted_docx_from_s3, upload_file_to_s3,
-    get_s3_key_from_url, s3_client
+    find_missing, upload_file_to_s3,
+    get_s3_key_from_url, s3_client, create_highlighted_pdf_document
 )
 from .authentication import token_verification
 from .new_serializers import (
@@ -288,23 +288,11 @@ class DownloadProcessedDocumentView(GenericAPIView):
         try:
             # Get processing session
             session = ProcessingSession.objects.get(
-                id=session_id,
-                # expires_at__gt=timezone.now()
+                id=session_id
             )
-            print(f"Session found: {session.id}")
-            
-            # Verify user has access
-            # if (session.audio_file.user != user or session.audio_file.user.role != 'reviewer'):
-            #     return Response({
-            #         'error': 'Access denied - You can only access your own sessions',
-            #         'timestamp': timezone.now().isoformat()
-            #     }, status=status.HTTP_403_FORBIDDEN)
             
             reference_doc = session.reference_document
             audio_file = session.audio_file
-            
-            print(f"Reference doc: {reference_doc.name}")
-            print(f"Audio file: {audio_file.original_filename}")
             
             # Check if processed DOCX already exists in S3
             if session.processed_docx_path:
@@ -322,14 +310,25 @@ class DownloadProcessedDocumentView(GenericAPIView):
                             'timestamp': timezone.now().isoformat()
                         }, status=status.HTTP_400_BAD_REQUEST)
                     
-                    # Create highlighted document
-                    processed_s3_url = create_highlighted_docx_from_s3(
-                        reference_doc.file_path, 
-                        transcript
-                    )
-                    
+                    # Create highlighted document based on file extension
+                    file_ext = reference_doc.file_path.rsplit('.', 1)[-1].lower()
+                    if file_ext == 'pdf':
+                        processed_s3_url = create_highlighted_pdf_document(
+                            reference_doc.file_path, 
+                            transcript
+                        )
+                    elif file_ext == 'docx':
+                        from .new_utils import create_highlighted_docx_from_s3
+                        processed_s3_url = create_highlighted_docx_from_s3(
+                            reference_doc.file_path,
+                            transcript
+                        )
+                    else:
+                        return Response({
+                            'error': f'Unsupported file type for highlighting: {file_ext}',
+                            'timestamp': timezone.now().isoformat()
+                        }, status=status.HTTP_400_BAD_REQUEST)
                     print(f"Created processed document: {processed_s3_url}")
-                    
                     # Save S3 URL to session
                     session.processed_docx_path = processed_s3_url
                     session.save()
@@ -346,57 +345,13 @@ class DownloadProcessedDocumentView(GenericAPIView):
             audio_file.report_path = processed_s3_url
             audio_file.save()
 
-            # AuditLog.objects.create(
-            #     action='Download Report',
-            #     user=user_data['user'],
-            #     # user = user_data['user'],
-            #     # session_id=session_id,
-            #     object_id=session.id,
-            #     object_type='AudioFile',
-            #     details={
-            #         "session_id": session.id
-            #             # 'file_name': audio_file.name,
-            #             # 'file_size': audio_file.size,
-            #             # 'speaker_stats': speaker_stats,
-            #             # 'processing_method': 'enhanced_diarization'
-            #         }
-            # )
-            
-            # Option 1: Return S3 URL (Current implementation)
+            # Direct file download
             return Response({
                 'processed_docx_url': processed_s3_url,
                 'message': 'Processed document is available at the above URL.',
                 'session_id': str(session.id),
                 'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed.docx"
             }, status=status.HTTP_200_OK)
-            
-            # Option 2: Direct file download (Uncomment if you want direct download)
-            """
-            try:
-                s3_key = get_s3_key_from_url(processed_s3_url)
-                temp_path = download_file_from_s3(s3_key)
-                
-                with open(temp_path, 'rb') as f:
-                    response = HttpResponse(
-                        f.read(),
-                        content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-                    )
-                    download_name = f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed.docx"
-                    response['Content-Disposition'] = f'attachment; filename="{download_name}"'
-                    
-                # Clean up temp file
-                os.unlink(temp_path)
-                return response
-                
-            except Exception as download_error:
-                print(f"Error downloading from S3: {str(download_error)}")
-                return Response({
-                    'error': f'Failed to download processed document: {str(download_error)}',
-                    'processed_docx_url': processed_s3_url,  # Provide URL as fallback
-                    'timestamp': timezone.now().isoformat()
-                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            """
-        
         except ProcessingSession.DoesNotExist:
             print(f"Session not found or expired: {session_id}")
             return Response({

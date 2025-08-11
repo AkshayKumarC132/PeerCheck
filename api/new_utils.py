@@ -2,12 +2,9 @@ import os
 import re
 import string
 import tempfile
-# import pythoncom
 import boto3
 from peercheck import settings
-# from docx import Document as DocxDocument
 from pdf2docx import Converter
-# import win32com.client
 import whisper
 import PyPDF2
 import docx
@@ -18,6 +15,12 @@ from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
 import uuid
+from collections import Counter
+from sentence_transformers import SentenceTransformer, util
+from docx.enum.text import WD_COLOR_INDEX
+from docx.shared import RGBColor
+import fitz  # PyMuPDF
+from docx2pdf import convert
 
 # Load Whisper model once
 model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
@@ -236,6 +239,168 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
         color_element.set(docx.oxml.ns.qn('w:val'), str(color))
 
     document.save(output_path)
+
+def generate_highlighted_pdf(doc_path, query_text, output_path):
+    """
+    Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
+    and saves the result to a new PDF file.
+    Adds robust validation for PDF input.
+    """
+    import logging
+    pdf_path = doc_path
+    if doc_path.lower().endswith('.docx'):
+        temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
+        convert(doc_path, temp_pdf_path)
+        pdf_path = temp_pdf_path
+
+    # --- Robust PDF Validation ---
+    if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+        raise ValueError(f"Input file '{pdf_path}' does not exist or is empty.")
+    with open(pdf_path, 'rb') as f:
+        header = f.read(5)
+        if header != b'%PDF-':
+            raise ValueError(f"Input file '{pdf_path}' is not a valid PDF (missing %PDF header).")
+    try:
+        target_doc = fitz.open(pdf_path)
+    except Exception as e:
+        logging.error(f"Failed to open PDF '{pdf_path}': {e}")
+        raise ValueError(f"Failed to open PDF '{pdf_path}': {e}")
+    
+    # --- Helper Functions ---
+    def split_into_sentences(text):
+        return [s.strip() for s in re.split(r'(?<=[.?!])\s+', text) if len(s.strip()) > 5]
+
+    def extract_numeric_patterns(text):
+        return set(re.findall(r'\b(?:\d+(?:\.\d+)*|\w+-\w+|\w{3,})\b', text.lower()))
+
+    # --- 1. Page Relevance Scoring ---
+    from rapidfuzz import fuzz
+
+    query_tokens = extract_numeric_patterns(query_text)
+    
+    token_freq = Counter()
+    target_page_tokens = []
+    for page in target_doc:
+        page_text = page.get_text()
+        tokens = extract_numeric_patterns(page_text)
+        target_page_tokens.append(tokens)
+        token_freq.update(tokens)
+
+    COMMON_TOKEN_THRESHOLD = int(0.5 * len(target_doc))
+    filtered_query_tokens = {tok for tok in query_tokens if token_freq[tok] < COMMON_TOKEN_THRESHOLD}
+
+    def token_score(token):
+        return len(token) / (1 + token_freq[token])
+
+    def fuzzy_match_score(query_set, target_set):
+        score = 0
+        for q in query_set:
+            for t in target_set:
+                if fuzz.ratio(q, t) > 90:
+                    score += token_score(q)
+        return score
+
+    page_scores = []
+    for i, tgt_tokens in enumerate(target_page_tokens):
+        score = fuzzy_match_score(filtered_query_tokens, tgt_tokens)
+        page_scores.append((i, score))
+
+    page_scores = sorted(page_scores, key=lambda x: x[1], reverse=True)
+
+    top_k = 5
+    top_pages = set()
+    for i, score in page_scores[:top_k]:
+        top_pages.update([i - 1, i, i + 1])
+    relevant_page_nums = sorted([i for i in top_pages if 0 <= i < len(target_doc)])
+    
+    # --- 2. Semantic Matching Setup ---
+    model = SentenceTransformer('all-MiniLM-L6-v2')
+    query_chunks = split_into_sentences(query_text)
+    if not query_chunks: query_chunks = [query_text]
+    query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
+
+    # --- 3. Apply Highlighting to Relevant Pages ---
+    for page_num in relevant_page_nums:
+        page = target_doc.load_page(page_num)
+        page_text = page.get_text("text")
+        page_chunks = split_into_sentences(page_text)
+        if not page_chunks: page_chunks = [page_text]
+        
+        page_embeddings = model.encode(page_chunks, convert_to_tensor=True)
+        
+        cosine_scores = util.cos_sim(page_embeddings, query_embeddings)
+        
+        matched_page_chunks = set()
+        import torch
+        for i, row in enumerate(cosine_scores):
+            if len(row) > 0 and torch.max(row) > 0.7:
+                if i < len(page_chunks):
+                    matched_page_chunks.add(page_chunks[i].lower())
+
+        green_rects = []
+        words_on_page = page.get_text("words")
+        for w in words_on_page:
+            word_text = w[4].strip()
+            word_text_lower = word_text.lower()
+            rect = fitz.Rect(w[:4])
+
+            is_numeric_match = any(word_text_lower == t or word_text_lower in t or t in word_text_lower
+                                   for t in filtered_query_tokens)
+            is_semantic_match = any(word_text_lower in chunk for chunk in matched_page_chunks)
+
+            # Define light green and light red colors
+            light_green = (0.6, 1, 0.6)
+            light_red = (1, 0.6, 0.6)
+
+            if is_numeric_match or is_semantic_match:
+                highlight = page.add_highlight_annot(rect)
+                highlight.set_colors(stroke=light_green)
+                highlight.set_opacity(0.3)
+                highlight.update()
+                green_rects.append(rect)
+            else:
+                if not any(rect.intersects(g) for g in green_rects):
+                    highlight = page.add_highlight_annot(rect)
+                    highlight.set_colors(stroke=light_red)
+                    highlight.set_opacity(0.3)
+                    highlight.update()
+
+    # --- 4. Save the Output ---
+    target_doc.save(output_path, garbage=4, deflate=True)
+    target_doc.close()
+
+    if doc_path.lower().endswith('.docx'):
+        os.unlink(pdf_path)
+        
+    return output_path
+
+def create_highlighted_pdf_document(text_s3_url, transcript):
+    """
+    Orchestrates the generation of a highlighted PDF using the new logic.
+    """
+    output_filename = f"processed/{uuid.uuid4()}_highlighted_report.pdf"
+    
+    # Download the reference document
+    s3_key = get_s3_key_from_url(text_s3_url)
+    temp_input_path = download_file_from_s3(s3_key)
+    
+    temp_output_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
+            temp_output_path = temp_file.name
+
+        generate_highlighted_pdf(temp_input_path, transcript, temp_output_path)
+        
+        with open(temp_output_path, 'rb') as f_out:
+            output_s3_url = upload_file_to_s3(f_out, output_filename)
+        
+        return output_s3_url
+
+    finally:
+        if os.path.exists(temp_input_path):
+            os.unlink(temp_input_path)
+        if temp_output_path and os.path.exists(temp_output_path):
+            os.unlink(temp_output_path)
 
 
 def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
