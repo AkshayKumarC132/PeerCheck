@@ -242,7 +242,7 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
 
     document.save(output_path)
 
-def generate_highlighted_pdf(doc_path, query_text, output_path):
+def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcript_match=True):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
     and saves the result to a new PDF file.
@@ -404,23 +404,27 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
             "Acronyms CSV could not be loaded; skipping abbreviation cleanup"
         )
 
-    transcript_lower = query_text.lower()
-
     validated_abbrs = {}
-    for norm, data in abbreviations.items():
-        full = data["full"]
-        if full.lower() in transcript_lower:
-            validated_abbrs[norm] = data
-            logging.debug(
-                f"Exact transcript match for abbreviation '{data['abbr']}' -> '{full}'"
-            )
-        else:
-            ratio = fuzz.partial_ratio(full.lower(), transcript_lower)
-            if ratio >= 70:
+    if require_transcript_match:
+        transcript_lower = query_text.lower()
+        for norm, data in abbreviations.items():
+            full = data["full"]
+            if full.lower() in transcript_lower:
                 validated_abbrs[norm] = data
                 logging.debug(
-                    f"Fuzzy transcript match for abbreviation '{data['abbr']}' -> '{full}' with ratio {ratio}"
+                    f"Exact transcript match for abbreviation '{data['abbr']}' -> '{full}'"
                 )
+            else:
+                ratio = fuzz.partial_ratio(full.lower(), transcript_lower)
+                if ratio >= 70:
+                    validated_abbrs[norm] = data
+                    logging.debug(
+                        f"Fuzzy transcript match for abbreviation '{data['abbr']}' -> '{full}' with ratio {ratio}"
+                    )
+        logging.info("Transcript validation enabled: %d abbreviations confirmed", len(validated_abbrs))
+    else:
+        validated_abbrs = abbreviations
+        logging.info("Transcript validation disabled: using %d abbreviations directly", len(validated_abbrs))
 
     dark_green = (0, 0.5, 0)
     light_red = (1, 0.6, 0.6)
@@ -473,7 +477,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
 
     return output_path
 
-def create_highlighted_pdf_document(text_s3_url, transcript):
+def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_match=True):
     """
     Orchestrates the generation of a highlighted PDF using the new logic.
     """
@@ -488,7 +492,12 @@ def create_highlighted_pdf_document(text_s3_url, transcript):
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_output_path = temp_file.name
 
-        generate_highlighted_pdf(temp_input_path, transcript, temp_output_path)
+        generate_highlighted_pdf(
+            temp_input_path,
+            transcript,
+            temp_output_path,
+            require_transcript_match=require_transcript_match,
+        )
 
         with open(temp_output_path, 'rb') as f_out:
             output_s3_url = upload_file_to_s3(f_out, output_filename)

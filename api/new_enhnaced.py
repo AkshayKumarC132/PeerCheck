@@ -2,6 +2,7 @@ import os
 import tempfile
 import uuid
 import time
+import logging
 from datetime import datetime, timedelta
 from django.conf import settings
 from django.http import HttpResponse, Http404
@@ -312,10 +313,20 @@ class DownloadProcessedDocumentView(GenericAPIView):
                     
                     # Create highlighted document based on file extension
                     file_ext = reference_doc.file_path.rsplit('.', 1)[-1].lower()
+                    use_transcript = (
+                        request.query_params.get("validate_abbreviations", "true")
+                        .lower()
+                        == "true"
+                    )
+                    logging.info(
+                        "validate_abbreviations=%s in DownloadProcessedDocumentView",
+                        use_transcript,
+                    )
                     if file_ext == 'pdf':
                         processed_s3_url = create_highlighted_pdf_document(
-                            reference_doc.file_path, 
-                            transcript
+                            reference_doc.file_path,
+                            transcript,
+                            require_transcript_match=use_transcript,
                         )
                     elif file_ext == 'docx':
                         from .new_utils import create_highlighted_docx_from_s3
