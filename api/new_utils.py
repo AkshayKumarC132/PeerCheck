@@ -2,6 +2,7 @@ import os
 import re
 import string
 import tempfile
+import csv
 import boto3
 from peercheck import settings
 from pdf2docx import Converter
@@ -320,16 +321,18 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
     query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
 
     # --- 3. Apply Highlighting to Relevant Pages ---
+    red_candidates = []
     for page_num in relevant_page_nums:
         page = target_doc.load_page(page_num)
         page_text = page.get_text("text")
         page_chunks = split_into_sentences(page_text)
-        if not page_chunks: page_chunks = [page_text]
-        
+        if not page_chunks:
+            page_chunks = [page_text]
+
         page_embeddings = model.encode(page_chunks, convert_to_tensor=True)
-        
+
         cosine_scores = util.cos_sim(page_embeddings, query_embeddings)
-        
+
         matched_page_chunks = set()
         import torch
         for i, row in enumerate(cosine_scores):
@@ -344,8 +347,10 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
             word_text_lower = word_text.lower()
             rect = fitz.Rect(w[:4])
 
-            is_numeric_match = any(word_text_lower == t or word_text_lower in t or t in word_text_lower
-                                   for t in filtered_query_tokens)
+            is_numeric_match = any(
+                word_text_lower == t or word_text_lower in t or t in word_text_lower
+                for t in filtered_query_tokens
+            )
             is_semantic_match = any(word_text_lower in chunk for chunk in matched_page_chunks)
 
             # Define light green and light red colors
@@ -364,7 +369,78 @@ def generate_highlighted_pdf(doc_path, query_text, output_path):
                     highlight.set_colors(stroke=light_red)
                     highlight.set_opacity(0.3)
                     highlight.update()
+                    red_candidates.append(
+                        {
+                            "page": page,
+                            "page_num": page_num,
+                            "rect": rect,
+                            "annot": highlight,
+                            "token": word_text,
+                        }
+                    )
 
+    # --- Post-highlight Cleanup Pass for Abbreviations ---
+    logging.info("Starting abbreviation cleanup pass")
+    abbreviations = {}
+    csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as csvfile:
+            reader = csv.reader(csvfile)
+            for row in reader:
+                if len(row) >= 2:
+                    abbr = row[0].strip()
+                    full = row[1].strip()
+                    if abbr and full:
+                        abbreviations[abbr] = full
+        logging.info(f"Loaded {len(abbreviations)} abbreviations from CSV")
+    except Exception as e:
+        logging.warning(f"Acronyms CSV could not be loaded: {e}")
+
+    transcript_lower = query_text.lower()
+
+    for item in red_candidates:
+        token = item["token"]
+        page = item["page"]
+        rect = item["rect"]
+        annot = item["annot"]
+        page_num = item["page_num"]
+
+        logging.debug(f"Evaluating red token '{token}' on page {page_num}")
+
+        if not token.isupper() or token not in abbreviations:
+            logging.debug(f"Token '{token}' is not a known abbreviation")
+            continue
+
+        full_form = abbreviations[token]
+        logging.debug(f"Token '{token}' maps to '{full_form}'")
+
+        if full_form.lower() in transcript_lower:
+            transcript_match = True
+            logging.debug("Exact match found in transcript")
+        else:
+            ratio = fuzz.partial_ratio(full_form.lower(), transcript_lower)
+            transcript_match = ratio > 80
+            logging.debug(f"Fuzzy match ratio for '{full_form}': {ratio}")
+
+        if not transcript_match:
+            logging.debug(f"Full form for '{token}' not found in transcript")
+            continue
+
+        found_intersection = any(fitz.Rect(r).intersects(rect) for r in page.search_for(token))
+        logging.debug(f"Intersection check for '{token}': {found_intersection}")
+
+        if not found_intersection:
+            continue
+
+        page.delete_annot(annot)
+        dark_green = (0, 0.5, 0)
+        new_annot = page.add_highlight_annot(rect)
+        new_annot.set_colors(stroke=dark_green)
+        new_annot.set_opacity(0.6)
+        new_annot.update()
+        logging.info(
+            f"Replaced red highlight with dark green for abbreviation '{token}' on page {page_num}"
+        )
     # --- 4. Save the Output ---
     target_doc.save(output_path, garbage=4, deflate=True)
     target_doc.close()
