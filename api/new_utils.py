@@ -242,6 +242,115 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
 
     document.save(output_path)
 
+
+def _load_abbreviation_map(csv_path: str) -> dict:
+    """Load abbreviation mappings from a CSV file.
+
+    Tries a couple of common encodings and normalizes keys by removing
+    non-alphanumeric characters and upper-casing. Single-character entries and
+    headers are skipped.
+    """
+    abbr_map = {}
+    for enc in ("utf-8", "cp1252", "latin1"):
+        try:
+            with open(csv_path, newline="", encoding=enc) as csvfile:
+                reader = csv.reader(csvfile)
+                for row in reader:
+                    if len(row) < 2:
+                        continue
+                    abbr_raw, full = row[0].strip(), row[1].strip()
+                    if not (abbr_raw and full) or abbr_raw.upper() == "ABBREVIATION":
+                        continue
+                    norm = re.sub(r"[^A-Za-z0-9]", "", abbr_raw).upper()
+                    if len(norm) < 2:
+                        continue
+                    abbr_map[norm] = {"abbr": abbr_raw, "full": full}
+            logging.info(
+                "Loaded %d abbreviations from CSV using %s", len(abbr_map), enc
+            )
+            return abbr_map
+        except Exception as exc:
+            logging.warning("Failed to load acronyms CSV with %s: %s", enc, exc)
+    return abbr_map
+
+
+def _confirm_abbreviations(abbr_map: dict, transcript: str) -> dict:
+    """Filter abbreviation map to only those whose full form appears in transcript."""
+    transcript_lower = transcript.lower()
+    validated = {}
+    for norm, data in abbr_map.items():
+        full = data["full"].lower()
+        if full in transcript_lower:
+            validated[norm] = data
+            logging.debug(
+                "Exact transcript match for abbreviation '%s' -> '%s'",
+                data["abbr"],
+                data["full"],
+            )
+            continue
+        ratio = fuzz.token_set_ratio(full, transcript_lower)
+        if ratio >= 65:
+            validated[norm] = data
+            logging.debug(
+                "Fuzzy transcript match for abbreviation '%s' -> '%s' with ratio %s",
+                data["abbr"],
+                data["full"],
+                ratio,
+            )
+    logging.info("Transcript validation enabled: %d abbreviations confirmed", len(validated))
+    return validated
+
+
+def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
+    """Replace red highlights with dark green for validated abbreviations."""
+    if not validated_abbrs:
+        logging.info("No validated abbreviations to apply")
+        return
+
+    dark_green = (0, 0.5, 0)
+    light_red = (1, 0.6, 0.6)
+
+    def _is_light_red(color, target=light_red, tol=0.1):
+        return all(abs(color[i] - target[i]) <= tol for i in range(3))
+
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+
+        red_annots = []
+        annot = page.first_annot
+        while annot:
+            colors = annot.colors or {}
+            stroke = colors.get("stroke")
+            if stroke and _is_light_red(stroke):
+                red_annots.append((annot, fitz.Rect(annot.rect)))
+            annot = annot.next
+
+        if not red_annots:
+            continue
+
+        words_on_page = page.get_text("words")
+        for w in words_on_page:
+            word_text = w[4].strip()
+            norm_word = re.sub(r"[^A-Za-z0-9]", "", word_text).upper()
+            data = validated_abbrs.get(norm_word)
+            if not data:
+                continue
+            rect = fitz.Rect(w[:4])
+            for annot, a_rect in list(red_annots):
+                if a_rect.intersects(rect):
+                    page.delete_annot(annot)
+                    red_annots.remove((annot, a_rect))
+                    new_annot = page.add_highlight_annot(rect)
+                    new_annot.set_colors(stroke=dark_green)
+                    new_annot.set_opacity(0.6)
+                    new_annot.update()
+                    logging.info(
+                        "Validated and highlighted abbreviation '%s' on page %d",
+                        data["abbr"],
+                        page_num + 1,
+                    )
+                    break
+
 def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcript_match=True):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
@@ -372,101 +481,19 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
 
     # --- Post-highlight Cleanup Pass for Abbreviations ---
     logging.info("Starting abbreviation cleanup pass")
-    abbreviations = {}
     csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
-    for enc in ("utf-8", "cp1252"):
-        try:
-            with open(csv_path, newline="", encoding=enc) as csvfile:
-                reader = csv.reader(csvfile)
-                for row in reader:
-                    if len(row) >= 2:
-                        abbr_raw = row[0].strip()
-                        full = row[1].strip()
-                        if (
-                            abbr_raw
-                            and full
-                            and abbr_raw.upper() != "ABBREVIATION"
-                        ):
-                            norm = re.sub(r"[^A-Za-z0-9]", "", abbr_raw).upper()
-                            if len(norm) >= 2:
-                                abbreviations[norm] = {
-                                    "abbr": abbr_raw,
-                                    "full": full,
-                                }
-            logging.info(
-                f"Loaded {len(abbreviations)} abbreviations from CSV using {enc}"
-            )
-            break
-        except Exception as e:
-            logging.warning(f"Failed to load acronyms CSV with {enc}: {e}")
-    if not abbreviations:
-        logging.warning(
-            "Acronyms CSV could not be loaded; skipping abbreviation cleanup"
-        )
+    abbreviations = _load_abbreviation_map(csv_path)
 
-    validated_abbrs = {}
     if require_transcript_match:
-        transcript_lower = query_text.lower()
-        for norm, data in abbreviations.items():
-            full = data["full"]
-            if full.lower() in transcript_lower:
-                validated_abbrs[norm] = data
-                logging.debug(
-                    f"Exact transcript match for abbreviation '{data['abbr']}' -> '{full}'"
-                )
-            else:
-                ratio = fuzz.partial_ratio(full.lower(), transcript_lower)
-                if ratio >= 70:
-                    validated_abbrs[norm] = data
-                    logging.debug(
-                        f"Fuzzy transcript match for abbreviation '{data['abbr']}' -> '{full}' with ratio {ratio}"
-                    )
-        logging.info("Transcript validation enabled: %d abbreviations confirmed", len(validated_abbrs))
+        validated_abbrs = _confirm_abbreviations(abbreviations, query_text)
     else:
         validated_abbrs = abbreviations
-        logging.info("Transcript validation disabled: using %d abbreviations directly", len(validated_abbrs))
+        logging.info(
+            "Transcript validation disabled: using %d abbreviations directly",
+            len(validated_abbrs),
+        )
 
-    dark_green = (0, 0.5, 0)
-    light_red = (1, 0.6, 0.6)
-
-    def _is_light_red(color, target=light_red, tol=0.05):
-        return all(abs(color[i] - target[i]) <= tol for i in range(3))
-
-    for page_num in relevant_page_nums:
-        page = target_doc.load_page(page_num)
-
-        red_annots = []
-        annot = page.first_annot
-        while annot:
-            colors = annot.colors or {}
-            stroke = colors.get("stroke")
-            if stroke and _is_light_red(stroke):
-                red_annots.append((annot, fitz.Rect(annot.rect)))
-            annot = annot.next
-
-        if not red_annots:
-            continue
-
-        words_on_page = page.get_text("words")
-        for w in words_on_page:
-            word_text = w[4].strip()
-            norm_word = re.sub(r"[^A-Za-z0-9]", "", word_text).upper()
-            data = validated_abbrs.get(norm_word)
-            if not data:
-                continue
-            rect = fitz.Rect(w[:4])
-            for annot, a_rect in list(red_annots):
-                if a_rect.intersects(rect):
-                    page.delete_annot(annot)
-                    red_annots.remove((annot, a_rect))
-                    new_annot = page.add_highlight_annot(rect)
-                    new_annot.set_colors(stroke=dark_green)
-                    new_annot.set_opacity(0.6)
-                    new_annot.update()
-                    logging.info(
-                        f"Validated and highlighted abbreviation '{data['abbr']}' on page {page_num + 1}"
-                    )
-                    break
+    _replace_validated_abbreviations(target_doc, validated_abbrs)
     # --- 4. Save the Output ---
     try:
         target_doc.save(output_path, garbage=4, deflate=True)
