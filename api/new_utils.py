@@ -246,11 +246,13 @@ def highlight_docx_cross_platform(docx_path, norm_trans, output_path, threshold=
 def _load_abbreviation_map(csv_path: str) -> dict:
     """Load abbreviation mappings from a CSV file.
 
-    Tries a couple of common encodings and normalizes keys by removing
-    non-alphanumeric characters and upper-casing. Single-character entries and
-    headers are skipped.
+    Supports rows that contain multiple abbreviations for the same meaning
+    separated by characters such as commas, slashes, dashes, or spaces. Each
+    abbreviation variant is normalized by stripping non-alphanumeric
+    characters and upper-casing before being added to the map. Single-character
+    entries and headers are skipped.
     """
-    abbr_map = {}
+    abbr_map: dict[str, dict] = {}
     for enc in ("utf-8", "cp1252", "latin1"):
         try:
             with open(csv_path, newline="", encoding=enc) as csvfile:
@@ -258,13 +260,33 @@ def _load_abbreviation_map(csv_path: str) -> dict:
                 for row in reader:
                     if len(row) < 2:
                         continue
-                    abbr_raw, full = row[0].strip(), row[1].strip()
-                    if not (abbr_raw and full) or abbr_raw.upper() == "ABBREVIATION":
+                    abbr_field, full = row[0].strip(), row[1].strip()
+                    if not (abbr_field and full) or abbr_field.upper() == "ABBREVIATION":
                         continue
-                    norm = re.sub(r"[^A-Za-z0-9]", "", abbr_raw).upper()
-                    if len(norm) < 2:
-                        continue
-                    abbr_map[norm] = {"abbr": abbr_raw, "full": full}
+
+                    # Split the abbreviation field into individual candidates
+                    for part in re.split(r",", abbr_field):
+                        part = part.strip()
+                        if not part:
+                            continue
+
+                        # Consider sub-variants separated by '/', '-' or spaces
+                        candidates = {part}
+                        for sep in ("/", "-", " "):
+                            if sep in part:
+                                candidates.update(
+                                    seg.strip() for seg in part.split(sep) if seg.strip()
+                                )
+
+                        for abbr in candidates:
+                            norm = re.sub(r"[^A-Za-z0-9]", "", abbr).upper()
+                            if len(norm) < 2:
+                                continue
+                            entry = abbr_map.setdefault(norm, {"abbrs": set(), "full": full})
+                            entry["abbrs"].add(abbr)
+
+            for data in abbr_map.values():
+                data["abbrs"] = list(data["abbrs"])
             logging.info(
                 "Loaded %d abbreviations from CSV using %s", len(abbr_map), enc
             )
@@ -280,11 +302,12 @@ def _confirm_abbreviations(abbr_map: dict, transcript: str) -> dict:
     validated = {}
     for norm, data in abbr_map.items():
         full = data["full"].lower()
+        abbr_display = "/".join(data.get("abbrs", []))
         if full in transcript_lower:
             validated[norm] = data
             logging.debug(
                 "Exact transcript match for abbreviation '%s' -> '%s'",
-                data["abbr"],
+                abbr_display,
                 data["full"],
             )
             continue
@@ -293,7 +316,7 @@ def _confirm_abbreviations(abbr_map: dict, transcript: str) -> dict:
             validated[norm] = data
             logging.debug(
                 "Fuzzy transcript match for abbreviation '%s' -> '%s' with ratio %s",
-                data["abbr"],
+                abbr_display,
                 data["full"],
                 ratio,
             )
@@ -346,7 +369,7 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     new_annot.update()
                     logging.info(
                         "Validated and highlighted abbreviation '%s' on page %d",
-                        data["abbr"],
+                        word_text,
                         page_num + 1,
                     )
                     break
