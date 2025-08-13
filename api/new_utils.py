@@ -330,7 +330,7 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
         logging.info("No validated abbreviations to apply")
         return
 
-    dark_green = (0, 0.5, 0)
+    dark_green = (0.6, 1, 0.6)
     light_red = (1, 0.6, 0.6)
 
     def _is_light_red(color, target=light_red, tol=0.1):

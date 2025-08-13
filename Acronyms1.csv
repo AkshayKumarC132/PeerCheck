@@ -83,7 +83,7 @@ ATI ,Automatic Test Indication / Insertion
 ATOMS ,Attitudes Toward Observations Maximizes Safety
 ATWS ,Anticipated Transients Without Scram
 ATWT ,Anticipated Transients Without Trip
-AUG ,Air Operated Valve Users’ Group
+AUG ,Air Operated Valve Usersï¿½ Group
 AUX ,Auxiliary
 AV ,Allowable Value
 AVT ,All Volatile Treatment
@@ -227,7 +227,7 @@ COC ,Chain Of Custody
 COE ,Centers of Excellence
 COLR ,Core Operating Limits Report
 conc ,concentration
-COTPC………………...,Control of Training Program Content
+COTPCï¿½ï¿½ï¿½ï¿½ï¿½ï¿½...,Control of Training Program Content
 CP ,Construction Permit
 CPA ,Containment Performance Analysis
 CPC ,Core Protection Calculators
@@ -323,7 +323,7 @@ DEP ,Drill and Exercise Performance
 DEPSG ,Double Ended Pump Suction Guillotine
 dept ,department
 DF ,Decontamination factor
-DFSS………………….,Dry Fuel Storage System
+DFSSï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½.,Dry Fuel Storage System
 DFBN ,Debris Filter Bottom Nozzle
 DFCS ,Digital Feedwater Control System
 DG; D/G ,Diesel Generator
@@ -400,7 +400,7 @@ EDEFSTS ,Emergency Diesel Engine Fuel Oil Storage & Transfer System
 EDELS ,Emergency Diesel Engine Lubrication System
 EDESS ,Emergency Diesel Engine Start System
 EDG ,Emergency Diesel Generator
-EDI’s ,Engineering Desk Instructions
+EDIï¿½s ,Engineering Desk Instructions
 EDMS ,Electronic Data Management System
 EDO ,Executive Director for Operations
 EDS ,Electrical Distribution System
@@ -651,7 +651,7 @@ ITIP ,Industry Technical Information Program
 ITP ,Individual Training Plan
 ITS ,Improved Technical Specifications
 ITS ,Incore Thermocouple System
-IT-TRG ,Instructor Training – Training Review Group
+IT-TRG ,Instructor Training ï¿½ Training Review Group
 IV ,Independent Verifier/Verification
 IV ,Intercept Valve
 JAR ,Job Authorization Request
@@ -662,7 +662,7 @@ JCO ,Justification for Continued Operation
 JFA ,Jumper Faucet Assembly
 JIC ,Joint Information Clearinghouse
 JITT ,Just-in-time Training
-JOG ,Joint Owners’ Group
+JOG ,Joint Ownersï¿½ Group
 JRB ,Job Review Board
 JRR ,John Redmond Reservoir
 JTA ,Job-Task-Analysis
@@ -900,6 +900,7 @@ NUREG ,Nuclear Utility Regulation
 NUSCO ,Northeast Utilities Service Co.
 NWRC ,No Work Required (Cancel)
 NWRO ,No Work Required (Non-Applicable OE)
+OPEN,open
 O&M ,Operational and Maintenance
 O&MR ,Operational and Maintenance Reminders
 O&P  ,Operational & Programmatic
@@ -996,7 +997,7 @@ PE ,Professional Engineer
 PEG ,Procurement Engineering Group
 PEO ,Plant Equipment Operator
 PEP ,Performance Enhancement Program
-PESS…………………....,Personnel Entrance Search Station (Main Security)
+PESSï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½....,Personnel Entrance Search Station (Main Security)
 PFCD ,Preliminary Fuel Cycle Design
 PFRT ,Positive Flux Rate Trip
 PFSS ,Post Fire Safe Shutdown
@@ -1187,7 +1188,9 @@ Rx ,Reactor
 S ,South
 S&L ,Sargent & Lundy
 S.W.I.M.  ,"Stop, Warn, Isolate and Minimize"
+SD,Shutdown
 "S/D, SD ",Shutdown
+SG,Steam Generator
 "S/G, SG ",Steam Generator
 S/U ,Start Up
 SACF ,Single Active Component Failure
@@ -1361,6 +1364,7 @@ SWS ,Service Water System
 swyd ,switchyard
 sync ,synchronize
 sys ,system
+TC,Thermocouple
 "T/C, TC ",Thermocouple
 T/G ,Turning Gear
 T/R ,transmitter/receiver
@@ -1368,11 +1372,11 @@ TA ,Tagging Authority
 TAB ,Training Advisory Board
 TAC ,Training Advisory Committee
 tach ,tachometer
-TADOT…………………  ,Trip Actuating Device Operational Test
+TADOTï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½  ,Trip Actuating Device Operational Test
 TAHL ,Temperature Alarm High Level
 TAR ,Travel Authorization Request
 Tauct ,Temperature (auctioneered)
-"Tavg, Tavg ",Temperature (average)
+Tavg,Temperature (average)
 T-brg ,Thrust Bearing
 TBS ,Turbine Bypass System
 TC; Tcold; Tcold ,Temperature (cold)
@@ -1424,7 +1428,7 @@ TSA ,Technical Service Authorization
 TSC ,Technical Support Center
 TSEO ,Technical Specification Equipment Outage
 TSI ,Turbine Supervisory Instrumentation
-TSO…………………...,Treatment System Operator
+TSOï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½...,Treatment System Operator
 TSO,Transmission System Operator
 TSP ,Technical Support
 TSR ,Technical Surveillance Requirements
@@ -1441,7 +1445,7 @@ UF ,Underfrequency
 UHF ,ultrahigh frequency
 UHS ,Ultimate Heat Sink
 UI ,Under Instruction
-UL ,Underwriters’ Laboratories Inc.
+UL ,Underwritersï¿½ Laboratories Inc.
 UNID ,Unique Equipment Identifier
 UPS ,Uninterruptible Power Supply
 URAL ,Underexcited Reactive Ampere Limit
@@ -1517,3 +1521,22 @@ xmtr ,transmitter
 XOVER ,Crossover
 ZERO ,Zero Environmental Release Options
 ZPA ,Zero Period Acceleration
+STROKE,stroke
+RELIEF,relief
+ATMOS,atmos
+ISO,iso
+AIR,air
+BLEED-OFF,bleed-off
+CLOSED,closed
+CIRCLE,circle
+CTRL/MAIN,ctrl/main
+INDICATING,indicating
+VERIFICATION,verification
+CONTINUING,continuing
+VALVE,valve
+WHITE,white
+ISOLATION,isolation
+SIMULTANEOUSLY,simultaneously
+OPPOSITE,opposite
+RESULTS,results
+CYCLE,cycle
