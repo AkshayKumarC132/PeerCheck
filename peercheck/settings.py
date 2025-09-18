@@ -125,11 +125,11 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'initial.sqlite3',
+        'NAME': BASE_DIR / 'new_peercheck1.sqlite3',
     },
-    'default1y': {
+    'development': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'Peer Check',
+        'NAME': 'peercheck_dev',
         'USER': 'postgres',
         'PASSWORD': 'QP3HeJel62BPzPaq07uETezy',
         'HOST': 'e-commerce.cj3oddyv0bsk.us-west-1.rds.amazonaws.com',
@@ -196,21 +196,25 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_ALL_ORIGINS = True  # Enable all origins for development
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:4200",
+    "http://localhost:4222",
     "http://localhost:4400",
     "http://127.0.0.1:8000",
     'https://api.hask.app',
     'https://peercheck.hask.app',
     'http://192.168.56.1:8000',
-    'http://172.16.16.126:8000'
+    'http://172.16.16.126:8000',
+    'http://172.16.16.126:5000'
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://localhost:4200',
+    "http://localhost:4222",
     "http://localhost:4400",
-    'http://13.52.99.241:80'
+    'http://13.52.99.241:80',
     'https://api.hask.app',
     'https://peercheck.hask.app',
     'http://192.168.56.1:8000',
-    'http://172.16.16.126:8000'
+    'http://172.16.16.126:8000',
+    'http://172.16.16.126:5000'
 ]
 CORS_ALLOW_METHODS = ['DELETE', 'OPTIONS', 'PATCH', 'GET', 'POST', 'PUT']
 CORS_ALLOW_HEADERS = [
@@ -218,48 +222,28 @@ CORS_ALLOW_HEADERS = [
     'origin', 'user-agent', 'x-csrftoken', 'x-requested-with'
 ]
 
+AWS_S3_ACCESS_KEY_ID = ''
+AWS_S3_SECRET_ACCESS_KEY = ''
+AWS_STORAGE_BUCKET_NAME = ''
+AWS_S3_REGION_NAME = ''
 
+# File Upload Settings
+FILE_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
+DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB
 
-if os.name == 'nt':  # Windows-specific settings
-    LOGGING = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'handlers': {
-            'console': {
-                'class': 'logging.StreamHandler',
-            },
-            'file': {
-                'class': 'logging.FileHandler',
-                'filename': 'debug.log',
-            },
-        },
-        'loggers': {
-            'api.views': {
-                'handlers': ['console', 'file'],
-                'level': 'DEBUG',
-                'propagate': True,
-            },
-        },
-    }
-else: # Assuming Linux/Unix
-    LOGGING = {
-        'version': 1,
-        'disable_existing_loggers': False,
-        'handlers': {
-            'console': {
-                'class': 'logging.StreamHandler',
-            },
-            'file': {
-                'level': 'DEBUG',
-                'class': 'logging.FileHandler',
-                'filename': '/var/www/PeerCheck/logs/debug.log',  # Updated path for Linux
-            },
-        },
-        'loggers': {
-            'api.views': {
-                'handlers': ['console', 'file'],
-                'level': 'DEBUG',
-                'propagate': True,
-            },
-        },
-    }
+# Audio processing settings
+WHISPER_MODEL = "small.en"
+ALLOWED_TEXT_EXTENSIONS = {'pdf', 'docx', 'txt'}
+ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'mpeg', 'mp4'}
+
+# Hugging Face Token
+HF_TOKEN =''
+
+CELERY_BROKER_URL = 'redis://localhost:6379/0'
+CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
+CELERY_BEAT_SCHEDULE = {
+    'process-missing-diarizations-every-15-mins': {
+        'task': 'api.tasks.process_missing_diarizations',
+        'schedule': 900,  # 900 seconds = 15 minutes
+    },
+}

@@ -9,6 +9,7 @@ from .views import (ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDe
                     UserSettingsView, SystemSettingsView, AuditLogView,UserProfileDetailsView,
                     SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID)
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
+from . import new_enhnaced
 
 urlpatterns = [
     path('process-audio/<str:token>/', ProcessAudioView.as_view(), name='process-audio'),
@@ -55,4 +56,31 @@ urlpatterns = [
     path('speaker/<int:profile_id>/<str:token>/', SpeakerProfileUpdateView.as_view(), name='speaker-update'),
 
     path('audio/<str:token>/<int:audio_id>/generate-summary/', GenerateSummaryFromAudioID.as_view(), name='generate-summary-from-audio'),
+
+    # Upload and process audio with text document
+    path('upload/<str:token>/', 
+         new_enhnaced.UploadAndProcessView.as_view(), 
+         name='upload_and_process'),
+    
+    # Download processed DOCX with highlighted text
+    path('download/<str:token>/<str:session_id>/', 
+         new_enhnaced.DownloadProcessedDocumentView.as_view(), 
+         name='download_processed'),
+    
+    path('documents/upload/<str:token>/', new_enhnaced.UploadReferenceDocumentView.as_view(), name='document-upload'),
+
+    # Get user's documents and audio files
+    path('documents/<str:token>/', 
+         new_enhnaced.GetUserDocumentsView.as_view(), 
+         name='user_documents'),
+    
+    # Get specific processing session details
+    path('session/<str:token>/<uuid:session_id>/', 
+         new_enhnaced.GetProcessingSessionView.as_view(), 
+         name='get_session'),
+    
+    # Admin cleanup of expired sessions
+    path('cleanup/<str:token>/', 
+         new_enhnaced.CleanupExpiredSessionsView.as_view(), 
+         name='cleanup_sessions'),
 ]
