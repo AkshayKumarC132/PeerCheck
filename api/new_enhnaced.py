@@ -34,6 +34,9 @@ from pyannote.audio import Pipeline
 import subprocess
 import threading
 
+
+logger = logging.getLogger(__name__)
+
 class UploadAndProcessView(CreateAPIView):
     """
     Upload text and audio files to S3, process them, and return analysis results
@@ -638,19 +641,21 @@ class UploadReferenceDocumentView(CreateAPIView):
 
 
 class RunDiarizationView(GenericAPIView):
-    """Rerun speaker diarization for an existing audio file."""
+    """Rerun speaker diarization for an existing audio file asynchronously."""
 
     serializer_class = RunDiarizationSerializer
 
     @swagger_auto_schema(
         operation_description="Rerun diarization for a specific audio file",
         responses={
-            200: openapi.Response(
-                description="Diarization rerun completed",
+            202: openapi.Response(
+                description="Diarization rerun started in the background",
                 schema=openapi.Schema(
                     type=openapi.TYPE_OBJECT,
                     properties={
                         'audio_file_id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'status': openapi.Schema(type=openapi.TYPE_STRING),
+                        'detail': openapi.Schema(type=openapi.TYPE_STRING),
                         'diarization': openapi.Schema(type=openapi.TYPE_OBJECT),
                     },
                 ),
@@ -691,18 +696,34 @@ class RunDiarizationView(GenericAPIView):
             transcript_segments = transcript_result.get('segments', [])
             transcript_words = transcript_result.get('words', [])
 
-        diarization_result = diarization_from_audio(
-            audio_file.file_path, transcript_segments, transcript_words
-        )
-        audio_file.diarization = diarization_result
-        audio_file.save(update_fields=['diarization'])
+        def diarization_background(audio_file_id, audio_url, segments, words):
+            try:
+                diarization_result = diarization_from_audio(audio_url, segments, words)
+                AudioFile.objects.filter(id=audio_file_id).update(
+                    diarization=diarization_result,
+                    status='processed',
+                )
+            except Exception as exc:
+                logger.exception("Failed to rerun diarization for audio %s", audio_file_id)
+                AudioFile.objects.filter(id=audio_file_id).update(status='failed')
+
+        audio_file.status = 'processing'
+        audio_file.save(update_fields=['status'])
+
+        threading.Thread(
+            target=diarization_background,
+            args=(audio_file.id, audio_file.file_path, transcript_segments, transcript_words),
+            daemon=True,
+        ).start()
 
         return Response(
             {
                 'audio_file_id': str(audio_file.id),
-                'diarization': diarization_result,
+                'status': 'processing',
+                'detail': 'Diarization rerun has started in the background.',
+                'diarization': audio_file.diarization,
             },
-            status=status.HTTP_200_OK,
+            status=status.HTTP_202_ACCEPTED,
         )
 
 
