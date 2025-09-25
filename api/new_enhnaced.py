@@ -3,10 +3,12 @@ import tempfile
 import uuid
 import time
 import logging
+import threading
 from datetime import datetime, timedelta
 
 import numpy as np
 from django.conf import settings
+from django.db import close_old_connections
 from django.http import HttpResponse, Http404
 from django.utils import timezone
 from rest_framework import status
@@ -48,6 +50,31 @@ from .new_serializers import (
     RunDiarizationSerializer,
     SpeakerProfileMappingSerializer,
 )
+
+
+def _start_diarization_thread(audio_file_id, audio_source, transcript_segments, transcript_words):
+    """Kick off background diarization work for the given audio file."""
+
+    def _run_diarization():
+        close_old_connections()
+        try:
+            segments = diarization_from_audio(
+                audio_source,
+                transcript_segments,
+                transcript_words,
+            )
+            payload = {
+                "segments": segments,
+                "speakers": build_speaker_summary(segments),
+            }
+            AudioFile.objects.filter(id=audio_file_id).update(diarization=payload)
+        except Exception:
+            logging.exception("Failed to complete diarization for audio %s", audio_file_id)
+            AudioFile.objects.filter(id=audio_file_id).update(diarization=None)
+
+    thread = threading.Thread(target=_run_diarization, daemon=True)
+    thread.start()
+    return thread
 
 class UploadAndProcessView(CreateAPIView):
     """
@@ -172,23 +199,14 @@ class UploadAndProcessView(CreateAPIView):
             # --- Speaker Diarization (using diarization_from_audio) ---
             diarization_payload = None
             diarization_error = None
-            try:
-                diarization_segments = diarization_from_audio(
-                    audio_s3_url,
-                    transcript_segments,
-                    transcript_words,
-                )
-                diarization_payload = {
-                    'segments': diarization_segments,
-                    'speakers': build_speaker_summary(diarization_segments),
-                }
-                audio_obj.diarization = diarization_payload
-                audio_obj.save(update_fields=['transcription', 'diarization'])
-            except Exception as diar_err:
-                diarization_error = str(diar_err)
-                audio_obj.diarization = None
-                audio_obj.save(update_fields=['transcription', 'diarization'])
-                print(f"Diarization error: {diarization_error}")
+            audio_obj.diarization = None
+            audio_obj.save(update_fields=['diarization'])
+            _start_diarization_thread(
+                audio_obj.id,
+                audio_s3_url,
+                transcript_segments,
+                transcript_words,
+            )
             # --- End Speaker Diarization ---
             
             # Perform comparison analysis
@@ -233,7 +251,8 @@ class UploadAndProcessView(CreateAPIView):
                 'entire_document': entire_html,
                 'processing_time': round(processing_time, 2),
                 'diarization': diarization_payload,
-                'diarization_error': diarization_error
+                'diarization_error': diarization_error,
+                'diarization_status': 'processing' if diarization_payload is None else 'completed',
             }
 
             # Don't validate response data with serializer, just return it directly
@@ -290,30 +309,20 @@ class RunDiarizationView(CreateAPIView):
         transcript_segments = transcript.get('segments', [])
         transcript_words = transcript.get('words', [])
 
-        try:
-            diarization_segments = diarization_from_audio(
-                audio_file.file_path,
-                transcript_segments,
-                transcript_words,
-            )
-            diarization_payload = {
-                'segments': diarization_segments,
-                'speakers': build_speaker_summary(diarization_segments),
-            }
-            audio_file.diarization = diarization_payload
-            audio_file.save(update_fields=['diarization'])
+        audio_file.diarization = None
+        audio_file.save(update_fields=['diarization'])
 
-            return Response({
-                'audio_file_id': str(audio_file.id),
-                'diarization': diarization_payload,
-            }, status=status.HTTP_200_OK)
-        except Exception as exc:
-            audio_file.diarization = None
-            audio_file.save(update_fields=['diarization'])
-            return Response({
-                'error': f'Failed to run diarization: {str(exc)}',
-                'audio_file_id': str(audio_file.id),
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        _start_diarization_thread(
+            audio_file.id,
+            audio_file.file_path,
+            transcript_segments,
+            transcript_words,
+        )
+
+        return Response({
+            'audio_file_id': str(audio_file.id),
+            'status': 'processing',
+        }, status=status.HTTP_202_ACCEPTED)
 
 
 class SpeakerProfileMappingView(CreateAPIView):
