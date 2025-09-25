@@ -63,20 +63,28 @@ urlpatterns = [
          name='upload_and_process'),
     
     # Download processed DOCX with highlighted text
-    path('download/<str:token>/<str:session_id>/', 
-         new_enhnaced.DownloadProcessedDocumentView.as_view(), 
+    path('download/<str:token>/<str:session_id>/',
+         new_enhnaced.DownloadProcessedDocumentView.as_view(),
          name='download_processed'),
-    
+
     path('documents/upload/<str:token>/', new_enhnaced.UploadReferenceDocumentView.as_view(), name='document-upload'),
 
     # Get user's documents and audio files
-    path('documents/<str:token>/', 
-         new_enhnaced.GetUserDocumentsView.as_view(), 
+    path('documents/<str:token>/',
+         new_enhnaced.GetUserDocumentsView.as_view(),
          name='user_documents'),
-    
+
+    path('audio/<str:token>/diarization/run/',
+         new_enhnaced.RunDiarizationView.as_view(),
+         name='run-diarization'),
+
+    path('audio/<str:token>/diarization/map/',
+         new_enhnaced.SpeakerProfileMappingView.as_view(),
+         name='speaker-profile-map'),
+
     # Get specific processing session details
-    path('session/<str:token>/<uuid:session_id>/', 
-         new_enhnaced.GetProcessingSessionView.as_view(), 
+    path('session/<str:token>/<uuid:session_id>/',
+         new_enhnaced.GetProcessingSessionView.as_view(),
          name='get_session'),
     
     # Admin cleanup of expired sessions
