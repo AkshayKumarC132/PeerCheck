@@ -846,10 +846,10 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         aggregated_vectors: Dict[str, List[List[float]]] = {label: [] for label in speaker_segments_map}
         embedding_error: Optional[str] = None
 
+        waveform = None
+        sample_rate = None
         try:
             embedding_inference = _get_embedding_inference()
-            waveform = None
-            sample_rate = None
             try:
                 import torchaudio  # type: ignore
 
@@ -857,14 +857,33 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
             except Exception:  # pragma: no cover - torchaudio not always installed in tests
                 waveform = None
                 sample_rate = None
-        except Exception as exc:
-            embedding_error = f"pyannote initialization failed: {exc}"
-        else:
+
+            if waveform is None or sample_rate is None:
+                try:
+                    import soundfile as sf  # type: ignore
+                    import torch  # type: ignore
+
+                    audio, sample_rate = sf.read(wav_path)
+                    if audio.ndim == 1:
+                        audio = np.expand_dims(audio, axis=0)
+                    elif audio.ndim == 2:
+                        audio = audio.T
+                    waveform = torch.from_numpy(audio).float()
+                except Exception:
+                    waveform = None
+                    sample_rate = None
+
             try:
                 if waveform is not None and sample_rate is not None:
-                    file_descriptor = {"waveform": waveform, "sample_rate": sample_rate}
+                    if hasattr(waveform, "dim") and waveform.dim() == 1:
+                        waveform = waveform.unsqueeze(0)
+                    file_descriptor = {
+                        "uri": os.path.basename(wav_path),
+                        "audio": {"waveform": waveform, "sample_rate": sample_rate},
+                    }
                 else:
                     file_descriptor = {"uri": os.path.basename(wav_path), "audio": wav_path}
+
                 for segment in diarization_segments:
                     label = segment["speaker_label"]
                     audio_segment = PyannoteSegment(segment["start"], segment["end"])
@@ -876,13 +895,32 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                     aggregated_vectors.setdefault(label, []).append(vector)
             except Exception as exc:
                 embedding_error = f"pyannote embedding failed: {exc}"
+        except Exception as exc:
+            embedding_error = f"pyannote initialization failed: {exc}"
 
         if embedding_error:
             try:
-                if waveform is None or sample_rate is None:
-                    import torchaudio  # type: ignore
+                import torch  # type: ignore
 
-                    waveform, sample_rate = torchaudio.load(wav_path)
+                if waveform is None or sample_rate is None:
+                    try:
+                        import torchaudio  # type: ignore
+
+                        waveform, sample_rate = torchaudio.load(wav_path)
+                    except Exception:
+                        waveform = None
+                        sample_rate = None
+
+                if waveform is None or sample_rate is None:
+                    import soundfile as sf  # type: ignore
+
+                    audio, sample_rate = sf.read(wav_path)
+                    if audio.ndim == 1:
+                        audio = np.expand_dims(audio, axis=0)
+                    elif audio.ndim == 2:
+                        audio = audio.T
+                    waveform = torch.from_numpy(audio).float()
+
                 encoder = _get_speechbrain_encoder()
                 waveform = waveform.to(encoder.device)
 
@@ -915,7 +953,9 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                 embedding_error = None
             except Exception as fallback_exc:
                 fallback_message = f"speechbrain fallback failed: {fallback_exc}"
-                embedding_error = f"{embedding_error}; {fallback_message}" if embedding_error else fallback_message
+                embedding_error = (
+                    f"{embedding_error}; {fallback_message}" if embedding_error else fallback_message
+                )
 
         speakers_summary = []
         missing_vectors: List[str] = []
@@ -946,8 +986,12 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                     match_score = 1.0
             else:
                 missing_vectors.append(label)
+                profile = SpeakerProfile.objects.filter(name=label).first()
                 if profile is None:
-                    profile = SpeakerProfile.objects.filter(name=label).first()
+                    profile = SpeakerProfile.objects.create(name=label)
+                    logger.debug(
+                        "Created placeholder speaker profile %s for label %s", profile.id, label
+                    )
 
             if profile and not profile.name:
                 profile.name = label
