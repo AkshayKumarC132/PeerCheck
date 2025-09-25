@@ -679,10 +679,13 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             os.unlink(output_path)
 
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
+    import contextlib
     import requests
     import subprocess
+    import wave
 
     threshold = getattr(settings, "SPEAKER_MATCH_THRESHOLD", 0.8)
+    min_embed_duration = getattr(settings, "SPEAKER_EMBEDDING_MIN_DURATION", 0.8)
 
     # Download audio locally for processing
     local_audio_path = os.path.join(tempfile.gettempdir(), f"diar_{os.path.basename(audio_url)}")
@@ -705,6 +708,15 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
 
     diarization = _get_diarization_pipeline()(wav_path)
     embedding_inference = _get_embedding_inference()
+
+    audio_duration = None
+    try:
+        with contextlib.closing(wave.open(wav_path, "rb")) as wav_file:
+            frame_rate = wav_file.getframerate() or 1
+            audio_duration = wav_file.getnframes() / float(frame_rate)
+    except Exception:
+        logging.exception("Unable to determine audio duration for %s", wav_path)
+        audio_duration = None
     
     def get_segment_text_from_words(words, seg_start, seg_end, overlap_threshold=0.1):
         """
@@ -857,9 +869,32 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                 label_map[speaker] = f"SPEAKER_{label_index}"
                 label_index += 1
 
-            segment = Segment(seg_start, seg_end)
-            vector = embedding_inference.crop(wav_path, segment)
-            vector_list = vector.tolist() if vector is not None else None
+            requested_segment = Segment(seg_start, seg_end)
+            vector_list = None
+
+            try:
+                duration = seg_end - seg_start
+                target_segment = requested_segment
+
+                if duration < min_embed_duration and audio_duration:
+                    center = seg_start + (duration / 2.0)
+                    padded_start = max(0.0, center - min_embed_duration / 2.0)
+                    padded_end = min(audio_duration, padded_start + min_embed_duration)
+
+                    if padded_end - padded_start >= min_embed_duration * 0.5:
+                        target_segment = Segment(padded_start, padded_end)
+
+                if target_segment.duration > 0:
+                    vector = embedding_inference.crop(wav_path, target_segment)
+                    if vector is not None:
+                        vector_list = vector.tolist()
+            except Exception as exc:
+                logging.warning(
+                    "Skipping embedding for segment %.3f-%.3f: %s",
+                    seg_start,
+                    seg_end,
+                    exc,
+                )
 
             diarization_segments.append({
                 "speaker": label_map[speaker],
