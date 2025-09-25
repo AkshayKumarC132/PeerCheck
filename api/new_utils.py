@@ -911,16 +911,18 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
             if mean_vector is not None:
                 profile, match_score = find_best_speaker_profile(mean_vector, match_threshold)
 
-            if profile is None and mean_vector is not None:
+            if profile is None:
                 profile = SpeakerProfile.objects.filter(name=label).first()
                 if profile is None:
                     profile = SpeakerProfile.objects.create(name=label, embedding=mean_vector)
                     logger.debug("Created new speaker profile %s for label %s", profile.id, label)
-                else:
+                elif mean_vector is not None:
                     profile.embedding = mean_vector
                     profile.save(update_fields=["embedding", "updated_at"])
                     logger.debug("Updated existing speaker profile %s for label %s", profile.id, label)
-                match_score = 1.0
+
+                if match_score is None and mean_vector is not None:
+                    match_score = 1.0
 
             if profile and not profile.name:
                 profile.name = label
