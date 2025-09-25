@@ -890,23 +890,47 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
             label_vectors.setdefault(label, []).append(vec)
 
     matched_profiles: Dict[str, SpeakerProfile] = {}
+    label_means: Dict[str, List[float]] = {}
     for label, vectors in label_vectors.items():
         try:
-            mean_vec = np.mean(np.array(vectors, dtype=float), axis=0)
+            arr = np.array(vectors, dtype=float)
         except Exception:
             continue
-        if mean_vec is None:
+        if arr.size == 0:
             continue
-        profile = match_speaker_embedding(mean_vec.tolist(), threshold=threshold)
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            continue
+        mean_vec = np.mean(arr, axis=0)
+        if mean_vec is None or np.isnan(mean_vec).any() or np.isinf(mean_vec).any():
+            continue
+        mean_vec_list = mean_vec.tolist()
+        label_means[label] = mean_vec_list
+
+        profile = match_speaker_embedding(mean_vec_list, threshold=threshold)
         if profile:
             matched_profiles[label] = profile
+
+    # Persist new speaker profiles for unmatched speakers so they can be named later.
+    for label, mean_vec in label_means.items():
+        if label in matched_profiles:
+            continue
+        try:
+            profile = SpeakerProfile.objects.create(
+                embedding=mean_vec,
+            )
+        except Exception:
+            continue
+        matched_profiles[label] = profile
 
     for segment in diarization_segments:
         label = segment.get("speaker_label") or segment.get("speaker")
         profile = matched_profiles.get(label)
         if profile:
             segment["speaker"] = profile.name or label
+            segment["speaker_name"] = profile.name
             segment["speaker_profile_id"] = profile.id
+        else:
+            segment.setdefault("speaker_name", None)
 
     # Clean up
     if os.path.exists(wav_path):
@@ -937,9 +961,9 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
         entry['total_duration'] += float(seg.get('duration') or 0.0)
         if seg.get('speaker_profile_id'):
             entry['speaker_profile_id'] = seg['speaker_profile_id']
-            entry['speaker_name'] = seg.get('speaker')
+            entry['speaker_name'] = seg.get('speaker_name') or seg.get('speaker')
         elif entry['speaker_name'] is None:
-            entry['speaker_name'] = seg.get('speaker') if seg.get('speaker_profile_id') else None
+            entry['speaker_name'] = seg.get('speaker_name') or seg.get('speaker')
 
     for entry in summary.values():
         entry['total_duration'] = round(entry['total_duration'], 2)

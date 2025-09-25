@@ -372,6 +372,10 @@ class SpeakerProfileMappingView(CreateAPIView):
             np.array(seg.get('speaker_vector'), dtype=float)
             for seg in matched_segments if seg.get('speaker_vector')
         ]
+        vectors = [
+            vec for vec in vectors
+            if vec.size and not np.isnan(vec).any() and not np.isinf(vec).any()
+        ]
 
         if not vectors:
             return Response({
@@ -386,22 +390,30 @@ class SpeakerProfileMappingView(CreateAPIView):
                 'audio_file_id': str(audio_file.id),
             }, status=status.HTTP_400_BAD_REQUEST)
 
+        mean_vector_list = mean_vector.tolist()
+
+        if not profile_id:
+            profile_id = next(
+                (seg.get('speaker_profile_id') for seg in matched_segments if seg.get('speaker_profile_id')),
+                None,
+            )
+
         try:
             if profile_id:
                 profile = SpeakerProfile.objects.get(id=profile_id)
-                profile.embedding = mean_vector.tolist()
+                profile.embedding = mean_vector_list
                 profile.name = name or profile.name
                 profile.save()
             else:
                 profile = SpeakerProfile.objects.filter(name__iexact=name).first()
                 if profile:
-                    profile.embedding = mean_vector.tolist()
+                    profile.embedding = mean_vector_list
                     profile.name = name
                     profile.save()
                 else:
                     profile = SpeakerProfile.objects.create(
                         name=name or speaker_label,
-                        embedding=mean_vector.tolist(),
+                        embedding=mean_vector_list,
                     )
         except SpeakerProfile.DoesNotExist:
             return Response({
@@ -414,6 +426,7 @@ class SpeakerProfileMappingView(CreateAPIView):
             seg_label = seg.get('speaker_label') or seg.get('speaker')
             if seg_label == speaker_label:
                 seg['speaker'] = profile.name or speaker_label
+                seg['speaker_name'] = profile.name
                 seg['speaker_profile_id'] = profile.id
             updated_segments.append(seg)
 
