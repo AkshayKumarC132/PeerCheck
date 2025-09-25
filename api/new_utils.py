@@ -29,6 +29,9 @@ import fitz  # PyMuPDF
 from docx2pdf import convert
 
 from .speaker_utils import find_best_speaker_profile
+from .models import SpeakerProfile
+
+logger = logging.getLogger(__name__)
 
 # Load Whisper model once
 model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
@@ -896,6 +899,21 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
             match_score = None
             if mean_vector is not None:
                 profile, match_score = find_best_speaker_profile(mean_vector, match_threshold)
+
+            if profile is None and mean_vector is not None:
+                profile = SpeakerProfile.objects.filter(name=label).first()
+                if profile is None:
+                    profile = SpeakerProfile.objects.create(name=label, embedding=mean_vector)
+                    logger.debug("Created new speaker profile %s for label %s", profile.id, label)
+                else:
+                    profile.embedding = mean_vector
+                    profile.save(update_fields=["embedding", "updated_at"])
+                    logger.debug("Updated existing speaker profile %s for label %s", profile.id, label)
+                match_score = 1.0
+
+            if profile and not profile.name:
+                profile.name = label
+                profile.save(update_fields=["name", "updated_at"])
 
             display_name = profile.name if profile and profile.name else label
             for seg in segments:
