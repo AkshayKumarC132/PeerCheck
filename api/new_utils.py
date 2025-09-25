@@ -653,6 +653,24 @@ def _get_embedding_inference():
     return Inference(model, window="whole", device=device)
 
 
+@lru_cache()
+def _get_speechbrain_encoder():
+    from speechbrain.pretrained import EncoderClassifier
+
+    source = getattr(
+        settings,
+        "SPEECHBRAIN_SPKREC_SOURCE",
+        "speechbrain/spkrec-ecapa-voxceleb",
+    )
+    savedir = getattr(
+        settings,
+        "SPEECHBRAIN_SPKREC_SAVEDIR",
+        os.path.join(settings.BASE_DIR, "pretrained_models", "spkrec-ecapa-voxceleb"),
+    )
+    os.makedirs(savedir, exist_ok=True)
+    return EncoderClassifier.from_hparams(source=source, savedir=savedir)
+
+
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
     import os
     import subprocess
@@ -809,19 +827,62 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         try:
             audio_loader = _get_audio_loader()
             embedding_inference = _get_embedding_inference()
-            for segment in diarization_segments:
-                label = segment["speaker_label"]
-                audio_segment = PyannoteSegment(segment["start"], segment["end"])
-                waveform, sample_rate = audio_loader.crop(wav_path, audio_segment)
-                embedding = embedding_inference({
-                    "waveform": waveform,
-                    "sample_rate": sample_rate,
-                })
-                vector = np.array(embedding).squeeze().tolist()
-                segment["speaker_vector"] = vector
-                aggregated_vectors.setdefault(label, []).append(vector)
         except Exception as exc:
-            embedding_error = str(exc)
+            embedding_error = f"pyannote initialization failed: {exc}"
+        else:
+            try:
+                for segment in diarization_segments:
+                    label = segment["speaker_label"]
+                    audio_segment = PyannoteSegment(segment["start"], segment["end"])
+                    waveform, sample_rate = audio_loader.crop(wav_path, audio_segment)
+                    embedding = embedding_inference({
+                        "waveform": waveform,
+                        "sample_rate": sample_rate,
+                    })
+                    vector = np.array(embedding).squeeze().tolist()
+                    segment["speaker_vector"] = vector
+                    aggregated_vectors.setdefault(label, []).append(vector)
+            except Exception as exc:
+                embedding_error = f"pyannote embedding failed: {exc}"
+
+        if embedding_error:
+            try:
+                import torchaudio
+
+                encoder = _get_speechbrain_encoder()
+                waveform, sample_rate = torchaudio.load(wav_path)
+                waveform = waveform.to(encoder.device)
+
+                for segment in diarization_segments:
+                    label = segment["speaker_label"]
+                    start_sample = max(int(segment["start"] * sample_rate), 0)
+                    end_sample = min(int(segment["end"] * sample_rate), waveform.shape[1])
+                    if end_sample <= start_sample:
+                        continue
+
+                    segment_waveform = waveform[:, start_sample:end_sample]
+                    if segment_waveform.numel() == 0:
+                        continue
+
+                    if segment_waveform.dim() > 2:
+                        segment_waveform = segment_waveform.mean(dim=0)
+                    if segment_waveform.dim() == 2:
+                        segment_waveform = segment_waveform.mean(dim=0, keepdim=False)
+                    if segment_waveform.dim() == 1:
+                        segment_waveform = segment_waveform.unsqueeze(0)
+
+                    segment_waveform = segment_waveform.to(encoder.device)
+                    embedding_tensor = encoder.encode_batch(segment_waveform)
+                    vector = (
+                        embedding_tensor.squeeze().detach().cpu().numpy().astype(float).tolist()
+                    )
+                    segment["speaker_vector"] = vector
+                    aggregated_vectors.setdefault(label, []).append(vector)
+
+                embedding_error = None
+            except Exception as fallback_exc:
+                fallback_message = f"speechbrain fallback failed: {fallback_exc}"
+                embedding_error = f"{embedding_error}; {fallback_message}" if embedding_error else fallback_message
 
         speakers_summary = []
         match_threshold = float(getattr(settings, "SPEAKER_RECOGNITION_THRESHOLD", 0.8))
