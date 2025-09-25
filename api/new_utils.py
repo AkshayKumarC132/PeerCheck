@@ -641,13 +641,6 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             os.unlink(output_path)
 
 @lru_cache()
-def _get_audio_loader():
-    from pyannote.audio import Audio
-
-    return Audio(sample_rate=None, mono=True)
-
-
-@lru_cache()
 def _get_embedding_inference():
     from pyannote.audio import Inference, Model
 
@@ -660,6 +653,7 @@ def _get_embedding_inference():
 @lru_cache()
 def _get_speechbrain_encoder():
     from speechbrain.pretrained import EncoderClassifier
+    from huggingface_hub import snapshot_download
 
     source = getattr(
         settings,
@@ -672,7 +666,21 @@ def _get_speechbrain_encoder():
         os.path.join(settings.BASE_DIR, "pretrained_models", "spkrec-ecapa-voxceleb"),
     )
     os.makedirs(savedir, exist_ok=True)
-    return EncoderClassifier.from_hparams(source=source, savedir=savedir)
+    try:
+        return EncoderClassifier.from_hparams(source=source, savedir=savedir)
+    except OSError as exc:
+        winerror = getattr(exc, "winerror", None)
+        if winerror == 1314 or "privilege" in str(exc).lower():
+            token = getattr(settings, "HF_TOKEN", None)
+            snapshot_dir = snapshot_download(
+                repo_id=source,
+                local_dir=savedir,
+                cache_dir=savedir,
+                local_dir_use_symlinks=False,
+                token=token,
+            )
+            return EncoderClassifier.from_hparams(source=snapshot_dir, savedir=snapshot_dir)
+        raise
 
 
 @lru_cache()
@@ -839,21 +847,19 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         embedding_error: Optional[str] = None
 
         try:
-            audio_loader = _get_audio_loader()
             embedding_inference = _get_embedding_inference()
         except Exception as exc:
             embedding_error = f"pyannote initialization failed: {exc}"
         else:
             try:
+                file_descriptor = {"uri": os.path.basename(wav_path), "audio": wav_path}
                 for segment in diarization_segments:
                     label = segment["speaker_label"]
                     audio_segment = PyannoteSegment(segment["start"], segment["end"])
-                    waveform, sample_rate = audio_loader.crop(wav_path, audio_segment)
-                    embedding = embedding_inference({
-                        "waveform": waveform,
-                        "sample_rate": sample_rate,
-                    })
-                    vector = np.array(embedding).squeeze().tolist()
+                    embedding = embedding_inference.crop(file_descriptor, audio_segment)
+                    if hasattr(embedding, "data"):
+                        embedding = embedding.data
+                    vector = np.array(embedding, dtype=float).squeeze().tolist()
                     segment["speaker_vector"] = vector
                     aggregated_vectors.setdefault(label, []).append(vector)
             except Exception as exc:
