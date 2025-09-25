@@ -30,7 +30,6 @@ from .new_serializers import (
 )
 from .speaker_utils import find_best_speaker_profile
 import requests
-from pyannote.audio import Pipeline
 import subprocess
 import threading
 

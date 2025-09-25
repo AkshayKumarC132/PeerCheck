@@ -4,6 +4,7 @@ import string
 import tempfile
 import csv
 import logging
+import threading
 from functools import lru_cache
 from typing import Dict, List, Optional
 
@@ -674,12 +675,24 @@ def _get_speechbrain_encoder():
     return EncoderClassifier.from_hparams(source=source, savedir=savedir)
 
 
+@lru_cache()
+def _get_diarization_pipeline():
+    from pyannote.audio import Pipeline
+
+    model_name = getattr(
+        settings, "PYANNOTE_DIARIZATION_MODEL", "pyannote/speaker-diarization-3.1"
+    )
+    return Pipeline.from_pretrained(model_name, use_auth_token=settings.HF_TOKEN)
+
+
+_DIARIZATION_PIPELINE_LOCK = threading.Lock()
+
+
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
     import os
     import subprocess
     import tempfile
     import requests
-    from pyannote.audio import Pipeline
     from pyannote.core import Segment as PyannoteSegment
 
     # Download audio
@@ -698,11 +711,9 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         os.unlink(local_audio_path)
 
     try:
-        pipeline = Pipeline.from_pretrained(
-            "pyannote/speaker-diarization-3.1",
-            use_auth_token=settings.HF_TOKEN,
-        )
-        diarization = pipeline(wav_path)
+        pipeline = _get_diarization_pipeline()
+        with _DIARIZATION_PIPELINE_LOCK:
+            diarization = pipeline(wav_path)
 
         def get_segment_text_from_words(words, seg_start, seg_end, overlap_threshold=0.1):
             """Extract text from words that overlap with the diarization segment."""
