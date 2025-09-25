@@ -848,11 +848,23 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
 
         try:
             embedding_inference = _get_embedding_inference()
+            waveform = None
+            sample_rate = None
+            try:
+                import torchaudio  # type: ignore
+
+                waveform, sample_rate = torchaudio.load(wav_path)
+            except Exception:  # pragma: no cover - torchaudio not always installed in tests
+                waveform = None
+                sample_rate = None
         except Exception as exc:
             embedding_error = f"pyannote initialization failed: {exc}"
         else:
             try:
-                file_descriptor = {"uri": os.path.basename(wav_path), "audio": wav_path}
+                if waveform is not None and sample_rate is not None:
+                    file_descriptor = {"waveform": waveform, "sample_rate": sample_rate}
+                else:
+                    file_descriptor = {"uri": os.path.basename(wav_path), "audio": wav_path}
                 for segment in diarization_segments:
                     label = segment["speaker_label"]
                     audio_segment = PyannoteSegment(segment["start"], segment["end"])
@@ -867,10 +879,11 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
 
         if embedding_error:
             try:
-                import torchaudio
+                if waveform is None or sample_rate is None:
+                    import torchaudio  # type: ignore
 
+                    waveform, sample_rate = torchaudio.load(wav_path)
                 encoder = _get_speechbrain_encoder()
-                waveform, sample_rate = torchaudio.load(wav_path)
                 waveform = waveform.to(encoder.device)
 
                 for segment in diarization_segments:
@@ -933,6 +946,8 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                     match_score = 1.0
             else:
                 missing_vectors.append(label)
+                if profile is None:
+                    profile = SpeakerProfile.objects.filter(name=label).first()
 
             if profile and not profile.name:
                 profile.name = label
