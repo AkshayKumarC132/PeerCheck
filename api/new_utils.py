@@ -899,30 +899,34 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                 embedding_error = f"{embedding_error}; {fallback_message}" if embedding_error else fallback_message
 
         speakers_summary = []
+        missing_vectors: List[str] = []
         match_threshold = float(getattr(settings, "SPEAKER_RECOGNITION_THRESHOLD", 0.8))
         for label, segments in speaker_segments_map.items():
-            vectors = aggregated_vectors.get(label, [])
+            vectors = aggregated_vectors.get(label) or []
             mean_vector = None
             if vectors:
                 mean_vector = np.mean(np.array(vectors, dtype=float), axis=0).tolist()
 
             profile = None
             match_score = None
+
             if mean_vector is not None:
                 profile, match_score = find_best_speaker_profile(mean_vector, match_threshold)
 
-            if profile is None:
-                profile = SpeakerProfile.objects.filter(name=label).first()
                 if profile is None:
-                    profile = SpeakerProfile.objects.create(name=label, embedding=mean_vector)
-                    logger.debug("Created new speaker profile %s for label %s", profile.id, label)
-                elif mean_vector is not None:
-                    profile.embedding = mean_vector
-                    profile.save(update_fields=["embedding", "updated_at"])
-                    logger.debug("Updated existing speaker profile %s for label %s", profile.id, label)
+                    profile = SpeakerProfile.objects.filter(name=label).first()
+                    if profile is None:
+                        profile = SpeakerProfile.objects.create(name=label, embedding=mean_vector)
+                        logger.debug("Created new speaker profile %s for label %s", profile.id, label)
+                    else:
+                        profile.embedding = mean_vector
+                        profile.save(update_fields=["embedding", "updated_at"])
+                        logger.debug("Updated existing speaker profile %s for label %s", profile.id, label)
 
-                if match_score is None and mean_vector is not None:
+                if match_score is None:
                     match_score = 1.0
+            else:
+                missing_vectors.append(label)
 
             if profile and not profile.name:
                 profile.name = label
@@ -944,6 +948,13 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
                     "match_score": match_score,
                 }
             )
+
+        if missing_vectors:
+            missing_msg = "missing embeddings for labels: " + ", ".join(sorted(missing_vectors))
+            if embedding_error:
+                embedding_error = f"{embedding_error}; {missing_msg}"
+            else:
+                embedding_error = missing_msg
 
         diarization_result: Dict[str, object] = {
             "segments": diarization_segments,

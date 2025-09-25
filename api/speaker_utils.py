@@ -20,6 +20,8 @@ def find_best_speaker_profile(
     best_profile = None
     best_score = 0.0
     for profile in SpeakerProfile.objects.all():
+        if not profile.embedding:
+            continue
         score = _cosine_similarity(embedding, profile.embedding)
         if score > best_score:
             best_score = score
