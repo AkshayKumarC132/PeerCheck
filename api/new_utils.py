@@ -917,6 +917,7 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         try:
             profile = SpeakerProfile.objects.create(
                 embedding=mean_vec,
+                name=label,
             )
         except Exception:
             continue
