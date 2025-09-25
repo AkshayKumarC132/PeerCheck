@@ -13,7 +13,7 @@ from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 import traceback
-from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, AuditLog
+from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, AuditLog, SpeakerProfile
 from .new_utils import (
     extract_text_from_s3, transcribe_audio_from_s3, diarization_from_audio,  # <-- add diarization_from_audio
     find_missing, upload_file_to_s3,
@@ -25,8 +25,10 @@ from .new_serializers import (
     DownloadRequestSerializer, UserDocumentsSerializer,
     CleanupRequestSerializer, CleanupResponseSerializer,
     ErrorResponseSerializer, ProcessingSessionDetailSerializer,
-    ReferenceDocumentSerializer
+    ReferenceDocumentSerializer, RunDiarizationSerializer,
+    SpeakerProfileMappingSerializer
 )
+from .speaker_utils import find_best_speaker_profile
 import requests
 from pyannote.audio import Pipeline
 import subprocess
@@ -153,7 +155,7 @@ class UploadAndProcessView(CreateAPIView):
             audio_obj.save()
 
             # --- Speaker Diarization (using diarization_from_audio) ---
-            diarization_segments = []
+            diarization_result = None
             diarization_error = None
             # try:
             #     diarization_segments = diarization_from_audio(audio_s3_url, transcript_segments, transcript_words)
@@ -226,7 +228,7 @@ class UploadAndProcessView(CreateAPIView):
                 'missing_content': missing_html,
                 'entire_document': entire_html,
                 'processing_time': round(processing_time, 2),
-                'diarization': diarization_segments if diarization_segments else None,
+                'diarization': diarization_result,
                 'diarization_error': diarization_error
             }
 
@@ -633,3 +635,251 @@ class UploadReferenceDocumentView(CreateAPIView):
                 'error': f'Processing failed: {str(e)}',
                 'timestamp': timezone.now().isoformat()  # Convert datetime to string
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class RunDiarizationView(GenericAPIView):
+    """Rerun speaker diarization for an existing audio file."""
+
+    serializer_class = RunDiarizationSerializer
+
+    @swagger_auto_schema(
+        operation_description="Rerun diarization for a specific audio file",
+        responses={
+            200: openapi.Response(
+                description="Diarization rerun completed",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'audio_file_id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'diarization': openapi.Schema(type=openapi.TYPE_OBJECT),
+                    },
+                ),
+            ),
+            400: ErrorResponseSerializer,
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+            404: ErrorResponseSerializer,
+        },
+    )
+    def post(self, request, token, *args, **kwargs):
+        auth_result = token_verification(token)
+        if auth_result['status'] != 200:
+            return Response({'error': auth_result['error']}, status=status.HTTP_401_UNAUTHORIZED)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = auth_result['user']
+        audio_id = serializer.validated_data['audio_id']
+
+        try:
+            audio_file = AudioFile.objects.get(id=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({'error': 'Audio file not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if audio_file.user and audio_file.user != user and not user.is_staff:
+            return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        transcript = audio_file.transcription or {}
+        transcript_segments = transcript.get('segments', [])
+        transcript_words = transcript.get('words', [])
+
+        if not transcript_segments and not transcript_words:
+            transcript_result = transcribe_audio_from_s3(audio_file.file_path)
+            audio_file.transcription = transcript_result
+            audio_file.save(update_fields=['transcription'])
+            transcript_segments = transcript_result.get('segments', [])
+            transcript_words = transcript_result.get('words', [])
+
+        diarization_result = diarization_from_audio(
+            audio_file.file_path, transcript_segments, transcript_words
+        )
+        audio_file.diarization = diarization_result
+        audio_file.save(update_fields=['diarization'])
+
+        return Response(
+            {
+                'audio_file_id': str(audio_file.id),
+                'diarization': diarization_result,
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class SpeakerProfileMappingView(GenericAPIView):
+    """Create or update speaker profiles based on diarization output."""
+
+    serializer_class = SpeakerProfileMappingSerializer
+
+    @staticmethod
+    def _mean_vector(vectors):
+        valid_vectors = [
+            [float(v) for v in vec]
+            for vec in vectors
+            if isinstance(vec, (list, tuple)) and vec
+        ]
+        if not valid_vectors:
+            return None
+
+        length = len(valid_vectors[0])
+        accum = [0.0] * length
+        count = 0
+        for vec in valid_vectors:
+            if len(vec) != length:
+                continue
+            accum = [a + v for a, v in zip(accum, vec)]
+            count += 1
+
+        if not count:
+            return None
+
+        return [value / count for value in accum]
+
+    @swagger_auto_schema(
+        operation_description="Assign friendly speaker names to diarization results",
+        responses={
+            200: openapi.Response(
+                description="Speaker profiles updated",
+                schema=openapi.Schema(
+                    type=openapi.TYPE_OBJECT,
+                    properties={
+                        'audio_file_id': openapi.Schema(type=openapi.TYPE_STRING),
+                        'diarization': openapi.Schema(type=openapi.TYPE_OBJECT),
+                        'updated_labels': openapi.Schema(
+                            type=openapi.TYPE_ARRAY,
+                            items=openapi.Schema(type=openapi.TYPE_STRING),
+                        ),
+                    },
+                ),
+            ),
+            400: ErrorResponseSerializer,
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+            404: ErrorResponseSerializer,
+        },
+    )
+    def post(self, request, token, *args, **kwargs):
+        auth_result = token_verification(token)
+        if auth_result['status'] != 200:
+            return Response({'error': auth_result['error']}, status=status.HTTP_401_UNAUTHORIZED)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        user = auth_result['user']
+        audio_id = serializer.validated_data['audio_id']
+
+        try:
+            audio_file = AudioFile.objects.get(id=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({'error': 'Audio file not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if audio_file.user and audio_file.user != user and not user.is_staff:
+            return Response({'error': 'Access denied'}, status=status.HTTP_403_FORBIDDEN)
+
+        diarization_data = audio_file.diarization or {}
+        if not isinstance(diarization_data, dict) or 'segments' not in diarization_data:
+            return Response(
+                {'error': 'Diarization data unavailable. Please rerun diarization first.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        segments = diarization_data.get('segments') or []
+        if not segments:
+            return Response({'error': 'No diarization segments available.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        speakers_summary = diarization_data.get('speakers') or []
+        summary_by_label = {
+            entry.get('label'): dict(entry)
+            for entry in speakers_summary
+            if entry.get('label')
+        }
+
+        if not summary_by_label:
+            for segment in segments:
+                label = segment.get('speaker_label')
+                if label and label not in summary_by_label:
+                    summary_by_label[label] = {
+                        'label': label,
+                        'name': segment.get('speaker', label),
+                        'profile_id': segment.get('speaker_profile_id'),
+                        'embedding': segment.get('speaker_vector'),
+                        'match_score': None,
+                    }
+
+        match_threshold = float(getattr(settings, 'SPEAKER_RECOGNITION_THRESHOLD', 0.8))
+        updated_labels = []
+
+        for mapping in serializer.validated_data['speakers']:
+            label = mapping['label']
+            target_name = mapping['name'].strip()
+            requested_profile_id = mapping.get('profile_id')
+
+            summary = summary_by_label.get(label)
+            if summary is None:
+                return Response({'error': f'Unknown speaker label: {label}'}, status=status.HTTP_400_BAD_REQUEST)
+
+            embedding = summary.get('embedding')
+            if embedding is None:
+                vectors = [
+                    seg.get('speaker_vector')
+                    for seg in segments
+                    if seg.get('speaker_label') == label and seg.get('speaker_vector')
+                ]
+                embedding = self._mean_vector(vectors)
+
+            if embedding is None:
+                return Response(
+                    {'error': f'No voice embedding available for {label}. Please rerun diarization.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            profile = None
+            if requested_profile_id:
+                profile = SpeakerProfile.objects.filter(id=requested_profile_id).first()
+                if profile is None:
+                    return Response({'error': 'Specified speaker profile not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+            if profile is None and summary.get('profile_id'):
+                profile = SpeakerProfile.objects.filter(id=summary['profile_id']).first()
+
+            if profile is None:
+                profile, _ = find_best_speaker_profile(embedding, match_threshold)
+
+            if profile is None:
+                profile = SpeakerProfile.objects.create(name=target_name, embedding=embedding)
+            else:
+                profile.name = target_name
+                profile.embedding = embedding
+                profile.save()
+
+            summary.update(
+                {
+                    'label': label,
+                    'name': profile.name or target_name,
+                    'profile_id': profile.id,
+                    'embedding': embedding,
+                }
+            )
+            updated_labels.append(label)
+
+            for segment in segments:
+                if segment.get('speaker_label') == label:
+                    segment['speaker'] = profile.name or target_name
+                    segment['speaker_profile_id'] = profile.id
+                    if segment.get('speaker_vector') is None:
+                        segment['speaker_vector'] = embedding
+
+        diarization_data['segments'] = segments
+        diarization_data['speakers'] = list(summary_by_label.values())
+        audio_file.diarization = diarization_data
+        audio_file.save(update_fields=['diarization'])
+
+        return Response(
+            {
+                'audio_file_id': str(audio_file.id),
+                'diarization': diarization_data,
+                'updated_labels': updated_labels,
+            },
+            status=status.HTTP_200_OK,
+        )

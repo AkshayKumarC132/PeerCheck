@@ -4,7 +4,11 @@ import string
 import tempfile
 import csv
 import logging
+from functools import lru_cache
+from typing import Dict, List, Optional
+
 import boto3
+import numpy as np
 from peercheck import settings
 from pdf2docx import Converter
 import whisper
@@ -23,6 +27,8 @@ from docx.enum.text import WD_COLOR_INDEX
 from docx.shared import RGBColor
 import fitz  # PyMuPDF
 from docx2pdf import convert
+
+from .speaker_utils import find_best_speaker_profile
 
 # Load Whisper model once
 model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
@@ -630,11 +636,31 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
         if output_path and os.path.exists(output_path) and is_s3_url: # Keep local file if not using S3
             os.unlink(output_path)
 
+@lru_cache()
+def _get_audio_loader():
+    from pyannote.audio import Audio
+
+    return Audio(sample_rate=None, mono=True)
+
+
+@lru_cache()
+def _get_embedding_inference():
+    from pyannote.audio import Inference, Model
+
+    model_name = getattr(settings, "PYANNOTE_EMBEDDING_MODEL", "pyannote/embedding")
+    device = getattr(settings, "PYANNOTE_DEVICE", "cpu")
+    model = Model.from_pretrained(model_name, use_auth_token=settings.HF_TOKEN)
+    return Inference(model, window="whole", device=device)
+
+
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
-    import requests, tempfile, os, subprocess
+    import os
+    import subprocess
+    import tempfile
+    import requests
     from pyannote.audio import Pipeline
-    from django.conf import settings
-    
+    from pyannote.core import Segment as PyannoteSegment
+
     # Download audio
     local_audio_path = os.path.join(tempfile.gettempdir(), f"diar_{os.path.basename(audio_url)}")
     with requests.get(audio_url, stream=True) as r:
@@ -642,167 +668,203 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         with open(local_audio_path, 'wb') as f:
             for chunk in r.iter_content(chunk_size=8192):
                 f.write(chunk)
-    
-    # Convert to wav if needed
+
     wav_path = local_audio_path
     if not local_audio_path.lower().endswith('.wav'):
         wav_path = local_audio_path.rsplit('.', 1)[0] + '.wav'
-        command = [
-            'ffmpeg', '-y', '-i', local_audio_path,
-            '-ar', '16000', '-ac', '1', wav_path
-        ]
+        command = ['ffmpeg', '-y', '-i', local_audio_path, '-ar', '16000', '-ac', '1', wav_path]
         subprocess.run(command, check=True)
         os.unlink(local_audio_path)
-    
-    # Run diarization
-    pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        use_auth_token=settings.HF_TOKEN
-    )
-    diarization = pipeline(wav_path)
-    
-    def get_segment_text_from_words(words, seg_start, seg_end, overlap_threshold=0.1):
-        """
-        Extract text from words that overlap with the diarization segment.
-        Uses overlap threshold to handle timing misalignments.
-        """
-        segment_words = []
-        
-        for word in words:
-            word_start = word.get('start')
-            word_end = word.get('end')
-            
-            if word_start is None or word_end is None:
-                continue
-            
-            # Calculate overlap between word and diarization segment
-            overlap_start = max(word_start, seg_start)
-            overlap_end = min(word_end, seg_end)
-            
-            if overlap_end > overlap_start:
-                # Calculate overlap percentage relative to word duration
-                word_duration = word_end - word_start
-                overlap_duration = overlap_end - overlap_start
-                
-                if word_duration > 0:
-                    overlap_percentage = overlap_duration / word_duration
-                    
-                    # Include word if it has significant overlap
-                    if overlap_percentage >= overlap_threshold:
-                        segment_words.append({
-                            'word': word.get('word', '').strip(),
-                            'start': word_start,
-                            'confidence': word.get('confidence', 1.0)
-                        })
-        
-        # Sort by start time and join
-        segment_words.sort(key=lambda x: x['start'])
-        return " ".join(w['word'] for w in segment_words if w['word'])
-    
-    def get_segment_text_from_segments(segments, seg_start, seg_end, overlap_threshold=0.3):
-        """
-        Extract text from transcript segments that overlap with the diarization segment.
-        """
-        segment_texts = []
-        
-        for segment in segments:
-            s_start = segment.get('start')
-            s_end = segment.get('end')
-            
-            if s_start is None or s_end is None:
-                continue
-            
-            # Calculate overlap
-            overlap_start = max(s_start, seg_start)
-            overlap_end = min(s_end, seg_end)
-            
-            if overlap_end > overlap_start:
-                segment_duration = s_end - s_start
-                overlap_duration = overlap_end - overlap_start
-                
-                if segment_duration > 0:
-                    overlap_percentage = overlap_duration / segment_duration
-                    
-                    # Include segment if it has significant overlap
-                    if overlap_percentage >= overlap_threshold:
-                        segment_texts.append({
-                            'text': segment.get('text', '').strip(),
-                            'start': s_start
-                        })
-        
-        # Sort by start time and join
-        segment_texts.sort(key=lambda x: x['start'])
-        return " ".join(t['text'] for t in segment_texts if t['text'])
-    
-    def merge_consecutive_same_speaker_segments(segments, max_gap=1.0):
-        """
-        Merge consecutive segments from the same speaker if they're close together.
-        """
-        if not segments:
-            return segments
-        
-        merged = []
-        current_segment = segments[0].copy()
-        
-        for i in range(1, len(segments)):
-            next_segment = segments[i]
-            
-            # Check if same speaker and segments are close
-            if (current_segment['speaker'] == next_segment['speaker'] and 
-                next_segment['start'] - current_segment['end'] <= max_gap):
-                
-                # Merge segments
-                current_segment['end'] = next_segment['end']
-                if next_segment['text'].strip():
-                    if current_segment['text'].strip():
-                        current_segment['text'] += " " + next_segment['text']
-                    else:
-                        current_segment['text'] = next_segment['text']
+
+    try:
+        pipeline = Pipeline.from_pretrained(
+            "pyannote/speaker-diarization-3.1",
+            use_auth_token=settings.HF_TOKEN,
+        )
+        diarization = pipeline(wav_path)
+
+        def get_segment_text_from_words(words, seg_start, seg_end, overlap_threshold=0.1):
+            """Extract text from words that overlap with the diarization segment."""
+
+            segment_words = []
+            for word in words:
+                word_start = word.get('start')
+                word_end = word.get('end')
+                if word_start is None or word_end is None:
+                    continue
+
+                overlap_start = max(word_start, seg_start)
+                overlap_end = min(word_end, seg_end)
+                if overlap_end > overlap_start:
+                    word_duration = word_end - word_start
+                    overlap_duration = overlap_end - overlap_start
+                    if word_duration > 0:
+                        overlap_percentage = overlap_duration / word_duration
+                        if overlap_percentage >= overlap_threshold:
+                            segment_words.append({
+                                'word': word.get('word', '').strip(),
+                                'start': word_start,
+                                'confidence': word.get('confidence', 1.0),
+                            })
+
+            segment_words.sort(key=lambda x: x['start'])
+            return " ".join(w['word'] for w in segment_words if w['word'])
+
+        def get_segment_text_from_segments(segments, seg_start, seg_end, overlap_threshold=0.3):
+            """Extract text from transcript segments that overlap with the diarization segment."""
+
+            segment_texts = []
+            for segment in segments:
+                s_start = segment.get('start')
+                s_end = segment.get('end')
+                if s_start is None or s_end is None:
+                    continue
+
+                overlap_start = max(s_start, seg_start)
+                overlap_end = min(s_end, seg_end)
+                if overlap_end > overlap_start:
+                    segment_duration = s_end - s_start
+                    overlap_duration = overlap_end - overlap_start
+                    if segment_duration > 0:
+                        overlap_percentage = overlap_duration / segment_duration
+                        if overlap_percentage >= overlap_threshold:
+                            segment_texts.append({
+                                'text': segment.get('text', '').strip(),
+                                'start': s_start,
+                            })
+
+            segment_texts.sort(key=lambda x: x['start'])
+            return " ".join(t['text'] for t in segment_texts if t['text'])
+
+        def merge_consecutive_same_speaker_segments(segments, max_gap=1.0):
+            """Merge consecutive segments from the same speaker if they're close together."""
+
+            if not segments:
+                return segments
+
+            merged = []
+            current_segment = segments[0].copy()
+
+            for i in range(1, len(segments)):
+                next_segment = segments[i]
+                if (
+                    current_segment['speaker'] == next_segment['speaker']
+                    and next_segment['start'] - current_segment['end'] <= max_gap
+                ):
+                    current_segment['end'] = next_segment['end']
+                    if next_segment['text'].strip():
+                        if current_segment['text'].strip():
+                            current_segment['text'] += " " + next_segment['text']
+                        else:
+                            current_segment['text'] = next_segment['text']
+                else:
+                    merged.append(current_segment)
+                    current_segment = next_segment.copy()
+
+            merged.append(current_segment)
+            return merged
+
+        diarization_segments: List[Dict] = []
+        for turn, _, speaker in diarization.itertracks(yield_label=True):
+            seg_start = float(turn.start)
+            seg_end = float(turn.end)
+            if transcript_words:
+                segment_text = get_segment_text_from_words(transcript_words, seg_start, seg_end)
             else:
-                # Different speaker or gap too large, save current and start new
-                merged.append(current_segment)
-                current_segment = next_segment.copy()
-        
-        # Add the last segment
-        merged.append(current_segment)
-        return merged
-    
-    # Process diarization results
-    diarization_segments = []
-    
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        seg_start = float(turn.start)
-        seg_end = float(turn.end)
-        
-        # Extract text using the appropriate method
-        if transcript_words:
-            segment_text = get_segment_text_from_words(transcript_words, seg_start, seg_end)
-        else:
-            segment_text = get_segment_text_from_segments(transcript_segments, seg_start, seg_end)
-        
-        # Only add segments with actual content or significant duration
-        if segment_text.strip() or (seg_end - seg_start) > 0.5:
-            diarization_segments.append({
-                "speaker": speaker,
-                "start": seg_start,
-                "end": seg_end,
-                "text": segment_text.strip(),
-                "duration": round(seg_end - seg_start, 2)
-            })
-    
-    # Merge consecutive segments from the same speaker
-    diarization_segments = merge_consecutive_same_speaker_segments(diarization_segments)
-    
-    # Filter out very short segments with no text
-    diarization_segments = [
-        seg for seg in diarization_segments 
-        if seg['text'].strip() or seg['duration'] > 1.0
-    ]
-    
-    # Clean up
-    os.unlink(wav_path)
-    
-    return diarization_segments
+                segment_text = get_segment_text_from_segments(transcript_segments, seg_start, seg_end)
+
+            if segment_text.strip() or (seg_end - seg_start) > 0.5:
+                diarization_segments.append(
+                    {
+                        "speaker": speaker,
+                        "raw_speaker": speaker,
+                        "start": seg_start,
+                        "end": seg_end,
+                        "text": segment_text.strip(),
+                        "duration": round(seg_end - seg_start, 2),
+                    }
+                )
+
+        diarization_segments = merge_consecutive_same_speaker_segments(diarization_segments)
+        diarization_segments = [
+            seg for seg in diarization_segments if seg['text'].strip() or seg['duration'] > 1.0
+        ]
+
+        speaker_label_map: Dict[str, str] = {}
+        speaker_segments_map: Dict[str, List[Dict]] = {}
+        for segment in diarization_segments:
+            raw_label = segment.get("raw_speaker", segment.get("speaker"))
+            if raw_label not in speaker_label_map:
+                speaker_label_map[raw_label] = f"SPEAKER_{len(speaker_label_map)}"
+            label = speaker_label_map[raw_label]
+            segment["speaker_label"] = label
+            segment["speaker_profile_id"] = None
+            segment.setdefault("speaker_vector", None)
+            segment["speaker"] = label
+            speaker_segments_map.setdefault(label, []).append(segment)
+
+        aggregated_vectors: Dict[str, List[List[float]]] = {label: [] for label in speaker_segments_map}
+        embedding_error: Optional[str] = None
+
+        try:
+            audio_loader = _get_audio_loader()
+            embedding_inference = _get_embedding_inference()
+            for segment in diarization_segments:
+                label = segment["speaker_label"]
+                audio_segment = PyannoteSegment(segment["start"], segment["end"])
+                waveform, sample_rate = audio_loader.crop(wav_path, audio_segment)
+                embedding = embedding_inference({
+                    "waveform": waveform,
+                    "sample_rate": sample_rate,
+                })
+                vector = np.array(embedding).squeeze().tolist()
+                segment["speaker_vector"] = vector
+                aggregated_vectors.setdefault(label, []).append(vector)
+        except Exception as exc:
+            embedding_error = str(exc)
+
+        speakers_summary = []
+        match_threshold = float(getattr(settings, "SPEAKER_RECOGNITION_THRESHOLD", 0.8))
+        for label, segments in speaker_segments_map.items():
+            vectors = aggregated_vectors.get(label, [])
+            mean_vector = None
+            if vectors:
+                mean_vector = np.mean(np.array(vectors, dtype=float), axis=0).tolist()
+
+            profile = None
+            match_score = None
+            if mean_vector is not None:
+                profile, match_score = find_best_speaker_profile(mean_vector, match_threshold)
+
+            display_name = profile.name if profile and profile.name else label
+            for seg in segments:
+                if mean_vector is not None and seg.get("speaker_vector") is None:
+                    seg["speaker_vector"] = mean_vector
+                seg["speaker"] = display_name
+                seg["speaker_profile_id"] = profile.id if profile else None
+
+            speakers_summary.append(
+                {
+                    "label": label,
+                    "name": display_name,
+                    "profile_id": profile.id if profile else None,
+                    "embedding": mean_vector,
+                    "match_score": match_score,
+                }
+            )
+
+        diarization_result: Dict[str, object] = {
+            "segments": diarization_segments,
+            "speakers": speakers_summary,
+        }
+
+        if embedding_error:
+            diarization_result["warnings"] = {"speaker_embedding": embedding_error}
+
+        return diarization_result
+    finally:
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
 
 
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---

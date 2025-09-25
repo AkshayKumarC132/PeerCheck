@@ -1,6 +1,6 @@
 import numpy as np
 from numpy.linalg import norm
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 from .models import SpeakerProfile
 
@@ -13,8 +13,10 @@ def _cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return float(np.dot(a, b) / (norm(a) * norm(b)))
 
 
-def match_speaker_embedding(embedding: List[float], threshold: float = 0.8) -> Optional[SpeakerProfile]:
-    """Return the best matching speaker profile or None."""
+def find_best_speaker_profile(
+    embedding: List[float], threshold: float = 0.8
+) -> Tuple[Optional[SpeakerProfile], float]:
+    """Return the best matching speaker profile and cosine similarity score."""
     best_profile = None
     best_score = 0.0
     for profile in SpeakerProfile.objects.all():
@@ -23,8 +25,16 @@ def match_speaker_embedding(embedding: List[float], threshold: float = 0.8) -> O
             best_score = score
             best_profile = profile
     if best_profile and best_score >= threshold:
-        return best_profile
-    return None
+        return best_profile, best_score
+    return None, best_score
+
+
+def match_speaker_embedding(
+    embedding: List[float], threshold: float = 0.8
+) -> Optional[SpeakerProfile]:
+    """Return the best matching speaker profile or ``None``."""
+    profile, _ = find_best_speaker_profile(embedding, threshold)
+    return profile
 
 
 def assign_speaker_profiles(

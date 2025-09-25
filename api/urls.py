@@ -63,15 +63,17 @@ urlpatterns = [
          name='upload_and_process'),
     
     # Download processed DOCX with highlighted text
-    path('download/<str:token>/<str:session_id>/', 
-         new_enhnaced.DownloadProcessedDocumentView.as_view(), 
+    path('download/<str:token>/<str:session_id>/',
+         new_enhnaced.DownloadProcessedDocumentView.as_view(),
          name='download_processed'),
-    
+
     path('documents/upload/<str:token>/', new_enhnaced.UploadReferenceDocumentView.as_view(), name='document-upload'),
+    path('diarization/rerun/<str:token>/', new_enhnaced.RunDiarizationView.as_view(), name='rerun-diarization'),
+    path('speakers/map/<str:token>/', new_enhnaced.SpeakerProfileMappingView.as_view(), name='speaker-profile-map'),
 
     # Get user's documents and audio files
-    path('documents/<str:token>/', 
-         new_enhnaced.GetUserDocumentsView.as_view(), 
+    path('documents/<str:token>/',
+         new_enhnaced.GetUserDocumentsView.as_view(),
          name='user_documents'),
     
     # Get specific processing session details

@@ -164,6 +164,37 @@ class ErrorResponseSerializer(serializers.Serializer):
     details = serializers.DictField(read_only=True, required=False)
     timestamp = serializers.DateTimeField(read_only=True)
 
+
+class RunDiarizationSerializer(serializers.Serializer):
+    audio_id = serializers.UUIDField()
+
+
+class SpeakerProfileMappingEntrySerializer(serializers.Serializer):
+    label = serializers.CharField()
+    name = serializers.CharField()
+    profile_id = serializers.IntegerField(required=False, allow_null=True)
+
+    def validate_name(self, value: str) -> str:
+        if not value.strip():
+            raise serializers.ValidationError("Name cannot be blank.")
+        return value
+
+
+class SpeakerProfileMappingSerializer(serializers.Serializer):
+    audio_id = serializers.UUIDField()
+    speakers = SpeakerProfileMappingEntrySerializer(many=True)
+
+    def validate_speakers(self, value):
+        labels = set()
+        for entry in value:
+            label = entry.get('label')
+            if not label:
+                raise serializers.ValidationError("Each speaker entry must include a label.")
+            if label in labels:
+                raise serializers.ValidationError("Duplicate speaker labels are not allowed.")
+            labels.add(label)
+        return value
+
 class ReferenceDocumentSerializer(serializers.Serializer):
     """
     Serializer for the ReferenceDocument model.

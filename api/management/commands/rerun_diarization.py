@@ -15,10 +15,10 @@ class Command(BaseCommand):
                 transcript = audio_file.transcription or {}
                 transcript_segments = transcript.get('segments', [])
                 transcript_words = transcript.get('words', [])
-                diarization_segments = diarization_from_audio(
+                diarization_result = diarization_from_audio(
                     audio_file.file_path, transcript_segments, transcript_words
                 )
-                audio_file.diarization = diarization_segments
+                audio_file.diarization = diarization_result
                 audio_file.save()
                 self.stdout.write(self.style.SUCCESS(f'Processed {audio_file.id}'))
             except Exception as e:
