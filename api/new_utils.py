@@ -6,6 +6,7 @@ import csv
 import logging
 import threading
 import textwrap
+import json
 from typing import Dict, List, Optional
 
 import boto3
@@ -622,7 +623,95 @@ def generate_highlighted_pdf(
                 return candidate
         return candidates[0]
 
-    def _add_navigation_button(page, label, target_page_index, fill_color=(0.27, 0.47, 0.79)):
+    def _build_segment_lines(segment, wrap_width):
+        status = (segment.get("status") or "").title() or "Unknown"
+        confidence = segment.get("confidence")
+        confidence_text = ""
+        if confidence is not None:
+            try:
+                confidence_text = f" (confidence {round(float(confidence), 2)})"
+            except (TypeError, ValueError):
+                confidence_text = ""
+
+        doc_text = segment.get("document_text") or "-"
+        spoken_text = segment.get("spoken_text") or "-"
+        speaker = segment.get("speaker") or "Unknown speaker"
+        start = _format_timestamp(segment.get("start"))
+        end = _format_timestamp(segment.get("end"))
+
+        lines = [f"• Status: {status}{confidence_text}"]
+        lines.append(
+            textwrap.fill(
+                f"Document: {doc_text}",
+                width=wrap_width,
+                subsequent_indent="  ",
+            )
+        )
+        spoken_header = f"Spoken ({speaker}, {start} – {end}): {spoken_text}"
+        lines.append(
+            textwrap.fill(
+                spoken_header,
+                width=wrap_width,
+                subsequent_indent="  ",
+            )
+        )
+        return lines
+
+    def _build_summary_popup_text(page_data, legend_map):
+        page_number = page_data.get("page_number")
+        legend_items = list((legend_map or {}).items())
+        wrap_width = 90
+
+        lines: List[str] = []
+        lines.append(f"Spoken Content Summary – Page {page_number}")
+
+        if legend_items:
+            lines.append("Legend:")
+            for key, meta in legend_items:
+                label = meta.get("label") or key.title()
+                lines.append(f"  • {label}")
+
+        segments = page_data.get("segments") or []
+        if not segments:
+            lines.append("No spoken content summary was generated for this page.")
+            return "\n".join(lines)
+
+        lines.append("")
+        for segment in segments:
+            lines.extend(_build_segment_lines(segment, wrap_width))
+            lines.append("")
+
+        return "\n".join(line for line in lines if line is not None)
+
+    def _build_unmatched_popup_text(unmatched_segments):
+        lines: List[str] = ["Unmatched Spoken Segments"]
+        if not unmatched_segments:
+            lines.append("No unmatched spoken segments were detected.")
+            return "\n".join(lines)
+
+        wrap_width = 90
+        for index, segment in enumerate(unmatched_segments, start=1):
+            speaker = segment.get("speaker") or "Unknown speaker"
+            start = _format_timestamp(segment.get("start"))
+            end = _format_timestamp(segment.get("end"))
+            spoken_text = segment.get("spoken_text") or "-"
+            header = f"{index}. {speaker} ({start} – {end})"
+            lines.append(header)
+            lines.append(
+                textwrap.fill(
+                    f"Spoken: {spoken_text}",
+                    width=wrap_width,
+                    subsequent_indent="  ",
+                )
+            )
+            lines.append("")
+
+        return "\n".join(line for line in lines if line is not None)
+
+    def _add_summary_button(page, label, popup_text, fill_color=(0.27, 0.47, 0.79)):
+        if not popup_text:
+            return
+
         button_rect = _find_available_button_rect(page)
         shape = page.new_shape()
         shape.draw_rect(button_rect)
@@ -637,168 +726,33 @@ def generate_highlighted_pdf(
             color=(1, 1, 1),
             overlay=True,
         )
+        MAX_JS_PAYLOAD = 6000
+        if len(popup_text) > MAX_JS_PAYLOAD:
+            popup_text = popup_text[: MAX_JS_PAYLOAD - 3] + "..."
+        script = json.dumps(popup_text)
         page.insert_link({
-            "kind": fitz.LINK_GOTO,
+            "kind": fitz.LINK_URI,
             "from": button_rect,
-            "page": max(0, int(target_page_index)),
+            "uri": f"javascript:app.alert({script})",
         })
-
-    def _render_pdf_summary_page(page, page_data, legend_map):
-        rect = page.rect
-        margin = 36
-        cursor_y = margin
-        heading = f"Spoken Content Summary – Page {page_data.get('page_number')}"
-        page.insert_text(
-            (margin, cursor_y),
-            heading,
-            fontsize=16,
-            fontname="helv",
-            color=(0, 0, 0),
-        )
-        cursor_y += 26
-
-        legend_items = list((legend_map or {}).items())
-        for key, meta in legend_items:
-            label = meta.get("label") or key.title()
-            color = _hex_to_rgb_tuple(meta.get("color"))
-            swatch = fitz.Rect(margin, cursor_y, margin + 14, cursor_y + 14)
-            page.draw_rect(swatch, color=color, fill=color, overlay=True)
-            page.insert_text(
-                (margin + 18, cursor_y + 11),
-                label,
-                fontsize=10,
-                fontname="helv",
-                color=(0, 0, 0),
-            )
-            cursor_y += 18
-
-        if legend_items:
-            cursor_y += 6
-
-        segments = page_data.get("segments") or []
-        if not segments:
-            page.insert_text(
-                (margin, cursor_y),
-                "No spoken content summary was generated for this page.",
-                fontsize=11,
-                fontname="helv",
-                color=(0.2, 0.2, 0.2),
-            )
-            return
-
-        wrap_width = max(60, int((rect.width - (2 * margin)) / 5))
-        lines: List[str] = []
-        for index, segment in enumerate(segments, start=1):
-            status = (segment.get("status") or "").title() or "Unknown"
-            confidence = round(float(segment.get("confidence") or 0.0), 2)
-            lines.append(f"{index}. Status: {status} (confidence {confidence})")
-
-            doc_text = segment.get("document_text") or "-"
-            lines.append(
-                textwrap.fill(
-                    f"Document: {doc_text}",
-                    width=wrap_width,
-                    subsequent_indent=" " * 11,
-                )
-            )
-
-            spoken_text = segment.get("spoken_text") or "-"
-            speaker = segment.get("speaker") or "Unknown speaker"
-            start = _format_timestamp(segment.get("start"))
-            end = _format_timestamp(segment.get("end"))
-            spoken_header = f"Spoken ({speaker}, {start} – {end}): {spoken_text}"
-            lines.append(
-                textwrap.fill(
-                    spoken_header,
-                    width=wrap_width,
-                    subsequent_indent=" " * 11,
-                )
-            )
-            lines.append("")
-
-        textbox_rect = fitz.Rect(margin, cursor_y, rect.x1 - margin, rect.y1 - margin)
-        page.insert_textbox(
-            textbox_rect,
-            "\n".join(lines).strip(),
-            fontsize=11,
-            fontname="helv",
-            lineheight=1.3,
-            color=(0.1, 0.1, 0.1),
-        )
-
-    def _render_unmatched_page(page, unmatched_segments):
-        rect = page.rect
-        margin = 36
-        cursor_y = margin
-        page.insert_text(
-            (margin, cursor_y),
-            "Unmatched Spoken Segments",
-            fontsize=16,
-            fontname="helv",
-            color=(0, 0, 0),
-        )
-        cursor_y += 26
-
-        wrap_width = max(60, int((rect.width - (2 * margin)) / 5))
-        lines: List[str] = []
-        for index, segment in enumerate(unmatched_segments, start=1):
-            speaker = segment.get("speaker") or "Unknown speaker"
-            start = _format_timestamp(segment.get("start"))
-            end = _format_timestamp(segment.get("end"))
-            spoken_text = segment.get("spoken_text") or "-"
-            header = f"{index}. {speaker} ({start} – {end})"
-            lines.append(header)
-            lines.append(
-                textwrap.fill(
-                    f"Spoken: {spoken_text}",
-                    width=wrap_width,
-                    subsequent_indent=" " * 8,
-                )
-            )
-            lines.append("")
-
-        textbox_rect = fitz.Rect(margin, cursor_y, rect.x1 - margin, rect.y1 - margin)
-        page.insert_textbox(
-            textbox_rect,
-            "\n".join(lines).strip(),
-            fontsize=11,
-            fontname="helv",
-            lineheight=1.3,
-            color=(0.1, 0.1, 0.1),
-        )
-
     summary_pages = summary_payload.get("pages") or []
     legend_map = summary_payload.get("legend") or {}
     unmatched_segments = summary_payload.get("unmatched_spoken_segments") or []
 
-    default_rect = target_doc[0].rect if len(target_doc) else fitz.Rect(0, 0, 595, 842)
-
     if summary_pages:
-        for page_info in sorted(summary_pages, key=lambda item: item.get("page_number") or 0, reverse=True):
+        for page_info in summary_pages:
             page_number = page_info.get("page_number")
             if not page_number:
                 continue
             base_index = max(0, min(int(page_number) - 1, len(target_doc) - 1))
             base_page = target_doc.load_page(base_index)
-            summary_page = target_doc.new_page(
-                base_index + 1,
-                width=base_page.rect.width,
-                height=base_page.rect.height,
-            )
-            _render_pdf_summary_page(summary_page, page_info, legend_map)
-            _add_navigation_button(summary_page, f"Back to Page {page_number}", base_index)
-            base_page = target_doc.load_page(base_index)
-            _add_navigation_button(base_page, "Show Spoken Summary", summary_page.number)
+            popup_text = _build_summary_popup_text(page_info, legend_map)
+            _add_summary_button(base_page, "View Spoken Summary", popup_text)
 
     if unmatched_segments:
-        rect_source = default_rect
-        unmatched_page = target_doc.new_page(
-            -1,
-            width=rect_source.width,
-            height=rect_source.height,
-        )
-        _render_unmatched_page(unmatched_page, unmatched_segments)
-        _add_navigation_button(unmatched_page, "Back to Page 1", 0)
+        popup_text = _build_unmatched_popup_text(unmatched_segments)
+        base_page = target_doc.load_page(0)
+        _add_summary_button(base_page, "Unmatched Spoken Segments", popup_text, fill_color=(0.8, 0.45, 0.16))
 
     # --- 4. Save the Output ---
     try:
