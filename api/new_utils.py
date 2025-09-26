@@ -592,13 +592,16 @@ def generate_highlighted_pdf(
             'mismatch': set(),
             'unspoken': set(),
         }
+        matched_page_chunks = set()
         page_summary_entries = []
 
         import torch
         for i, row in enumerate(cosine_scores):
             if len(row) > 0 and torch.max(row) > 0.7:
                 if i < len(page_chunks):
-                    status_chunks['match'].add(page_chunks[i].lower())
+                    chunk_lower = page_chunks[i].lower()
+                    matched_page_chunks.add(chunk_lower)
+                    status_chunks['match'].add(chunk_lower)
 
         for chunk in page_chunks:
             chunk_lower = chunk.lower()
@@ -676,9 +679,9 @@ def generate_highlighted_pdf(
                 'speaker_label': speaker_label,
                 'duration': duration,
                 'speaker_profile_id': speaker_profile_id,
+                'chunk_lower': chunk_lower,
             })
 
-        green_rects = []
         words_on_page = page.get_text("words")
         for w in words_on_page:
             word_text = w[4].strip()
@@ -690,20 +693,31 @@ def generate_highlighted_pdf(
                 for t in filtered_query_tokens
             )
 
-            status = None
-            if is_numeric_match:
-                status = 'match'
+            matching_entry = None
+            normalized_word = normalize_line(word_text)
+            for entry in page_summary_entries:
+                chunk_lower = entry.get('chunk_lower') or ''
+                if word_text_lower and word_text_lower in chunk_lower:
+                    matching_entry = entry
+                    break
+                if normalized_word and normalized_word in chunk_lower:
+                    matching_entry = entry
+                    break
+
+            status = matching_entry['status'] if matching_entry else None
+            is_semantic_match = any(
+                word_text_lower and word_text_lower in chunk
+                for chunk in matched_page_chunks
+            )
+
+            if status == 'match':
+                highlight_status = 'match'
+            elif status in {'mismatch', 'unspoken'}:
+                highlight_status = status
+            elif is_numeric_match or is_semantic_match:
+                highlight_status = 'match'
             else:
-                for label in ('match', 'mismatch', 'unspoken'):
-                    if any(word_text_lower and word_text_lower in chunk for chunk in status_chunks[label]):
-                        status = label
-                        break
-
-            if not status:
-                continue
-
-            if status in {'mismatch', 'unspoken'} and any(rect.intersects(g) for g in green_rects):
-                continue
+                highlight_status = 'mismatch'
 
             colors = {
                 'match': (0.6, 1, 0.6),
@@ -712,12 +726,9 @@ def generate_highlighted_pdf(
             }
 
             highlight = page.add_highlight_annot(rect)
-            highlight.set_colors(stroke=colors[status])
+            highlight.set_colors(stroke=colors[highlight_status])
             highlight.set_opacity(0.3)
             highlight.update()
-
-            if status == 'match':
-                green_rects.append(rect)
 
         if page_summary_entries:
             summary_lines = ["Spoken Content Summary"]
@@ -752,32 +763,41 @@ def generate_highlighted_pdf(
                 summary_lines.extend(wrapped if wrapped else [line])
 
             text_content = "\n".join(summary_lines)
-            line_height = 9
-            box_padding = 10
-            box_height = (len(summary_lines) * line_height) + (2 * box_padding)
             page_rect = page.rect
-            box_top = max(page_rect.y1 - box_height - 24, page_rect.y0 + 24)
-            box_rect = fitz.Rect(
-                page_rect.x0 + 36,
-                box_top,
-                page_rect.x1 - 36,
-                min(page_rect.y1 - 24, box_top + box_height),
+            button_width = 140
+            button_height = 18
+            margin = 36
+            button_rect = fitz.Rect(
+                page_rect.x1 - button_width - margin,
+                page_rect.y1 - button_height - margin,
+                page_rect.x1 - margin,
+                page_rect.y1 - margin,
             )
             page.draw_rect(
-                box_rect,
-                color=(0.3, 0.3, 0.3),
-                fill=(1, 1, 1),
-                width=0.5,
-                fill_opacity=0.85,
+                button_rect,
+                color=(0.2, 0.2, 0.2),
+                fill=(0.9, 0.9, 0.9),
+                width=0.8,
+                fill_opacity=0.95,
             )
             page.insert_textbox(
-                box_rect,
-                text_content,
-                fontsize=8,
+                button_rect,
+                "View Speaker Summary",
+                fontsize=9,
                 fontname="helv",
-                lineheight=1.15,
+                lineheight=1.1,
                 color=(0, 0, 0),
+                align=fitz.TEXT_ALIGN_CENTER,
             )
+
+            button_center = fitz.Point(
+                (button_rect.x0 + button_rect.x1) / 2,
+                (button_rect.y0 + button_rect.y1) / 2,
+            )
+            summary_annot = page.add_text_annot(button_center, text_content, icon="Comment")
+            summary_annot.set_info(title="Spoken Content Summary")
+            summary_annot.set_flags(fitz.ANNOT_FLAG_PRINT)
+            summary_annot.update()
 
     # --- Post-highlight Cleanup Pass for Abbreviations ---
     logging.info("Starting abbreviation cleanup pass")
