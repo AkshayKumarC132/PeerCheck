@@ -7,7 +7,7 @@ import logging
 import threading
 import textwrap
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import boto3
 import numpy as np
@@ -605,154 +605,206 @@ def generate_highlighted_pdf(
 
     summary_payload = spoken_summary or {}
 
-    def _find_available_button_rect(page, width=140, height=28, margin=18):
-        page_rect = page.rect
-        candidates = [
-            fitz.Rect(page_rect.x1 - width - margin, page_rect.y0 + margin,
-                      page_rect.x1 - margin, page_rect.y0 + margin + height),
-            fitz.Rect(page_rect.x1 - width - margin, page_rect.y1 - margin - height,
-                      page_rect.x1 - margin, page_rect.y1 - margin),
-            fitz.Rect(page_rect.x0 + margin, page_rect.y0 + margin,
-                      page_rect.x0 + margin + width, page_rect.y0 + margin + height),
-            fitz.Rect(page_rect.x0 + margin, page_rect.y1 - margin - height,
-                      page_rect.x0 + margin + width, page_rect.y1 - margin),
+    def _summary_columns():
+        return [
+            {"key": "speaker", "header": "Speaker", "ratio": 0.15},
+            {"key": "start", "header": "Start", "ratio": 0.1},
+            {"key": "end", "header": "End", "ratio": 0.1},
+            {"key": "status", "header": "Status", "ratio": 0.12},
+            {"key": "confidence", "header": "Confidence", "ratio": 0.1},
+            {"key": "document_text", "header": "Document Text", "ratio": 0.215},
+            {"key": "spoken_text", "header": "Spoken Text", "ratio": 0.215},
         ]
-        words = [fitz.Rect(w[:4]) for w in page.get_text("words")]
-        for candidate in candidates:
-            if all(not candidate.intersects(word_rect) for word_rect in words):
-                return candidate
-        return candidates[0]
 
-    def _build_segment_lines(segment, wrap_width):
-        status = (segment.get("status") or "").title() or "Unknown"
-        confidence = segment.get("confidence")
-        confidence_text = ""
-        if confidence is not None:
-            try:
-                confidence_text = f" (confidence {round(float(confidence), 2)})"
-            except (TypeError, ValueError):
-                confidence_text = ""
+    def _format_confidence(value: Optional[float]) -> str:
+        if value is None:
+            return "-"
+        try:
+            return f"{round(float(value) * 100, 1)}%"
+        except (TypeError, ValueError):
+            return str(value)
 
-        doc_text = segment.get("document_text") or "-"
-        spoken_text = segment.get("spoken_text") or "-"
-        speaker = segment.get("speaker") or "Unknown speaker"
-        start = _format_timestamp(segment.get("start"))
-        end = _format_timestamp(segment.get("end"))
+    def _prepare_row(segment: Dict, legend_map: Dict[str, Dict[str, str]]) -> Dict[str, str]:
+        status_key = (segment.get("status") or "").lower()
+        legend_entry = legend_map.get(status_key, {})
+        return {
+            "speaker": segment.get("speaker") or "Unknown",
+            "start": _format_timestamp(segment.get("start")),
+            "end": _format_timestamp(segment.get("end")),
+            "status": legend_entry.get("label") or status_key.title() or "-",
+            "confidence": _format_confidence(segment.get("confidence")),
+            "document_text": segment.get("document_text") or "-",
+            "spoken_text": segment.get("spoken_text") or "-",
+        }
 
-        lines = [f"• Status: {status}{confidence_text}"]
-        lines.append(
-            textwrap.fill(
-                f"Document: {doc_text}",
-                width=wrap_width,
-                subsequent_indent="  ",
-            )
+    def _wrap_text(text: str, width: float, fontsize: float) -> List[str]:
+        if width <= 0:
+            return [text]
+        avg_char_width = max(fontsize * 0.55, 1e-6)
+        max_chars = max(1, int(width / avg_char_width))
+        wrapped: List[str] = []
+        for paragraph in str(text).splitlines() or [""]:
+            segment = paragraph.strip() if paragraph else ""
+            if not segment:
+                wrapped.append("")
+                continue
+            wrapped.extend(textwrap.wrap(segment, max_chars) or [segment])
+        return wrapped or [""]
+
+    def _draw_summary_header(page: "fitz.Page", page_number: int, legend_map: Dict[str, Dict[str, str]], columns: List[Dict[str, str]], margin: float = 36.0) -> Tuple[float, List[float]]:
+        page_rect = page.rect
+        table_width = page_rect.width - 2 * margin
+        x_positions = [page_rect.x0 + margin]
+        for column in columns:
+            x_positions.append(x_positions[-1] + table_width * column["ratio"])
+
+        title_rect = fitz.Rect(
+            page_rect.x0 + margin,
+            page_rect.y0 + margin,
+            page_rect.x1 - margin,
+            page_rect.y0 + margin + 22,
         )
-        spoken_header = f"Spoken ({speaker}, {start} – {end}): {spoken_text}"
-        lines.append(
-            textwrap.fill(
-                spoken_header,
-                width=wrap_width,
-                subsequent_indent="  ",
-            )
-        )
-        return lines
-
-    def _build_summary_popup_text(page_data, legend_map):
-        page_number = page_data.get("page_number")
-        legend_items = list((legend_map or {}).items())
-        wrap_width = 90
-
-        lines: List[str] = []
-        lines.append(f"Spoken Content Summary – Page {page_number}")
-
-        if legend_items:
-            lines.append("Legend:")
-            for key, meta in legend_items:
-                label = meta.get("label") or key.title()
-                lines.append(f"  • {label}")
-
-        segments = page_data.get("segments") or []
-        if not segments:
-            lines.append("No spoken content summary was generated for this page.")
-            return "\n".join(lines)
-
-        lines.append("")
-        for segment in segments:
-            lines.extend(_build_segment_lines(segment, wrap_width))
-            lines.append("")
-
-        return "\n".join(line for line in lines if line is not None)
-
-    def _build_unmatched_popup_text(unmatched_segments):
-        lines: List[str] = ["Unmatched Spoken Segments"]
-        if not unmatched_segments:
-            lines.append("No unmatched spoken segments were detected.")
-            return "\n".join(lines)
-
-        wrap_width = 90
-        for index, segment in enumerate(unmatched_segments, start=1):
-            speaker = segment.get("speaker") or "Unknown speaker"
-            start = _format_timestamp(segment.get("start"))
-            end = _format_timestamp(segment.get("end"))
-            spoken_text = segment.get("spoken_text") or "-"
-            header = f"{index}. {speaker} ({start} – {end})"
-            lines.append(header)
-            lines.append(
-                textwrap.fill(
-                    f"Spoken: {spoken_text}",
-                    width=wrap_width,
-                    subsequent_indent="  ",
-                )
-            )
-            lines.append("")
-
-        return "\n".join(line for line in lines if line is not None)
-
-    def _add_summary_button(page, label, popup_text, fill_color=(0.27, 0.47, 0.79)):
-        if not popup_text:
-            return
-
-        button_rect = _find_available_button_rect(page)
-        shape = page.new_shape()
-        shape.draw_rect(button_rect)
-        shape.finish(color=fill_color, fill=fill_color, overlay=True)
-        shape.commit()
         page.insert_textbox(
-            button_rect,
-            label,
-            fontsize=10,
+            title_rect,
+            f"Spoken Content Summary - Page {page_number}",
+            fontsize=14,
             fontname="helv",
-            align=fitz.TEXT_ALIGN_CENTER,
-            color=(1, 1, 1),
-            overlay=True,
+            align=fitz.TEXT_ALIGN_LEFT,
         )
-        MAX_JS_PAYLOAD = 6000
-        if len(popup_text) > MAX_JS_PAYLOAD:
-            popup_text = popup_text[: MAX_JS_PAYLOAD - 3] + "..."
-        script = json.dumps(popup_text)
-        page.insert_link({
-            "kind": fitz.LINK_URI,
-            "from": button_rect,
-            "uri": f"javascript:app.alert({script})",
-        })
+
+        legend_y = title_rect.y1 + 6
+        if legend_map:
+            for key, meta in legend_map.items():
+                color_hex = meta.get("color") or "#DDDDDD"
+                rgb = _hex_to_rgb_tuple(color_hex)
+                swatch = fitz.Rect(
+                    page_rect.x0 + margin,
+                    legend_y,
+                    page_rect.x0 + margin + 12,
+                    legend_y + 12,
+                )
+                page.draw_rect(swatch, color=rgb, fill=rgb)
+                label_rect = fitz.Rect(
+                    swatch.x1 + 6,
+                    legend_y,
+                    page_rect.x1 - margin,
+                    legend_y + 12,
+                )
+                label = meta.get("label") or key.title()
+                page.insert_textbox(
+                    label_rect,
+                    label,
+                    fontsize=9,
+                    fontname="helv",
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+                legend_y = label_rect.y1 + 4
+        header_top = max(legend_y, title_rect.y1 + 6)
+
+        header_height = 18
+        header_bottom = header_top + header_height
+        for idx, column in enumerate(columns):
+            cell_rect = fitz.Rect(x_positions[idx], header_top, x_positions[idx + 1], header_bottom)
+            page.draw_rect(cell_rect, color=(0.7, 0.7, 0.7), fill=(0.9, 0.9, 0.9))
+            page.insert_textbox(
+                cell_rect,
+                column["header"],
+                fontsize=10,
+                fontname="helv",
+                align=fitz.TEXT_ALIGN_CENTER,
+            )
+
+        return header_bottom, x_positions
+
+    def _draw_summary_rows(
+        doc: "fitz.Document",
+        base_insert_index: int,
+        base_page_rect: "fitz.Rect",
+        page_number: int,
+        segments: List[Dict],
+        legend_map: Dict[str, Dict[str, str]],
+        margin: float = 36.0,
+    ) -> int:
+        columns = _summary_columns()
+        insert_position = base_insert_index + 1
+        page = doc.new_page(insert_position, width=base_page_rect.width, height=base_page_rect.height)
+        pages_created = 1
+        insert_position += 1
+
+        current_y, x_positions = _draw_summary_header(page, page_number, legend_map, columns, margin=margin)
+        table_bottom = page.rect.y1 - margin
+        body_fontsize = 9
+
+        for segment in segments:
+            row_values = _prepare_row(segment, legend_map)
+            wrapped_texts: Dict[str, str] = {}
+            max_lines = 1
+            for idx, column in enumerate(columns):
+                col_width = max((x_positions[idx + 1] - x_positions[idx]) - 4, 4)
+                wrapped_lines = _wrap_text(row_values[column["key"]], col_width, body_fontsize)
+                max_lines = max(max_lines, len(wrapped_lines))
+                wrapped_texts[column["key"]] = "\n".join(wrapped_lines)
+
+            line_height = body_fontsize + 2
+            row_height = max(18, max_lines * line_height + 4)
+
+            if current_y + row_height > table_bottom:
+                page = doc.new_page(insert_position, width=base_page_rect.width, height=base_page_rect.height)
+                pages_created += 1
+                insert_position += 1
+                current_y, x_positions = _draw_summary_header(page, page_number, legend_map, columns, margin=margin)
+                table_bottom = page.rect.y1 - margin
+
+                wrapped_texts = {}
+                max_lines = 1
+                for idx, column in enumerate(columns):
+                    col_width = max((x_positions[idx + 1] - x_positions[idx]) - 4, 4)
+                    wrapped_lines = _wrap_text(row_values[column["key"]], col_width, body_fontsize)
+                    max_lines = max(max_lines, len(wrapped_lines))
+                    wrapped_texts[column["key"]] = "\n".join(wrapped_lines)
+                row_height = max(18, max_lines * line_height + 4)
+
+            for idx, column in enumerate(columns):
+                cell_rect = fitz.Rect(x_positions[idx], current_y, x_positions[idx + 1], current_y + row_height)
+                page.draw_rect(cell_rect, color=(0.8, 0.8, 0.8))
+                text_rect = fitz.Rect(cell_rect.x0 + 2, cell_rect.y0 + 2, cell_rect.x1 - 2, cell_rect.y1 - 2)
+                page.insert_textbox(
+                    text_rect,
+                    wrapped_texts[column["key"]],
+                    fontsize=body_fontsize,
+                    fontname="helv",
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+
+            current_y += row_height
+
+        return pages_created
+
     summary_pages = summary_payload.get("pages") or []
     legend_map = summary_payload.get("legend") or {}
-    unmatched_segments = summary_payload.get("unmatched_spoken_segments") or []
 
     if summary_pages:
+        summary_pages = sorted(
+            [p for p in summary_pages if p.get("page_number")],
+            key=lambda item: int(item.get("page_number")),
+        )
+        inserted_count = 0
         for page_info in summary_pages:
-            page_number = page_info.get("page_number")
-            if not page_number:
-                continue
-            base_index = max(0, min(int(page_number) - 1, len(target_doc) - 1))
+            page_number = int(page_info.get("page_number"))
+            base_index = max(0, min(page_number - 1 + inserted_count, len(target_doc) - 1))
             base_page = target_doc.load_page(base_index)
-            popup_text = _build_summary_popup_text(page_info, legend_map)
-            _add_summary_button(base_page, "View Spoken Summary", popup_text)
-
-    if unmatched_segments:
-        popup_text = _build_unmatched_popup_text(unmatched_segments)
-        base_page = target_doc.load_page(0)
-        _add_summary_button(base_page, "Unmatched Spoken Segments", popup_text, fill_color=(0.8, 0.45, 0.16))
+            segments = page_info.get("segments") or []
+            if not segments:
+                continue
+            created = _draw_summary_rows(
+                target_doc,
+                base_index,
+                base_page.rect,
+                page_number,
+                segments,
+                legend_map,
+            )
+            inserted_count += created
 
     # --- 4. Save the Output ---
     try:
