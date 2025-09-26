@@ -422,7 +422,13 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     )
                     break
 
-def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_transcript_match=True):
+def generate_highlighted_pdf(
+    doc_path,
+    transcript_data,
+    output_path,
+    require_transcript_match=True,
+    diarization_data=None,
+):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
     and saves the result to a new PDF file.
@@ -437,12 +443,22 @@ def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_tra
         convert(doc_path, temp_pdf_path)
         pdf_path = temp_pdf_path
 
+    if diarization_data is None and isinstance(transcript_data, dict):
+        diarization_data = transcript_data.get("diarization")
+
     if isinstance(transcript_data, dict):
         query_text = transcript_data.get("text", "")
         transcript_segments = transcript_data.get("segments") or []
     else:
         query_text = transcript_data or ""
         transcript_segments = []
+
+    diarization_segments = []
+    if diarization_data:
+        if isinstance(diarization_data, dict):
+            diarization_segments = diarization_data.get("segments") or []
+        elif isinstance(diarization_data, list):
+            diarization_segments = diarization_data
 
     def _format_timestamp(value: Optional[float]) -> str:
         if value is None:
@@ -541,6 +557,24 @@ def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_tra
                 'end': None,
             })
 
+    diarization_entries = []
+    for seg in diarization_segments:
+        seg_text = (seg.get('text') or '').strip()
+        if not seg_text and not seg.get('duration'):
+            continue
+        diarization_entries.append({
+            'text': seg_text,
+            'norm': normalize_line(seg_text),
+            'start': seg.get('start'),
+            'end': seg.get('end'),
+            'speaker': seg.get('speaker_name') or seg.get('speaker'),
+            'speaker_label': seg.get('speaker_label') or seg.get('speaker'),
+            'duration': seg.get('duration'),
+            'speaker_profile_id': seg.get('speaker_profile_id'),
+        })
+
+    comparison_entries = diarization_entries or transcript_entries
+
     # --- 3. Apply Highlighting to Relevant Pages ---
     for page_num in relevant_page_nums:
         page = target_doc.load_page(page_num)
@@ -574,7 +608,7 @@ def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_tra
 
             best_score = 0.0
             best_entry = None
-            for entry in transcript_entries:
+            for entry in comparison_entries:
                 if not entry['norm']:
                     continue
                 score = fuzz.token_set_ratio(norm_chunk, entry['norm']) / 100.0
@@ -590,22 +624,58 @@ def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_tra
                 status = 'unspoken'
 
             status_chunks[status].add(chunk_lower)
-            if status == 'unspoken':
-                summary_text = chunk.strip()
-                timestamp = "N/A"
-            else:
-                spoken = best_entry or {}
-                summary_text = (spoken.get('text') or chunk).strip()
-                start_label = _format_timestamp(spoken.get('start'))
-                end_label = _format_timestamp(spoken.get('end'))
-                timestamp = (
-                    f"{start_label} - {end_label}" if end_label != "N/A" else start_label
-                )
+            matched_segment = None
+            matched_score = 0.0
+            if diarization_entries:
+                for seg_entry in diarization_entries:
+                    if not seg_entry['norm']:
+                        continue
+                    seg_score = fuzz.token_set_ratio(norm_chunk, seg_entry['norm']) / 100.0
+                    if seg_score > matched_score:
+                        matched_score = seg_score
+                        matched_segment = seg_entry
+
+            if not matched_segment and diarization_entries and best_entry and best_entry in diarization_entries:
+                matched_segment = best_entry
+                matched_score = best_score
+
+            summary_text = chunk.strip()
+            timestamp = "N/A"
+            speaker_name = "Not spoken" if status == 'unspoken' else "Unknown Speaker"
+            duration = None
+            speaker_label = None
+            speaker_profile_id = None
+
+            if status != 'unspoken':
+                if matched_segment and matched_score >= 0.4:
+                    summary_text = (matched_segment.get('text') or chunk).strip()
+                    start_label = _format_timestamp(matched_segment.get('start'))
+                    end_label = _format_timestamp(matched_segment.get('end'))
+                    timestamp = (
+                        f"{start_label} - {end_label}" if end_label != "N/A" else start_label
+                    )
+                    speaker_name = matched_segment.get('speaker') or "Unknown Speaker"
+                    duration = matched_segment.get('duration')
+                    speaker_label = matched_segment.get('speaker_label')
+                    speaker_profile_id = matched_segment.get('speaker_profile_id')
+                elif best_entry:
+                    summary_text = (best_entry.get('text') or chunk).strip()
+                    start_label = _format_timestamp(best_entry.get('start'))
+                    end_label = _format_timestamp(best_entry.get('end'))
+                    timestamp = (
+                        f"{start_label} - {end_label}" if end_label != "N/A" else start_label
+                    )
+                    speaker_name = best_entry.get('speaker') or speaker_name
+                    speaker_label = best_entry.get('speaker_label')
 
             page_summary_entries.append({
                 'status': status,
                 'text': summary_text,
                 'timestamp': timestamp,
+                'speaker': speaker_name,
+                'speaker_label': speaker_label,
+                'duration': duration,
+                'speaker_profile_id': speaker_profile_id,
             })
 
         green_rects = []
@@ -651,11 +721,33 @@ def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_tra
 
         if page_summary_entries:
             summary_lines = ["Spoken Content Summary"]
+            status_labels = {
+                'match': 'Correct',
+                'mismatch': 'Mismatch',
+                'unspoken': 'Unspoken',
+            }
             for entry in page_summary_entries:
-                status_label = entry['status'].capitalize()
+                status_label = status_labels.get(entry['status'], entry['status'].capitalize())
                 timestamp = entry['timestamp']
                 content = entry['text']
-                line = f"- [{status_label} | {timestamp}] {content}"
+                speaker_display = entry.get('speaker') or 'Unknown Speaker'
+                extra_parts = []
+                duration_val = entry.get('duration')
+                try:
+                    duration_float = float(duration_val) if duration_val is not None else None
+                except (TypeError, ValueError):
+                    duration_float = None
+                if duration_float is not None:
+                    extra_parts.append(f"Duration: {duration_float:.2f}s")
+                if entry.get('speaker_label') and entry.get('speaker_label') != entry.get('speaker'):
+                    extra_parts.append(f"Label: {entry['speaker_label']}")
+                if entry.get('speaker_profile_id'):
+                    extra_parts.append(f"Profile ID: {entry['speaker_profile_id']}")
+                extra_info = f" ({'; '.join(extra_parts)})" if extra_parts else ""
+                line = (
+                    f"- [{speaker_display} | {status_label} | {timestamp}] "
+                    f"{content}{extra_info}"
+                )
                 wrapped = textwrap.wrap(line, width=90)
                 summary_lines.extend(wrapped if wrapped else [line])
 
@@ -712,7 +804,12 @@ def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_tra
 
     return output_path
 
-def create_highlighted_pdf_document(text_s3_url, transcript_data, require_transcript_match=True):
+def create_highlighted_pdf_document(
+    text_s3_url,
+    transcript_data,
+    require_transcript_match=True,
+    diarization_data=None,
+):
     """
     Orchestrates the generation of a highlighted PDF using the new logic.
     """
@@ -732,6 +829,7 @@ def create_highlighted_pdf_document(text_s3_url, transcript_data, require_transc
             transcript_data,
             temp_output_path,
             require_transcript_match=require_transcript_match,
+            diarization_data=diarization_data,
         )
 
         with open(temp_output_path, 'rb') as f_out:

@@ -529,6 +529,7 @@ class DownloadProcessedDocumentView(GenericAPIView):
                             reference_doc.file_path,
                             transcript_result,
                             require_transcript_match=use_transcript,
+                            diarization_data=audio_file.diarization,
                         )
                     elif file_ext == 'docx':
                         from .new_utils import create_highlighted_docx_from_s3
