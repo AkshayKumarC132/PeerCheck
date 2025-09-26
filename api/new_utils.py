@@ -515,6 +515,7 @@ def generate_highlighted_pdf(
         page_scores.append((i, score))
 
     page_scores = sorted(page_scores, key=lambda x: x[1], reverse=True)
+    page_score_lookup = {page_index: score for page_index, score in page_scores}
 
     top_k = 5
     top_pages = set()
@@ -829,9 +830,47 @@ def generate_highlighted_pdf(
             key=lambda item: int(item.get("page_number")),
         )
 
-        target_page: Optional[Dict] = None
-        fallback_page: Optional[Dict] = None
         normalized_pages: List[Dict] = []
+        best_page: Optional[Dict] = None
+        best_rank: Optional[Tuple[float, int, float, float, int]] = None
+
+        def _safe_float(value: Any) -> float:
+            try:
+                if value is None:
+                    return 0.0
+                return float(value)
+            except (TypeError, ValueError):
+                return 0.0
+
+        def _rank_page(page_info: Dict) -> Optional[Tuple[float, int, float, float, int]]:
+            page_number = page_info.get("page_number")
+            try:
+                page_index = int(page_number)
+            except (TypeError, ValueError):
+                return None
+            segments = page_info.get("segments") or []
+            matched_segments = [
+                segment
+                for segment in segments
+                if (segment.get("status") or "").lower() in {"correct", "mismatch"}
+            ]
+            if not matched_segments:
+                return None
+
+            confidence_values = [_safe_float(segment.get("confidence")) for segment in matched_segments]
+            total_confidence = sum(confidence_values)
+            max_confidence = max(confidence_values) if confidence_values else 0.0
+            fuzzy_score = page_score_lookup.get(page_index - 1, 0.0)
+
+            # Higher fuzzy score, matched count, confidence sums win; break ties by highest max
+            # confidence and finally the earliest page number.
+            return (
+                float(fuzzy_score),
+                len(matched_segments),
+                total_confidence,
+                max_confidence,
+                -int(page_index),
+            )
 
         for page_info in sorted_pages:
             segments = page_info.get("segments") or []
@@ -840,18 +879,14 @@ def generate_highlighted_pdf(
             normalized_segments = _sorted_segments(segments)
             page_info = {**page_info, "segments": normalized_segments}
             normalized_pages.append(page_info)
-            if fallback_page is None:
-                fallback_page = page_info
+            rank = _rank_page(page_info)
+            if rank is None:
+                continue
+            if best_rank is None or rank > best_rank:
+                best_rank = rank
+                best_page = page_info
 
-            has_matched = any(
-                (segment.get("status") or "").lower() in {"correct", "mismatch"}
-                for segment in normalized_segments
-            )
-            if has_matched:
-                target_page = page_info
-                break
-
-        selected_page = target_page or fallback_page
+        selected_page = best_page
 
         if normalized_pages:
             summary_payload["pages"] = normalized_pages
