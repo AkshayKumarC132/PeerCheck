@@ -504,8 +504,26 @@ class DownloadProcessedDocumentView(GenericAPIView):
                 print("Creating new processed document...")
                 try:
                     # Create highlighted DOCX and upload to S3
-                    transcript = audio_file.transcription.get('text', '') if audio_file.transcription else ''
-                    
+                    transcription_data = audio_file.transcription or {}
+                    transcript = transcription_data.get('text', '') or ''
+                    speaker_segments = []
+
+                    diarization_data = audio_file.diarization
+                    if isinstance(diarization_data, dict):
+                        speaker_segments = diarization_data.get('segments', []) or []
+                    elif isinstance(diarization_data, list):
+                        speaker_segments = diarization_data
+
+                    if not speaker_segments:
+                        speaker_segments = transcription_data.get('segments', []) or []
+
+                    if not transcript and speaker_segments:
+                        transcript = "\n".join(
+                            seg.get('text', '').strip()
+                            for seg in speaker_segments
+                            if isinstance(seg, dict)
+                        )
+
                     if not transcript:
                         return Response({
                             'error': 'No transcript available for processing',
@@ -533,7 +551,8 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         from .new_utils import create_highlighted_docx_from_s3
                         processed_s3_url = create_highlighted_docx_from_s3(
                             reference_doc.file_path,
-                            transcript
+                            transcript,
+                            speaker_segments=speaker_segments,
                         )
                     else:
                         return Response({

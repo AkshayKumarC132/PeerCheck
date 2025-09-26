@@ -15,17 +15,15 @@ from pdf2docx import Converter
 import whisper
 import PyPDF2
 import docx
+from docx.shared import RGBColor
 from difflib import SequenceMatcher
 from fuzzywuzzy import fuzz
 from io import BytesIO
-from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
 import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
-from docx.enum.text import WD_COLOR_INDEX
-from docx.shared import RGBColor
 import fitz  # PyMuPDF
 from docx2pdf import convert
 
@@ -522,8 +520,13 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
 
         green_rects = []
         words_on_page = page.get_text("words")
+
+        transcript_tokens = [token for token in re.findall(r"\w+", query_text.lower()) if token]
+
         for w in words_on_page:
             word_text = w[4].strip()
+            if not word_text:
+                continue
             word_text_lower = word_text.lower()
             rect = fitz.Rect(w[:4])
 
@@ -533,9 +536,13 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
             )
             is_semantic_match = any(word_text_lower in chunk for chunk in matched_page_chunks)
 
-            # Define light green and light red colors
             light_green = (0.6, 1, 0.6)
             light_red = (1, 0.6, 0.6)
+            light_orange = (1, 0.83, 0.65)
+
+            best_ratio = 0
+            if transcript_tokens:
+                best_ratio = max((fuzz.partial_ratio(word_text_lower, token) for token in transcript_tokens), default=0)
 
             if is_numeric_match or is_semantic_match:
                 highlight = page.add_highlight_annot(rect)
@@ -544,9 +551,10 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
                 highlight.update()
                 green_rects.append(rect)
             else:
+                color = light_orange if best_ratio < 60 else light_red
                 if not any(rect.intersects(g) for g in green_rects):
                     highlight = page.add_highlight_annot(rect)
-                    highlight.set_colors(stroke=light_red)
+                    highlight.set_colors(stroke=color)
                     highlight.set_opacity(0.3)
                     highlight.update()
 
@@ -613,7 +621,13 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
+def create_highlighted_docx_from_s3(
+    text_s3_url,
+    transcript,
+    high_threshold=0.6,
+    low_threshold=0.3,
+    speaker_segments=None,
+):
     """
     Generates a highlighted DOCX report from a reference document (PDF or DOCX)
     and a transcript, then uploads it to S3.
@@ -657,7 +671,8 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             norm_trans=norm_trans,
             output_path=output_path,
             high_threshold=high_threshold,
-            low_threshold=low_threshold
+            low_threshold=low_threshold,
+            speaker_segments=speaker_segments,
         )
         
         # --- UPLOAD THE FINAL REPORT TO S3 ---
@@ -1009,51 +1024,257 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
 
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---
 
+def _normalize_color_to_hex(color_value: str) -> str:
+    """Normalize a color input into a DOCX-friendly hex string."""
+    if not color_value:
+        return "000000"
+    if isinstance(color_value, tuple):
+        r, g, b = color_value
+        return f"{int(r):02X}{int(g):02X}{int(b):02X}"
+    if hasattr(color_value, "rgb"):
+        # RGBColor from python-docx exposes .rgb which is already a hex string
+        return str(color_value.rgb)
+    color_str = str(color_value).replace("#", "").strip()
+    if color_str.startswith("RGBColor"):
+        parts = [p.strip().replace("0x", "") for p in color_str[color_str.find("(") + 1:color_str.find(")")].split(",")]
+        if len(parts) == 3:
+            return "".join(p.zfill(2) for p in parts)
+    if len(color_str) == 6:
+        return color_str.upper()
+    return "000000"
+
+
 def _apply_color_to_paragraph_runs(p_element, color_hex_str):
     """Applies a color to all text runs within a paragraph's XML element."""
+    hex_value = _normalize_color_to_hex(color_hex_str)
     for r_element in p_element.xpath('.//w:r'):
         rPr = r_element.find(qn('w:rPr'))
         if rPr is None:
             rPr = docx.oxml.OxmlElement('w:rPr')
             r_element.insert(0, rPr)
-        
-        color_element = docx.oxml.OxmlElement('w:color')
-        color_element.set(qn('w:val'), color_hex_str)
-        rPr.append(color_element)
 
-def _process_element_three_color(element, norm_trans, thresholds, colors):
-    """Finds all paragraphs in an XML element and applies color based on the two-threshold system."""
+        color_element = rPr.find(qn('w:color'))
+        if color_element is None:
+            color_element = docx.oxml.OxmlElement('w:color')
+            rPr.append(color_element)
+        color_element.set(qn('w:val'), hex_value)
+
+
+def _process_element_three_color(element, norm_trans, thresholds, colors, paragraph_details=None):
+    """Finds all paragraphs in an XML element and applies color based on the multi-threshold system."""
     if element is None:
         return
-        
+
     for p_element in element.xpath('.//w:p'):
         full_text = "".join(p_element.xpath('.//w:t/text()')).strip()
         if not full_text:
             continue
-            
+
         norm_para_text = normalize_line(full_text)
         best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
-        
-        color_to_apply = None
-        if best_score >= thresholds['high']:
-            color_to_apply = colors['GREEN']
-        elif best_score >= thresholds['low']:
-            color_to_apply = colors['RED']
-        
-        if color_to_apply:
-            _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
 
-def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
-    """Highlights text in a DOCX using the Green/Red/Black system."""
+        if best_score >= thresholds['high']:
+            color_key = 'MATCH'
+            status = 'correct'
+        elif best_score >= thresholds['low']:
+            color_key = 'MISMATCH'
+            status = 'mismatch'
+        else:
+            color_key = 'UNSPOKEN'
+            status = 'unspoken'
+
+        _apply_color_to_paragraph_runs(p_element, colors[color_key])
+
+        if paragraph_details is not None:
+            paragraph_details.append({
+                'text': full_text,
+                'score': best_score,
+                'status': status,
+            })
+
+
+def highlight_docx_three_color(
+    docx_path,
+    norm_trans,
+    output_path,
+    high_threshold=0.6,
+    low_threshold=0.3,
+    speaker_segments=None,
+):
+    """Highlights text in a DOCX using the enhanced color system and appends a spoken summary."""
     document = docx.Document(docx_path)
-    colors = {"GREEN": RGBColor(0, 176, 80), "RED": RGBColor(255, 0, 0)}
+    colors = {
+        "MATCH": "4CAF50",      # Light green for correct matches
+        "MISMATCH": "F28B82",   # Light red for mismatches
+        "UNSPOKEN": "FDCB9E",   # Light orange for unspoken content
+    }
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
+    paragraph_details = []
+
     # Process main body, headers, and footers for complete coverage
-    _process_element_three_color(document.element.body, norm_trans, thresholds, colors)
+    _process_element_three_color(document.element.body, norm_trans, thresholds, colors, paragraph_details)
     for section in document.sections:
-        for part in [section.header, section.footer, section.first_page_header, 
+        for part in [section.header, section.footer, section.first_page_header,
                      section.first_page_footer, section.even_page_header, section.even_page_footer]:
             _process_element_three_color(part._element, norm_trans, thresholds, colors)
 
+    if speaker_segments:
+        _append_spoken_content_summary(document, paragraph_details, speaker_segments, thresholds)
+
     document.save(output_path)
+
+
+CONFIRMATION_PHRASES = {
+    "that's correct",
+    "confirmed",
+    "absolutely",
+    "yes that's right",
+    "indeed",
+    "yes correct",
+    "correct",
+}
+
+
+def _format_timestamp(time_value):
+    if time_value is None:
+        return None
+    try:
+        total_seconds = max(float(time_value), 0.0)
+    except (TypeError, ValueError):
+        return None
+    minutes, seconds = divmod(int(total_seconds), 60)
+    return f"{int(minutes):02d}:{int(seconds):02d}"
+
+
+def _format_time_range(start, end):
+    start_fmt = _format_timestamp(start)
+    end_fmt = _format_timestamp(end)
+    if start_fmt and end_fmt and start_fmt != end_fmt:
+        return f"{start_fmt} - {end_fmt}"
+    return start_fmt or end_fmt or "—"
+
+
+def _segment_contains_confirmation(text: str) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in CONFIRMATION_PHRASES)
+
+
+def _lookup_confirmation_label(index, segments):
+    current = segments[index]
+    if _segment_contains_confirmation(current.get('text', '')):
+        return "Confirmed"
+
+    current_end = current.get('end')
+    current_speaker = current.get('speaker') or current.get('speaker_name')
+
+    for offset in range(1, 4):
+        if index + offset >= len(segments):
+            break
+        candidate = segments[index + offset]
+        candidate_speaker = candidate.get('speaker') or candidate.get('speaker_name')
+        if candidate_speaker == current_speaker:
+            continue
+
+        if current_end is not None and candidate.get('start') is not None:
+            if float(candidate['start']) - float(current_end or 0) > 30:
+                break
+
+        if _segment_contains_confirmation(candidate.get('text', '')):
+            display_name = candidate.get('speaker_name') or candidate.get('speaker') or "Speaker"
+            return f"Confirmed by {display_name}"
+
+    return ""
+
+
+def _append_spoken_content_summary(document, paragraph_details, speaker_segments, thresholds):
+    body_paragraphs = [entry['text'] for entry in paragraph_details if entry.get('text')]
+    body_norms = [normalize_line(text) for text in body_paragraphs]
+
+    segments = [seg for seg in speaker_segments if isinstance(seg, dict)]
+    segments.sort(key=lambda seg: seg.get('start') or 0)
+
+    summary_rows = []
+
+    for idx, segment in enumerate(segments):
+        spoken_text = (segment.get('text') or '').strip()
+        if not spoken_text:
+            continue
+
+        norm_spoken = normalize_line(spoken_text)
+        best_score = 0.0
+        best_idx = None
+
+        for doc_idx, doc_norm in enumerate(body_norms):
+            if not doc_norm:
+                continue
+            score = fuzz.token_set_ratio(norm_spoken, doc_norm) / 100.0
+            if score > best_score:
+                best_score = score
+                best_idx = doc_idx
+
+        if best_score >= thresholds['high']:
+            status = "Correct"
+        elif best_score >= thresholds['low']:
+            status = "Mismatch"
+        else:
+            status = "Mismatch"
+
+        related_phrase = body_paragraphs[best_idx] if best_idx is not None else ""
+        speaker_name = segment.get('speaker_name') or segment.get('speaker') or "Speaker"
+        timestamp = _format_time_range(segment.get('start'), segment.get('end'))
+        confirmation = _lookup_confirmation_label(idx, segments) if segments else ""
+
+        summary_rows.append({
+            'speaker': speaker_name,
+            'timestamp': timestamp,
+            'spoken_text': spoken_text,
+            'status': status,
+            'document_phrase': related_phrase,
+            'confirmation': confirmation,
+        })
+
+    for detail in paragraph_details:
+        if detail.get('status') != 'unspoken' or not detail.get('text'):
+            continue
+        summary_rows.append({
+            'speaker': '—',
+            'timestamp': '—',
+            'spoken_text': '',
+            'status': 'Unspoken',
+            'document_phrase': detail['text'],
+            'confirmation': '',
+        })
+
+    if not summary_rows:
+        return
+
+    document.add_page_break()
+    document.add_heading("Spoken Content Summary", level=1)
+
+    headers = [
+        "Speaker",
+        "Time",
+        "Spoken Content",
+        "Status",
+        "Document Phrase(s)",
+        "Confirmation",
+    ]
+
+    table = document.add_table(rows=1, cols=len(headers))
+    header_cells = table.rows[0].cells
+    for cell, title in zip(header_cells, headers):
+        paragraph = cell.paragraphs[0]
+        run = paragraph.add_run(title)
+        run.bold = True
+
+    for row in summary_rows:
+        cells = table.add_row().cells
+        cells[0].text = str(row['speaker'])
+        cells[1].text = row['timestamp']
+        cells[2].text = row['spoken_text']
+        cells[3].text = row['status']
+        cells[4].text = row['document_phrase']
+        cells[5].text = row['confirmation']
