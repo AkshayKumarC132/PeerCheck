@@ -422,18 +422,37 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     )
                     break
 
-def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcript_match=True):
+def generate_highlighted_pdf(doc_path, transcript_data, output_path, require_transcript_match=True):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
     and saves the result to a new PDF file.
-    Adds robust validation for PDF input.
+    Adds robust validation for PDF input and embeds spoken-content summaries per page.
     """
     import logging
+    import textwrap
+
     pdf_path = doc_path
     if doc_path.lower().endswith('.docx'):
         temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
         convert(doc_path, temp_pdf_path)
         pdf_path = temp_pdf_path
+
+    if isinstance(transcript_data, dict):
+        query_text = transcript_data.get("text", "")
+        transcript_segments = transcript_data.get("segments") or []
+    else:
+        query_text = transcript_data or ""
+        transcript_segments = []
+
+    def _format_timestamp(value: Optional[float]) -> str:
+        if value is None:
+            return "N/A"
+        total_seconds = max(0, int(round(value)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:02d}:{seconds:02d}"
 
     # --- Robust PDF Validation ---
     if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
@@ -501,6 +520,27 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     if not query_chunks: query_chunks = [query_text]
     query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
 
+    transcript_entries = []
+    if transcript_segments:
+        for seg in transcript_segments:
+            seg_text = (seg.get('text') or '').strip()
+            if not seg_text:
+                continue
+            transcript_entries.append({
+                'text': seg_text,
+                'norm': normalize_line(seg_text),
+                'start': seg.get('start'),
+                'end': seg.get('end'),
+            })
+    else:
+        for chunk in split_into_sentences(query_text):
+            transcript_entries.append({
+                'text': chunk,
+                'norm': normalize_line(chunk),
+                'start': None,
+                'end': None,
+            })
+
     # --- 3. Apply Highlighting to Relevant Pages ---
     for page_num in relevant_page_nums:
         page = target_doc.load_page(page_num)
@@ -513,12 +553,60 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
 
         cosine_scores = util.cos_sim(page_embeddings, query_embeddings)
 
-        matched_page_chunks = set()
+        status_chunks = {
+            'match': set(),
+            'mismatch': set(),
+            'unspoken': set(),
+        }
+        page_summary_entries = []
+
         import torch
         for i, row in enumerate(cosine_scores):
             if len(row) > 0 and torch.max(row) > 0.7:
                 if i < len(page_chunks):
-                    matched_page_chunks.add(page_chunks[i].lower())
+                    status_chunks['match'].add(page_chunks[i].lower())
+
+        for chunk in page_chunks:
+            chunk_lower = chunk.lower()
+            norm_chunk = normalize_line(chunk)
+            if not norm_chunk:
+                continue
+
+            best_score = 0.0
+            best_entry = None
+            for entry in transcript_entries:
+                if not entry['norm']:
+                    continue
+                score = fuzz.token_set_ratio(norm_chunk, entry['norm']) / 100.0
+                if score > best_score:
+                    best_score = score
+                    best_entry = entry
+
+            if best_score >= 0.7:
+                status = 'match'
+            elif best_score >= 0.4:
+                status = 'mismatch'
+            else:
+                status = 'unspoken'
+
+            status_chunks[status].add(chunk_lower)
+            if status == 'unspoken':
+                summary_text = chunk.strip()
+                timestamp = "N/A"
+            else:
+                spoken = best_entry or {}
+                summary_text = (spoken.get('text') or chunk).strip()
+                start_label = _format_timestamp(spoken.get('start'))
+                end_label = _format_timestamp(spoken.get('end'))
+                timestamp = (
+                    f"{start_label} - {end_label}" if end_label != "N/A" else start_label
+                )
+
+            page_summary_entries.append({
+                'status': status,
+                'text': summary_text,
+                'timestamp': timestamp,
+            })
 
         green_rects = []
         words_on_page = page.get_text("words")
@@ -531,24 +619,73 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
                 word_text_lower == t or word_text_lower in t or t in word_text_lower
                 for t in filtered_query_tokens
             )
-            is_semantic_match = any(word_text_lower in chunk for chunk in matched_page_chunks)
 
-            # Define light green and light red colors
-            light_green = (0.6, 1, 0.6)
-            light_red = (1, 0.6, 0.6)
-
-            if is_numeric_match or is_semantic_match:
-                highlight = page.add_highlight_annot(rect)
-                highlight.set_colors(stroke=light_green)
-                highlight.set_opacity(0.3)
-                highlight.update()
-                green_rects.append(rect)
+            status = None
+            if is_numeric_match:
+                status = 'match'
             else:
-                if not any(rect.intersects(g) for g in green_rects):
-                    highlight = page.add_highlight_annot(rect)
-                    highlight.set_colors(stroke=light_red)
-                    highlight.set_opacity(0.3)
-                    highlight.update()
+                for label in ('match', 'mismatch', 'unspoken'):
+                    if any(word_text_lower and word_text_lower in chunk for chunk in status_chunks[label]):
+                        status = label
+                        break
+
+            if not status:
+                continue
+
+            if status in {'mismatch', 'unspoken'} and any(rect.intersects(g) for g in green_rects):
+                continue
+
+            colors = {
+                'match': (0.6, 1, 0.6),
+                'mismatch': (1, 0.6, 0.6),
+                'unspoken': (0.8, 0.2, 0.2),
+            }
+
+            highlight = page.add_highlight_annot(rect)
+            highlight.set_colors(stroke=colors[status])
+            highlight.set_opacity(0.3)
+            highlight.update()
+
+            if status == 'match':
+                green_rects.append(rect)
+
+        if page_summary_entries:
+            summary_lines = ["Spoken Content Summary"]
+            for entry in page_summary_entries:
+                status_label = entry['status'].capitalize()
+                timestamp = entry['timestamp']
+                content = entry['text']
+                line = f"- [{status_label} | {timestamp}] {content}"
+                wrapped = textwrap.wrap(line, width=90)
+                summary_lines.extend(wrapped if wrapped else [line])
+
+            text_content = "\n".join(summary_lines)
+            line_height = 9
+            box_padding = 10
+            box_height = (len(summary_lines) * line_height) + (2 * box_padding)
+            page_rect = page.rect
+            box_top = max(page_rect.y1 - box_height - 24, page_rect.y0 + 24)
+            box_rect = fitz.Rect(
+                page_rect.x0 + 36,
+                box_top,
+                page_rect.x1 - 36,
+                min(page_rect.y1 - 24, box_top + box_height),
+            )
+            page.draw_rect(
+                box_rect,
+                color=(0.3, 0.3, 0.3),
+                fill=(1, 1, 1),
+                width=0.5,
+                fill_opacity=0.85,
+            )
+            page.insert_textbox(
+                box_rect,
+                text_content,
+                fontsize=8,
+                fontname="helv",
+                lineheight=1.15,
+                color=(0, 0, 0),
+            )
 
     # --- Post-highlight Cleanup Pass for Abbreviations ---
     logging.info("Starting abbreviation cleanup pass")
@@ -575,7 +712,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
 
     return output_path
 
-def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_match=True):
+def create_highlighted_pdf_document(text_s3_url, transcript_data, require_transcript_match=True):
     """
     Orchestrates the generation of a highlighted PDF using the new logic.
     """
@@ -592,7 +729,7 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
 
         generate_highlighted_pdf(
             temp_input_path,
-            transcript,
+            transcript_data,
             temp_output_path,
             require_transcript_match=require_transcript_match,
         )
@@ -1016,7 +1153,11 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
         if rPr is None:
             rPr = docx.oxml.OxmlElement('w:rPr')
             r_element.insert(0, rPr)
-        
+
+        existing_color = rPr.find(qn('w:color'))
+        if existing_color is not None:
+            rPr.remove(existing_color)
+
         color_element = docx.oxml.OxmlElement('w:color')
         color_element.set(qn('w:val'), color_hex_str)
         rPr.append(color_element)
@@ -1034,19 +1175,23 @@ def _process_element_three_color(element, norm_trans, thresholds, colors):
         norm_para_text = normalize_line(full_text)
         best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
         
-        color_to_apply = None
         if best_score >= thresholds['high']:
-            color_to_apply = colors['GREEN']
+            color_to_apply = colors['MATCH']
         elif best_score >= thresholds['low']:
-            color_to_apply = colors['RED']
-        
-        if color_to_apply:
-            _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+            color_to_apply = colors['MISMATCH']
+        else:
+            color_to_apply = colors['UNSPOKEN']
+
+        _apply_color_to_paragraph_runs(p_element, color_to_apply)
 
 def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
-    """Highlights text in a DOCX using the Green/Red/Black system."""
+    """Highlights text in a DOCX using match / mismatch / unspoken colors."""
     document = docx.Document(docx_path)
-    colors = {"GREEN": RGBColor(0, 176, 80), "RED": RGBColor(255, 0, 0)}
+    colors = {
+        "MATCH": "00B050",
+        "MISMATCH": "FF9999",
+        "UNSPOKEN": "8B0000",
+    }
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
     # Process main body, headers, and footers for complete coverage
