@@ -496,7 +496,23 @@ class DownloadProcessedDocumentView(GenericAPIView):
             
             reference_doc = session.reference_document
             audio_file = session.audio_file
-            
+
+            transcript_payload = audio_file.transcription or {}
+            transcript = transcript_payload.get('text', '')
+            if not transcript:
+                return Response({
+                    'error': 'No transcript available for processing',
+                    'timestamp': timezone.now().isoformat()
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            transcript_segments = transcript_payload.get('segments') or []
+            diarization_payload = audio_file.diarization
+            spoken_summary = generate_spoken_content_summary(
+                reference_doc.file_path,
+                transcript_segments,
+                diarization_payload,
+            )
+
             # Check if processed DOCX already exists in S3
             if session.processed_docx_path:
                 print(f"Using existing processed document: {session.processed_docx_path}")
@@ -505,14 +521,6 @@ class DownloadProcessedDocumentView(GenericAPIView):
                 print("Creating new processed document...")
                 try:
                     # Create highlighted DOCX and upload to S3
-                    transcript = audio_file.transcription.get('text', '') if audio_file.transcription else ''
-                    
-                    if not transcript:
-                        return Response({
-                            'error': 'No transcript available for processing',
-                            'timestamp': timezone.now().isoformat()
-                        }, status=status.HTTP_400_BAD_REQUEST)
-                    
                     # Create highlighted document based on file extension
                     file_ext = reference_doc.file_path.rsplit('.', 1)[-1].lower()
                     use_transcript = (
@@ -529,12 +537,14 @@ class DownloadProcessedDocumentView(GenericAPIView):
                             reference_doc.file_path,
                             transcript,
                             require_transcript_match=use_transcript,
+                            spoken_summary=spoken_summary,
                         )
                     elif file_ext == 'docx':
                         from .new_utils import create_highlighted_docx_from_s3
                         processed_s3_url = create_highlighted_docx_from_s3(
                             reference_doc.file_path,
-                            transcript
+                            transcript,
+                            spoken_summary=spoken_summary,
                         )
                     else:
                         return Response({
@@ -557,16 +567,6 @@ class DownloadProcessedDocumentView(GenericAPIView):
             # Save the S3 link to AudioFile.report_path
             audio_file.report_path = processed_s3_url
             audio_file.save()
-
-            transcript_payload = audio_file.transcription or {}
-            transcript_segments = transcript_payload.get('segments') or []
-            diarization_payload = audio_file.diarization
-
-            spoken_summary = generate_spoken_content_summary(
-                reference_doc.file_path,
-                transcript_segments,
-                diarization_payload,
-            )
 
             # Direct file download
             return Response({

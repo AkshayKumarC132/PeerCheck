@@ -5,6 +5,7 @@ import tempfile
 import csv
 import logging
 import threading
+import textwrap
 from typing import Dict, List, Optional
 
 import boto3
@@ -18,14 +19,15 @@ import docx
 from difflib import SequenceMatcher
 from fuzzywuzzy import fuzz
 from io import BytesIO
-from docx.shared import RGBColor
+from docx.shared import RGBColor, Pt
 from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+from docx.text.paragraph import Run
 import docx.oxml
 import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
-from docx.enum.text import WD_COLOR_INDEX
-from docx.shared import RGBColor
+from docx.enum.text import WD_COLOR_INDEX, WD_ALIGN_PARAGRAPH
 import fitz  # PyMuPDF
 from docx2pdf import convert
 
@@ -422,7 +424,31 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     )
                     break
 
-def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcript_match=True):
+
+def _hex_to_rgb_tuple(hex_color: str) -> tuple:
+    hex_color = (hex_color or "").lstrip('#')
+    if len(hex_color) != 6:
+        return 0.6, 0.6, 0.6
+    return tuple(int(hex_color[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+def _format_timestamp(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    seconds = max(0.0, float(seconds))
+    minutes, secs = divmod(int(round(seconds)), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+def generate_highlighted_pdf(
+    doc_path,
+    query_text,
+    output_path,
+    require_transcript_match=True,
+    spoken_summary: Optional[Dict] = None,
+):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
     and saves the result to a new PDF file.
@@ -575,6 +601,205 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
         )
 
     _replace_validated_abbreviations(target_doc, validated_abbrs)
+
+    summary_payload = spoken_summary or {}
+
+    def _find_available_button_rect(page, width=140, height=28, margin=18):
+        page_rect = page.rect
+        candidates = [
+            fitz.Rect(page_rect.x1 - width - margin, page_rect.y0 + margin,
+                      page_rect.x1 - margin, page_rect.y0 + margin + height),
+            fitz.Rect(page_rect.x1 - width - margin, page_rect.y1 - margin - height,
+                      page_rect.x1 - margin, page_rect.y1 - margin),
+            fitz.Rect(page_rect.x0 + margin, page_rect.y0 + margin,
+                      page_rect.x0 + margin + width, page_rect.y0 + margin + height),
+            fitz.Rect(page_rect.x0 + margin, page_rect.y1 - margin - height,
+                      page_rect.x0 + margin + width, page_rect.y1 - margin),
+        ]
+        words = [fitz.Rect(w[:4]) for w in page.get_text("words")]
+        for candidate in candidates:
+            if all(not candidate.intersects(word_rect) for word_rect in words):
+                return candidate
+        return candidates[0]
+
+    def _add_navigation_button(page, label, target_page_index, fill_color=(0.27, 0.47, 0.79)):
+        button_rect = _find_available_button_rect(page)
+        shape = page.new_shape()
+        shape.draw_rect(button_rect)
+        shape.finish(color=fill_color, fill=fill_color, overlay=True)
+        shape.commit()
+        page.insert_textbox(
+            button_rect,
+            label,
+            fontsize=10,
+            fontname="helv",
+            align=fitz.TEXT_ALIGN_CENTER,
+            color=(1, 1, 1),
+            overlay=True,
+        )
+        page.insert_link({
+            "kind": fitz.LINK_GOTO,
+            "from": button_rect,
+            "page": max(0, int(target_page_index)),
+        })
+
+    def _render_pdf_summary_page(page, page_data, legend_map):
+        rect = page.rect
+        margin = 36
+        cursor_y = margin
+        heading = f"Spoken Content Summary – Page {page_data.get('page_number')}"
+        page.insert_text(
+            (margin, cursor_y),
+            heading,
+            fontsize=16,
+            fontname="helv",
+            color=(0, 0, 0),
+        )
+        cursor_y += 26
+
+        legend_items = list((legend_map or {}).items())
+        for key, meta in legend_items:
+            label = meta.get("label") or key.title()
+            color = _hex_to_rgb_tuple(meta.get("color"))
+            swatch = fitz.Rect(margin, cursor_y, margin + 14, cursor_y + 14)
+            page.draw_rect(swatch, color=color, fill=color, overlay=True)
+            page.insert_text(
+                (margin + 18, cursor_y + 11),
+                label,
+                fontsize=10,
+                fontname="helv",
+                color=(0, 0, 0),
+            )
+            cursor_y += 18
+
+        if legend_items:
+            cursor_y += 6
+
+        segments = page_data.get("segments") or []
+        if not segments:
+            page.insert_text(
+                (margin, cursor_y),
+                "No spoken content summary was generated for this page.",
+                fontsize=11,
+                fontname="helv",
+                color=(0.2, 0.2, 0.2),
+            )
+            return
+
+        wrap_width = max(60, int((rect.width - (2 * margin)) / 5))
+        lines: List[str] = []
+        for index, segment in enumerate(segments, start=1):
+            status = (segment.get("status") or "").title() or "Unknown"
+            confidence = round(float(segment.get("confidence") or 0.0), 2)
+            lines.append(f"{index}. Status: {status} (confidence {confidence})")
+
+            doc_text = segment.get("document_text") or "-"
+            lines.append(
+                textwrap.fill(
+                    f"Document: {doc_text}",
+                    width=wrap_width,
+                    subsequent_indent=" " * 11,
+                )
+            )
+
+            spoken_text = segment.get("spoken_text") or "-"
+            speaker = segment.get("speaker") or "Unknown speaker"
+            start = _format_timestamp(segment.get("start"))
+            end = _format_timestamp(segment.get("end"))
+            spoken_header = f"Spoken ({speaker}, {start} – {end}): {spoken_text}"
+            lines.append(
+                textwrap.fill(
+                    spoken_header,
+                    width=wrap_width,
+                    subsequent_indent=" " * 11,
+                )
+            )
+            lines.append("")
+
+        textbox_rect = fitz.Rect(margin, cursor_y, rect.x1 - margin, rect.y1 - margin)
+        page.insert_textbox(
+            textbox_rect,
+            "\n".join(lines).strip(),
+            fontsize=11,
+            fontname="helv",
+            lineheight=1.3,
+            color=(0.1, 0.1, 0.1),
+        )
+
+    def _render_unmatched_page(page, unmatched_segments):
+        rect = page.rect
+        margin = 36
+        cursor_y = margin
+        page.insert_text(
+            (margin, cursor_y),
+            "Unmatched Spoken Segments",
+            fontsize=16,
+            fontname="helv",
+            color=(0, 0, 0),
+        )
+        cursor_y += 26
+
+        wrap_width = max(60, int((rect.width - (2 * margin)) / 5))
+        lines: List[str] = []
+        for index, segment in enumerate(unmatched_segments, start=1):
+            speaker = segment.get("speaker") or "Unknown speaker"
+            start = _format_timestamp(segment.get("start"))
+            end = _format_timestamp(segment.get("end"))
+            spoken_text = segment.get("spoken_text") or "-"
+            header = f"{index}. {speaker} ({start} – {end})"
+            lines.append(header)
+            lines.append(
+                textwrap.fill(
+                    f"Spoken: {spoken_text}",
+                    width=wrap_width,
+                    subsequent_indent=" " * 8,
+                )
+            )
+            lines.append("")
+
+        textbox_rect = fitz.Rect(margin, cursor_y, rect.x1 - margin, rect.y1 - margin)
+        page.insert_textbox(
+            textbox_rect,
+            "\n".join(lines).strip(),
+            fontsize=11,
+            fontname="helv",
+            lineheight=1.3,
+            color=(0.1, 0.1, 0.1),
+        )
+
+    summary_pages = summary_payload.get("pages") or []
+    legend_map = summary_payload.get("legend") or {}
+    unmatched_segments = summary_payload.get("unmatched_spoken_segments") or []
+
+    default_rect = target_doc[0].rect if len(target_doc) else fitz.Rect(0, 0, 595, 842)
+
+    if summary_pages:
+        for page_info in sorted(summary_pages, key=lambda item: item.get("page_number") or 0, reverse=True):
+            page_number = page_info.get("page_number")
+            if not page_number:
+                continue
+            base_index = max(0, min(int(page_number) - 1, len(target_doc) - 1))
+            base_page = target_doc.load_page(base_index)
+            summary_page = target_doc.new_page(
+                base_index + 1,
+                width=base_page.rect.width,
+                height=base_page.rect.height,
+            )
+            _render_pdf_summary_page(summary_page, page_info, legend_map)
+            _add_navigation_button(summary_page, f"Back to Page {page_number}", base_index)
+            base_page = target_doc.load_page(base_index)
+            _add_navigation_button(base_page, "Show Spoken Summary", summary_page.number)
+
+    if unmatched_segments:
+        rect_source = default_rect
+        unmatched_page = target_doc.new_page(
+            -1,
+            width=rect_source.width,
+            height=rect_source.height,
+        )
+        _render_unmatched_page(unmatched_page, unmatched_segments)
+        _add_navigation_button(unmatched_page, "Back to Page 1", 0)
+
     # --- 4. Save the Output ---
     try:
         target_doc.save(output_path, garbage=4, deflate=True)
@@ -585,7 +810,12 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
 
     return output_path
 
-def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_match=True):
+def create_highlighted_pdf_document(
+    text_s3_url,
+    transcript,
+    require_transcript_match=True,
+    spoken_summary: Optional[Dict] = None,
+):
     """
     Orchestrates the generation of a highlighted PDF using the new logic.
     """
@@ -605,6 +835,7 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
             transcript,
             temp_output_path,
             require_transcript_match=require_transcript_match,
+            spoken_summary=spoken_summary,
         )
 
         with open(temp_output_path, 'rb') as f_out:
@@ -623,7 +854,13 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
+def create_highlighted_docx_from_s3(
+    text_s3_url,
+    transcript,
+    high_threshold=0.6,
+    low_threshold=0.3,
+    spoken_summary: Optional[Dict] = None,
+):
     """
     Generates a highlighted DOCX report from a reference document (PDF or DOCX)
     and a transcript, then uploads it to S3.
@@ -667,7 +904,8 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             norm_trans=norm_trans,
             output_path=output_path,
             high_threshold=high_threshold,
-            low_threshold=low_threshold
+            low_threshold=low_threshold,
+            spoken_summary=spoken_summary,
         )
         
         # --- UPLOAD THE FINAL REPORT TO S3 ---
@@ -1294,7 +1532,14 @@ def _process_element_three_color(element, norm_trans, thresholds, colors):
 
         _apply_color_to_paragraph_runs(p_element, color_to_apply)
 
-def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
+def highlight_docx_three_color(
+    docx_path,
+    norm_trans,
+    output_path,
+    high_threshold=0.6,
+    low_threshold=0.3,
+    spoken_summary: Optional[Dict] = None,
+):
     """Highlights text in a DOCX using the Green/Red/Black system."""
     document = docx.Document(docx_path)
     colors = {
@@ -1307,8 +1552,167 @@ def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshol
     # Process main body, headers, and footers for complete coverage
     _process_element_three_color(document.element.body, norm_trans, thresholds, colors)
     for section in document.sections:
-        for part in [section.header, section.footer, section.first_page_header, 
+        for part in [section.header, section.footer, section.first_page_header,
                      section.first_page_footer, section.even_page_header, section.even_page_footer]:
             _process_element_three_color(part._element, norm_trans, thresholds, colors)
 
+    if spoken_summary:
+        _append_spoken_summary_to_docx(document, spoken_summary)
+
     document.save(output_path)
+
+
+def _add_docx_bookmark(paragraph, bookmark_name: str) -> None:
+    bookmark_id = str(uuid.uuid4().int % 1000000)
+    start = OxmlElement('w:bookmarkStart')
+    start.set(qn('w:id'), bookmark_id)
+    start.set(qn('w:name'), bookmark_name)
+    end = OxmlElement('w:bookmarkEnd')
+    end.set(qn('w:id'), bookmark_id)
+    paragraph._p.insert(0, start)
+    paragraph._p.append(end)
+
+
+def _add_docx_internal_link(paragraph, text: str, anchor: str) -> Run:
+    hyperlink = OxmlElement('w:hyperlink')
+    hyperlink.set(qn('w:anchor'), anchor)
+    new_run = OxmlElement('w:r')
+    r_pr = OxmlElement('w:rPr')
+    new_run.append(r_pr)
+    text_element = OxmlElement('w:t')
+    text_element.text = text
+    new_run.append(text_element)
+    hyperlink.append(new_run)
+    paragraph._p.append(hyperlink)
+    return Run(new_run, paragraph)
+
+
+def _apply_button_style(run: Run, fill_hex: str = "#4472C4") -> None:
+    fill = fill_hex.lstrip('#').upper() or "4472C4"
+    run.font.color.rgb = RGBColor(255, 255, 255)
+    run.font.bold = True
+    run.font.size = Pt(10)
+    r_pr = run._r.get_or_add_rPr()
+    shading = OxmlElement('w:shd')
+    shading.set(qn('w:val'), 'clear')
+    shading.set(qn('w:color'), 'auto')
+    shading.set(qn('w:fill'), fill)
+    r_pr.append(shading)
+
+
+def _docx_cell_set_shading(cell, fill_hex: str) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = tc_pr.find(qn('w:shd'))
+    if shd is None:
+        shd = OxmlElement('w:shd')
+        tc_pr.append(shd)
+    shd.set(qn('w:val'), 'clear')
+    shd.set(qn('w:color'), 'auto')
+    shd.set(qn('w:fill'), fill_hex.lstrip('#').upper())
+
+
+def _set_table_style(table, style_name: str, fallback: str = 'Table Grid') -> None:
+    try:
+        table.style = style_name
+    except (KeyError, ValueError):
+        table.style = fallback
+
+
+def _add_docx_summary_header_button(document: docx.Document, anchor_name: str) -> None:
+    label = "Show Spoken Summary"
+    for section in document.sections:
+        header = section.header
+        if any(anchor_name in paragraph._p.xml for paragraph in header.paragraphs):
+            continue
+        paragraph = header.add_paragraph()
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+        run = _add_docx_internal_link(paragraph, label, anchor_name)
+        _apply_button_style(run)
+
+
+def _append_spoken_summary_to_docx(document: docx.Document, spoken_summary: Dict) -> None:
+    pages = spoken_summary.get('pages') or []
+    unmatched = spoken_summary.get('unmatched_spoken_segments') or []
+    legend = spoken_summary.get('legend') or {}
+
+    if not pages and not unmatched:
+        return
+
+    document.add_page_break()
+    heading = document.add_heading("Spoken Content Summary", level=1)
+    anchor_name = "SpokenContentSummary"
+    _add_docx_bookmark(heading, anchor_name)
+    _add_docx_summary_header_button(document, anchor_name)
+
+    if legend:
+        legend_table = document.add_table(rows=1, cols=2)
+        _set_table_style(legend_table, 'Light List Accent 1')
+        header_cells = legend_table.rows[0].cells
+        header_cells[0].text = "Status"
+        header_cells[1].text = "Description"
+        for key, meta in legend.items():
+            row_cells = legend_table.add_row().cells
+            label = meta.get('label') or key.title()
+            description = meta.get('description') or label
+            row_cells[0].text = label
+            row_cells[1].text = description
+            color = meta.get('color') or '#FFFFFF'
+            _docx_cell_set_shading(row_cells[0], color)
+        document.add_paragraph()
+
+    for page_data in pages:
+        page_number = page_data.get('page_number')
+        document.add_heading(f"Page {page_number}", level=2)
+        segments = page_data.get('segments') or []
+        if not segments:
+            document.add_paragraph("No spoken segments were matched for this page.")
+            continue
+
+        table = document.add_table(rows=1, cols=4)
+        _set_table_style(table, 'Light List Accent 2')
+        headers = table.rows[0].cells
+        headers[0].text = "Document Text"
+        headers[1].text = "Spoken Details"
+        headers[2].text = "Status"
+        headers[3].text = "Confidence"
+
+        for segment in segments:
+            row_cells = table.add_row().cells
+            row_cells[0].text = segment.get('document_text') or '-'
+
+            spoken_lines = []
+            speaker = segment.get('speaker') or 'Unknown speaker'
+            start = _format_timestamp(segment.get('start'))
+            end = _format_timestamp(segment.get('end'))
+            spoken_text = segment.get('spoken_text') or '-'
+            spoken_lines.append(f"{speaker} ({start} – {end})")
+            spoken_lines.append(spoken_text)
+            row_cells[1].text = "\n".join(spoken_lines)
+
+            status_label = (segment.get('status') or '').title() or 'Unknown'
+            row_cells[2].text = status_label
+            color = legend.get(segment.get('status') or '', {}).get('color')
+            if color:
+                _docx_cell_set_shading(row_cells[2], color)
+
+            confidence = round(float(segment.get('confidence') or 0.0), 2)
+            row_cells[3].text = str(confidence)
+
+        document.add_paragraph()
+
+    if unmatched:
+        document.add_heading("Unmatched Spoken Segments", level=2)
+        table = document.add_table(rows=1, cols=3)
+        _set_table_style(table, 'Light List Accent 3')
+        headers = table.rows[0].cells
+        headers[0].text = "Speaker"
+        headers[1].text = "Timestamps"
+        headers[2].text = "Spoken Text"
+
+        for segment in unmatched:
+            row_cells = table.add_row().cells
+            row_cells[0].text = segment.get('speaker') or 'Unknown speaker'
+            start = _format_timestamp(segment.get('start'))
+            end = _format_timestamp(segment.get('end'))
+            row_cells[1].text = f"{start} – {end}"
+            row_cells[2].text = segment.get('spoken_text') or '-'
