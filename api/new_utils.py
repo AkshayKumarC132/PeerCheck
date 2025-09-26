@@ -11,7 +11,6 @@ import boto3
 import numpy as np
 from django.conf import settings as django_settings
 from peercheck import settings
-from pdf2docx import Converter
 import whisper
 import PyPDF2
 import docx
@@ -26,8 +25,32 @@ from collections import Counter
 from sentence_transformers import SentenceTransformer, util
 from docx.enum.text import WD_COLOR_INDEX
 from docx.shared import RGBColor
-import fitz  # PyMuPDF
-from docx2pdf import convert
+
+try:  # pragma: no cover - validate PyMuPDF availability
+    import fitz  # type: ignore[attr-defined]
+except Exception as exc:  # pragma: no cover - provide clearer guidance
+    raise ImportError(
+        "PyMuPDF is required for PDF highlighting features. Install the 'PyMuPDF' "
+        "package instead of the legacy 'fitz' package."
+    ) from exc
+
+if not hasattr(fitz, "Matrix") or not hasattr(fitz, "Rect"):  # pragma: no cover
+    raise ImportError(
+        "An incompatible 'fitz' package was detected. Please uninstall it and "
+        "install 'PyMuPDF' to enable PDF processing."
+    )
+# Optional conversion utilities. They are only needed when converting between
+# DOCX and PDF formats, so import them lazily to avoid hard failures in
+# environments where the underlying dependencies (e.g. PyMuPDF) are missing.
+try:  # pragma: no cover - import guard
+    from pdf2docx import Converter  # type: ignore
+except Exception:  # pragma: no cover - gracefully handle optional dependency
+    Converter = None
+
+try:  # pragma: no cover - import guard
+    from docx2pdf import convert  # type: ignore
+except Exception:  # pragma: no cover - gracefully handle optional dependency
+    convert = None
 
 from pyannote.audio import Pipeline, Inference, Model
 from pyannote.core import Segment
@@ -439,6 +462,11 @@ def generate_highlighted_pdf(
 
     pdf_path = doc_path
     if doc_path.lower().endswith('.docx'):
+        if convert is None:
+            raise RuntimeError(
+                "docx2pdf is required to convert DOCX files to PDF for highlighting. "
+                "Please install docx2pdf and its dependencies or provide a PDF input."
+            )
         temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
         convert(doc_path, temp_pdf_path)
         pdf_path = temp_pdf_path
@@ -895,6 +923,11 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             print("Input is a DOCX file. No conversion needed.")
             docx_in_path = temp_input_path
         elif ext == 'pdf':
+            if Converter is None:
+                raise RuntimeError(
+                    "pdf2docx (and its PyMuPDF dependency) is required to convert PDF files "
+                    "to DOCX for highlighting. Please install pdf2docx or upload a DOCX file."
+                )
             print("Input is a PDF file. Converting to DOCX...")
             docx_in_path = tempfile.NamedTemporaryFile(delete=False, suffix='.docx').name
             cv = Converter(temp_input_path)
