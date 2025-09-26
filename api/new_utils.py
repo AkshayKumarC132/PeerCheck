@@ -7,7 +7,7 @@ import logging
 import threading
 import textwrap
 import json
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import boto3
 import numpy as np
@@ -783,28 +783,91 @@ def generate_highlighted_pdf(
     summary_pages = summary_payload.get("pages") or []
     legend_map = summary_payload.get("legend") or {}
 
+    def _sorted_segments(segments: List[Dict]) -> List[Dict]:
+        ordered: List[Dict] = []
+        for index, segment in enumerate(segments):
+            copy_segment = dict(segment or {})
+            document_text = copy_segment.get("document_text")
+            if not (isinstance(document_text, str) and document_text.strip()):
+                spoken_text = copy_segment.get("spoken_text")
+                if isinstance(spoken_text, str) and spoken_text.strip():
+                    copy_segment["document_text"] = spoken_text
+            if "spoken_text" not in copy_segment or not str(copy_segment.get("spoken_text")).strip():
+                doc_text = copy_segment.get("document_text")
+                if isinstance(doc_text, str) and doc_text.strip():
+                    copy_segment["spoken_text"] = doc_text
+            copy_segment["_order_index"] = index
+            ordered.append(copy_segment)
+
+        def _coerce(value: Any) -> Optional[float]:
+            try:
+                if value is None:
+                    return None
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def _sort_key(item: Dict) -> Tuple[int, float, float, int]:
+            start_val = _coerce(item.get("start"))
+            end_val = _coerce(item.get("end"))
+            return (
+                0 if start_val is not None else 1,
+                start_val if start_val is not None else float("inf"),
+                end_val if end_val is not None else float("inf"),
+                int(item.get("_order_index", 0)),
+            )
+
+        ordered.sort(key=_sort_key)
+
+        for item in ordered:
+            item.pop("_order_index", None)
+        return ordered
+
     if summary_pages:
-        summary_pages = sorted(
+        sorted_pages = sorted(
             [p for p in summary_pages if p.get("page_number")],
             key=lambda item: int(item.get("page_number")),
         )
-        inserted_count = 0
-        for page_info in summary_pages:
-            page_number = int(page_info.get("page_number"))
-            base_index = max(0, min(page_number - 1 + inserted_count, len(target_doc) - 1))
-            base_page = target_doc.load_page(base_index)
+
+        target_page: Optional[Dict] = None
+        fallback_page: Optional[Dict] = None
+        normalized_pages: List[Dict] = []
+
+        for page_info in sorted_pages:
             segments = page_info.get("segments") or []
             if not segments:
                 continue
-            created = _draw_summary_rows(
+            normalized_segments = _sorted_segments(segments)
+            page_info = {**page_info, "segments": normalized_segments}
+            normalized_pages.append(page_info)
+            if fallback_page is None:
+                fallback_page = page_info
+
+            has_matched = any(
+                (segment.get("status") or "").lower() in {"correct", "mismatch"}
+                for segment in normalized_segments
+            )
+            if has_matched:
+                target_page = page_info
+                break
+
+        selected_page = target_page or fallback_page
+
+        if normalized_pages:
+            summary_payload["pages"] = normalized_pages
+
+        if selected_page:
+            page_number = int(selected_page.get("page_number"))
+            base_index = max(0, min(page_number - 1, len(target_doc) - 1))
+            base_page = target_doc.load_page(base_index)
+            _draw_summary_rows(
                 target_doc,
                 base_index,
                 base_page.rect,
                 page_number,
-                segments,
+                selected_page.get("segments") or [],
                 legend_map,
             )
-            inserted_count += created
 
     # --- 4. Save the Output ---
     try:
