@@ -1,17 +1,20 @@
 # Speech-to-Text
 vosk
 openai-whisper
+# faster_whisper
 torch
 torchaudio
 torchvision
+pyannote.audio
 
 # Text Analysis/NLP
 spacy
 transformers
 spacy-transformers
+sentence-transformers
 
 # Text-to-Speech
-TTS
+# TTS
 
 # API Development
 fastapi
@@ -29,6 +32,7 @@ numpy
 pandas
 pydub
 ffmpeg-python
+
 # base64
 fuzzywuzzy
 python-Levenshtein
@@ -46,6 +50,7 @@ psycopg2-binary
 python-docx
 pdf2docx
 PyPDF2
+docx2pdf
 
 # Windows COM Support (MISSING - NOW ADDED)
 pywin32

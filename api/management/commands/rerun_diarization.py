@@ -1,6 +1,6 @@
 from django.core.management.base import BaseCommand
 from api.models import AudioFile
-from api.new_utils import diarization_from_audio
+from api.new_utils import diarization_from_audio, build_speaker_summary
 
 class Command(BaseCommand):
     help = 'Rerun diarization for AudioFiles with null diarization'
@@ -18,7 +18,10 @@ class Command(BaseCommand):
                 diarization_segments = diarization_from_audio(
                     audio_file.file_path, transcript_segments, transcript_words
                 )
-                audio_file.diarization = diarization_segments
+                audio_file.diarization = {
+                    'segments': diarization_segments,
+                    'speakers': build_speaker_summary(diarization_segments),
+                }
                 audio_file.save()
                 self.stdout.write(self.style.SUCCESS(f'Processed {audio_file.id}'))
             except Exception as e:

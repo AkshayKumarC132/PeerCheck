@@ -3,8 +3,12 @@ import tempfile
 import uuid
 import time
 import logging
+import threading
 from datetime import datetime, timedelta
+
+import numpy as np
 from django.conf import settings
+from django.db import close_old_connections
 from django.http import HttpResponse, Http404
 from django.utils import timezone
 from rest_framework import status
@@ -13,24 +17,64 @@ from rest_framework.response import Response
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 import traceback
-from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, AuditLog
+from .models import (
+    ReferenceDocument,
+    AudioFile,
+    ProcessingSession,
+    UserProfile,
+    AuditLog,
+    SpeakerProfile,
+)
 from .new_utils import (
-    extract_text_from_s3, transcribe_audio_from_s3, diarization_from_audio,  # <-- add diarization_from_audio
-    find_missing, upload_file_to_s3,
-    get_s3_key_from_url, s3_client, create_highlighted_pdf_document
+    extract_text_from_s3,
+    transcribe_audio_from_s3,
+    diarization_from_audio,
+    build_speaker_summary,
+    find_missing,
+    upload_file_to_s3,
+    get_s3_key_from_url,
+    s3_client,
+    create_highlighted_pdf_document,
 )
 from .authentication import token_verification
 from .new_serializers import (
-    UploadAndProcessSerializer, ProcessingResultSerializer,
-    DownloadRequestSerializer, UserDocumentsSerializer,
-    CleanupRequestSerializer, CleanupResponseSerializer,
-    ErrorResponseSerializer, ProcessingSessionDetailSerializer,
-    ReferenceDocumentSerializer
+    UploadAndProcessSerializer,
+    ProcessingResultSerializer,
+    DownloadRequestSerializer,
+    UserDocumentsSerializer,
+    CleanupRequestSerializer,
+    CleanupResponseSerializer,
+    ErrorResponseSerializer,
+    ProcessingSessionDetailSerializer,
+    ReferenceDocumentSerializer,
+    RunDiarizationSerializer,
+    SpeakerProfileMappingSerializer,
 )
-import requests
-from pyannote.audio import Pipeline
-import subprocess
-import threading
+
+
+def _start_diarization_thread(audio_file_id, audio_source, transcript_segments, transcript_words):
+    """Kick off background diarization work for the given audio file."""
+
+    def _run_diarization():
+        close_old_connections()
+        try:
+            segments = diarization_from_audio(
+                audio_source,
+                transcript_segments,
+                transcript_words,
+            )
+            payload = {
+                "segments": segments,
+                "speakers": build_speaker_summary(segments),
+            }
+            AudioFile.objects.filter(id=audio_file_id).update(diarization=payload)
+        except Exception:
+            logging.exception("Failed to complete diarization for audio %s", audio_file_id)
+            AudioFile.objects.filter(id=audio_file_id).update(diarization=None)
+
+    thread = threading.Thread(target=_run_diarization, daemon=True)
+    thread.start()
+    return thread
 
 class UploadAndProcessView(CreateAPIView):
     """
@@ -153,36 +197,16 @@ class UploadAndProcessView(CreateAPIView):
             audio_obj.save()
 
             # --- Speaker Diarization (using diarization_from_audio) ---
-            diarization_segments = []
+            diarization_payload = None
             diarization_error = None
-            # try:
-            #     diarization_segments = diarization_from_audio(audio_s3_url, transcript_segments, transcript_words)
-            # except Exception as diar_err:
-            #     diarization_error = str(diar_err)
-            #     print(f"Diarization error: {diarization_error}")
-            # audio_obj.diarization = diarization_segments if diarization_segments else None
-            # audio_obj.save()
-            # --- End Speaker Diarization ---
-            
-            # --- Speaker Diarization in Background Thread ---
-            def diarization_background(audio_file_id, audio_s3_url, transcript_segments, transcript_words):
-                try:
-                    diarization_segments = diarization_from_audio(audio_s3_url, transcript_segments, transcript_words)
-                    audio_file = AudioFile.objects.get(id=audio_file_id)
-                    audio_file.diarization = diarization_segments
-                    audio_file.save()
-                except Exception as diar_err:
-                    audio_file = AudioFile.objects.get(id=audio_file_id)
-                    audio_file.diarization = None
-                    audio_file.save()
-                    print(f"Diarization error (background): {str(diar_err)}")
-
-            diarization_thread = threading.Thread(
-                target=diarization_background,
-                args=(audio_obj.id, audio_s3_url, transcript_segments, transcript_words),
-                daemon=True
+            audio_obj.diarization = None
+            audio_obj.save(update_fields=['diarization'])
+            _start_diarization_thread(
+                audio_obj.id,
+                audio_s3_url,
+                transcript_segments,
+                transcript_words,
             )
-            diarization_thread.start()
             # --- End Speaker Diarization ---
             
             # Perform comparison analysis
@@ -226,8 +250,9 @@ class UploadAndProcessView(CreateAPIView):
                 'missing_content': missing_html,
                 'entire_document': entire_html,
                 'processing_time': round(processing_time, 2),
-                'diarization': diarization_segments if diarization_segments else None,
-                'diarization_error': diarization_error
+                'diarization': diarization_payload,
+                'diarization_error': diarization_error,
+                'diarization_status': 'processing' if diarization_payload is None else 'completed',
             }
 
             # Don't validate response data with serializer, just return it directly
@@ -253,6 +278,182 @@ class UploadAndProcessView(CreateAPIView):
             }
             
             return Response(error_data, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class RunDiarizationView(CreateAPIView):
+    """API to rerun speaker diarization for a processed audio file."""
+
+    serializer_class = RunDiarizationSerializer
+
+    def create(self, request, token, *args, **kwargs):
+        auth_result = token_verification(token)
+        if auth_result['status'] != 200:
+            return Response({
+                'error': auth_result['error'],
+                'timestamp': timezone.now(),
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        audio_id = serializer.validated_data['audio_id']
+
+        try:
+            audio_file = AudioFile.objects.get(id=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({
+                'error': 'Audio file not found',
+                'audio_id': str(audio_id),
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        transcript = audio_file.transcription or {}
+        transcript_segments = transcript.get('segments', [])
+        transcript_words = transcript.get('words', [])
+
+        audio_file.diarization = None
+        audio_file.save(update_fields=['diarization'])
+
+        _start_diarization_thread(
+            audio_file.id,
+            audio_file.file_path,
+            transcript_segments,
+            transcript_words,
+        )
+
+        return Response({
+            'audio_file_id': str(audio_file.id),
+            'status': 'processing',
+        }, status=status.HTTP_202_ACCEPTED)
+
+
+class SpeakerProfileMappingView(CreateAPIView):
+    """API to assign or update speaker profiles using diarization results."""
+
+    serializer_class = SpeakerProfileMappingSerializer
+
+    def create(self, request, token, *args, **kwargs):
+        auth_result = token_verification(token)
+        if auth_result['status'] != 200:
+            return Response({
+                'error': auth_result['error'],
+                'timestamp': timezone.now(),
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        audio_id = serializer.validated_data['audio_id']
+        speaker_label = serializer.validated_data['speaker_label']
+        name = serializer.validated_data['name'].strip()
+        profile_id = serializer.validated_data.get('profile_id')
+
+        try:
+            audio_file = AudioFile.objects.get(id=audio_id)
+        except AudioFile.DoesNotExist:
+            return Response({
+                'error': 'Audio file not found',
+                'audio_id': str(audio_id),
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        diarization_data = audio_file.diarization or {}
+        if isinstance(diarization_data, dict):
+            segments = diarization_data.get('segments', [])
+        else:
+            segments = diarization_data
+
+        if not segments:
+            return Response({
+                'error': 'No diarization data available for this audio file',
+                'audio_file_id': str(audio_file.id),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        matched_segments = [
+            seg for seg in segments
+            if (seg.get('speaker_label') or seg.get('speaker')) == speaker_label
+        ]
+
+        if not matched_segments:
+            return Response({
+                'error': f'Speaker label {speaker_label} not found in diarization results',
+                'audio_file_id': str(audio_file.id),
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        vectors = [
+            np.array(seg.get('speaker_vector'), dtype=float)
+            for seg in matched_segments if seg.get('speaker_vector')
+        ]
+        vectors = [
+            vec for vec in vectors
+            if vec.size and not np.isnan(vec).any() and not np.isinf(vec).any()
+        ]
+
+        if not vectors:
+            return Response({
+                'error': 'Speaker embeddings are not available for the selected label',
+                'audio_file_id': str(audio_file.id),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        mean_vector = np.mean(vectors, axis=0)
+        if mean_vector is None or np.isnan(mean_vector).any():
+            return Response({
+                'error': 'Failed to compute a valid speaker embedding for the selected label',
+                'audio_file_id': str(audio_file.id),
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        mean_vector_list = mean_vector.tolist()
+
+        if not profile_id:
+            profile_id = next(
+                (seg.get('speaker_profile_id') for seg in matched_segments if seg.get('speaker_profile_id')),
+                None,
+            )
+
+        try:
+            if profile_id:
+                profile = SpeakerProfile.objects.get(id=profile_id)
+                profile.embedding = mean_vector_list
+                profile.name = name or profile.name
+                profile.save()
+            else:
+                profile = SpeakerProfile.objects.filter(name__iexact=name).first()
+                if profile:
+                    profile.embedding = mean_vector_list
+                    profile.name = name
+                    profile.save()
+                else:
+                    profile = SpeakerProfile.objects.create(
+                        name=name or speaker_label,
+                        embedding=mean_vector_list,
+                    )
+        except SpeakerProfile.DoesNotExist:
+            return Response({
+                'error': 'Specified speaker profile does not exist',
+                'profile_id': profile_id,
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        updated_segments = []
+        for seg in segments:
+            seg_label = seg.get('speaker_label') or seg.get('speaker')
+            if seg_label == speaker_label:
+                seg['speaker'] = profile.name or speaker_label
+                seg['speaker_name'] = profile.name
+                seg['speaker_profile_id'] = profile.id
+            updated_segments.append(seg)
+
+        diarization_payload = {
+            'segments': updated_segments,
+            'speakers': build_speaker_summary(updated_segments),
+        }
+        audio_file.diarization = diarization_payload
+        audio_file.save(update_fields=['diarization'])
+
+        return Response({
+            'audio_file_id': str(audio_file.id),
+            'speaker_profile': {
+                'id': profile.id,
+                'name': profile.name,
+            },
+            'diarization': diarization_payload,
+        }, status=status.HTTP_200_OK)
 
 class DownloadProcessedDocumentView(GenericAPIView):
     """

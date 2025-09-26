@@ -1,6 +1,6 @@
 from celery import shared_task
 from api.models import AudioFile
-from api.new_utils import diarization_from_audio
+from api.new_utils import diarization_from_audio, build_speaker_summary
 
 @shared_task
 def process_missing_diarizations():
@@ -13,7 +13,10 @@ def process_missing_diarizations():
             diarization_segments = diarization_from_audio(
                 audio_file.file_path, transcript_segments, transcript_words
             )
-            audio_file.diarization = diarization_segments
+            audio_file.diarization = {
+                'segments': diarization_segments,
+                'speakers': build_speaker_summary(diarization_segments),
+            }
             audio_file.save()
         except Exception as e:
             # Optionally log the error
