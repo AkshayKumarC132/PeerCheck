@@ -35,6 +35,7 @@ from .new_utils import (
     get_s3_key_from_url,
     s3_client,
     create_highlighted_pdf_document,
+    generate_spoken_content_summary,
 )
 from .authentication import token_verification
 from .new_serializers import (
@@ -557,12 +558,23 @@ class DownloadProcessedDocumentView(GenericAPIView):
             audio_file.report_path = processed_s3_url
             audio_file.save()
 
+            transcript_payload = audio_file.transcription or {}
+            transcript_segments = transcript_payload.get('segments') or []
+            diarization_payload = audio_file.diarization
+
+            spoken_summary = generate_spoken_content_summary(
+                reference_doc.file_path,
+                transcript_segments,
+                diarization_payload,
+            )
+
             # Direct file download
             return Response({
                 'processed_docx_url': processed_s3_url,
                 'message': 'Processed document is available at the above URL.',
                 'session_id': str(session.id),
-                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed.docx"
+                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed.docx",
+                'spoken_content_summary': spoken_summary,
             }, status=status.HTTP_200_OK)
         except ProcessingSession.DoesNotExist:
             print(f"Session not found or expired: {session_id}")

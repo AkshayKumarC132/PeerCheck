@@ -502,6 +502,12 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
 
     # --- 3. Apply Highlighting to Relevant Pages ---
+    transcript_word_set = {
+        token.lower()
+        for token in re.findall(r"\b\w+\b", query_text.lower())
+        if token.strip()
+    }
+
     for page_num in relevant_page_nums:
         page = target_doc.load_page(page_num)
         page_text = page.get_text("text")
@@ -536,6 +542,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
             # Define light green and light red colors
             light_green = (0.6, 1, 0.6)
             light_red = (1, 0.6, 0.6)
+            light_orange = (1, 0.85, 0.6)
 
             if is_numeric_match or is_semantic_match:
                 highlight = page.add_highlight_annot(rect)
@@ -546,7 +553,10 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
             else:
                 if not any(rect.intersects(g) for g in green_rects):
                     highlight = page.add_highlight_annot(rect)
-                    highlight.set_colors(stroke=light_red)
+                    if word_text_lower in transcript_word_set:
+                        highlight.set_colors(stroke=light_red)
+                    else:
+                        highlight.set_colors(stroke=light_orange)
                     highlight.set_opacity(0.3)
                     highlight.update()
 
@@ -1009,6 +1019,245 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
 
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---
 
+HIGHLIGHT_STATUS_LEGEND = {
+    "correct": {"label": "Correct Match", "color": "#C6EFCE"},
+    "mismatch": {"label": "Mismatch", "color": "#FFC7CE"},
+    "unspoken": {"label": "Unspoken", "color": "#FFEB9C"},
+}
+
+
+def _extract_docx_pages(docx_path: str) -> List[Dict]:
+    document = docx.Document(docx_path)
+    pages: List[Dict] = []
+    current_lines: List[str] = []
+    page_number = 1
+
+    def _flush():
+        nonlocal current_lines, page_number
+        if current_lines:
+            pages.append({
+                "page_number": page_number,
+                "text": "\n".join(current_lines),
+            })
+            current_lines = []
+
+    for para in document.paragraphs:
+        text = para.text.strip()
+        if text:
+            current_lines.append(text)
+
+        has_page_break = False
+        for run in para.runs:
+            br_elems = run._element.findall(qn('w:br'))
+            for br in br_elems:
+                br_type = br.get(qn('w:type'))
+                if br_type == 'page':
+                    has_page_break = True
+                    break
+            if has_page_break:
+                break
+
+        if has_page_break:
+            _flush()
+            page_number += 1
+
+    _flush()
+
+    if not pages:
+        combined = "\n".join(p.text.strip() for p in document.paragraphs if p.text.strip())
+        if combined:
+            pages.append({"page_number": 1, "text": combined})
+
+    return pages
+
+
+def _load_document_pages(text_source: str) -> List[Dict]:
+    is_s3_url = text_source.startswith("s3://") or (
+        text_source.startswith("https://") and ".amazonaws.com/" in text_source
+    )
+    s3_key = get_s3_key_from_url(text_source) if is_s3_url else text_source
+    local_path = download_file_from_s3(s3_key) if is_s3_url else text_source
+
+    pages: List[Dict] = []
+    ext = s3_key.rsplit('.', 1)[-1].lower() if '.' in s3_key else ''
+
+    try:
+        if ext == 'pdf':
+            doc = fitz.open(local_path)
+            try:
+                for idx in range(len(doc)):
+                    page = doc.load_page(idx)
+                    pages.append({
+                        "page_number": idx + 1,
+                        "text": page.get_text("text") or "",
+                    })
+            finally:
+                doc.close()
+        elif ext == 'docx':
+            pages = _extract_docx_pages(local_path)
+        elif ext == 'txt':
+            pages = [{"page_number": 1, "text": extract_text_txt(local_path)}]
+        else:
+            # Fallback: treat entire extracted text as a single page when possible
+            extracted = ''
+            try:
+                if ext in {'doc', 'docm'}:
+                    extracted = extract_text_docx(local_path)
+                elif ext in {'rtf', 'text', ''}:
+                    extracted = extract_text_txt(local_path)
+            except Exception as exc:
+                logging.warning("Failed to extract text for summary from %s: %s", s3_key, exc)
+            if extracted:
+                pages = [{"page_number": 1, "text": extracted}]
+    finally:
+        if is_s3_url and local_path and os.path.exists(local_path):
+            os.unlink(local_path)
+
+    return pages
+
+
+def _prepare_transcript_segments(
+    transcript_segments: Optional[List[Dict]],
+    diarization_segments: Optional[List[Dict]],
+) -> List[Dict]:
+    diarization_segments = diarization_segments or []
+    prepared: List[Dict] = []
+
+    for segment in transcript_segments or []:
+        text = (segment.get('text') or '').strip()
+        if not text:
+            continue
+
+        start = segment.get('start')
+        end = segment.get('end') if segment.get('end') is not None else start
+        start = float(start) if start is not None else None
+        end = float(end) if end is not None else start
+
+        best_match = None
+        best_overlap = 0.0
+        for diar_seg in diarization_segments:
+            d_start = float(diar_seg.get('start') or 0.0)
+            d_end = float(diar_seg.get('end') or d_start)
+            overlap = min(end or d_end, d_end) - max(start or d_start, d_start)
+            if overlap > best_overlap:
+                best_overlap = overlap
+                best_match = diar_seg
+
+        speaker_label = None
+        speaker_name = None
+        if best_match:
+            speaker_label = best_match.get('speaker_label') or best_match.get('speaker')
+            speaker_name = best_match.get('speaker_name') or speaker_label
+
+        prepared.append({
+            'text': text,
+            'norm_text': normalize_line(text),
+            'start': round(start, 3) if isinstance(start, float) else None,
+            'end': round(end, 3) if isinstance(end, float) else None,
+            'speaker_label': speaker_label,
+            'speaker_name': speaker_name,
+            'matched': False,
+        })
+
+    return prepared
+
+
+def _find_best_transcript_segment(norm_text: str, segments: List[Dict]):
+    best_segment = None
+    best_score = 0.0
+    for segment in segments:
+        comp = segment.get('norm_text')
+        if not comp:
+            continue
+        score = fuzz.token_set_ratio(norm_text, comp) / 100.0
+        if score > best_score:
+            best_score = score
+            best_segment = segment
+    return best_segment, best_score
+
+
+def generate_spoken_content_summary(
+    text_source: str,
+    transcript_segments: Optional[List[Dict]],
+    diarization: Optional[Dict] = None,
+    high_threshold: float = 0.6,
+    low_threshold: float = 0.3,
+) -> Dict:
+    legend_copy = {key: value.copy() for key, value in HIGHLIGHT_STATUS_LEGEND.items()}
+    diar_segments = []
+    if diarization:
+        if isinstance(diarization, dict):
+            diar_segments = diarization.get('segments') or []
+        elif isinstance(diarization, list):
+            diar_segments = diarization
+
+    prepared_segments = _prepare_transcript_segments(transcript_segments, diar_segments)
+    pages = _load_document_pages(text_source) if text_source else []
+
+    summary_pages: List[Dict] = []
+
+    splitter = re.compile(r'(?<=[.!?])\s+')
+
+    for page in pages:
+        page_number = page.get('page_number')
+        page_text = page.get('text') or ''
+        sentences = [s.strip() for s in splitter.split(page_text) if len(s.strip()) > 2]
+        if not sentences and page_text.strip():
+            sentences = [page_text.strip()]
+
+        page_entries: List[Dict] = []
+
+        for sentence in sentences:
+            norm_sentence = normalize_line(sentence)
+            if not norm_sentence:
+                continue
+
+            best_segment, score = _find_best_transcript_segment(norm_sentence, prepared_segments)
+            if score >= high_threshold:
+                status = 'correct'
+            elif score >= low_threshold:
+                status = 'mismatch'
+            else:
+                status = 'unspoken'
+
+            entry: Dict = {
+                'document_text': sentence,
+                'status': status,
+                'confidence': round(score, 3),
+            }
+
+            if best_segment and status != 'unspoken':
+                best_segment['matched'] = True
+                entry.update({
+                    'spoken_text': best_segment['text'],
+                    'speaker': best_segment.get('speaker_name') or best_segment.get('speaker_label'),
+                    'start': best_segment.get('start'),
+                    'end': best_segment.get('end'),
+                })
+
+            page_entries.append(entry)
+
+        if page_entries:
+            summary_pages.append({'page_number': page_number, 'segments': page_entries})
+
+    unmatched_spoken = [
+        {
+            'spoken_text': segment['text'],
+            'speaker': segment.get('speaker_name') or segment.get('speaker_label'),
+            'start': segment.get('start'),
+            'end': segment.get('end'),
+        }
+        for segment in prepared_segments
+        if not segment.get('matched')
+    ]
+
+    return {
+        'legend': legend_copy,
+        'pages': summary_pages,
+        'unmatched_spoken_segments': unmatched_spoken,
+    }
+
+
 def _apply_color_to_paragraph_runs(p_element, color_hex_str):
     """Applies a color to all text runs within a paragraph's XML element."""
     for r_element in p_element.xpath('.//w:r'):
@@ -1017,9 +1266,11 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
             rPr = docx.oxml.OxmlElement('w:rPr')
             r_element.insert(0, rPr)
         
-        color_element = docx.oxml.OxmlElement('w:color')
+        color_element = rPr.find(qn('w:color'))
+        if color_element is None:
+            color_element = docx.oxml.OxmlElement('w:color')
+            rPr.append(color_element)
         color_element.set(qn('w:val'), color_hex_str)
-        rPr.append(color_element)
 
 def _process_element_three_color(element, norm_trans, thresholds, colors):
     """Finds all paragraphs in an XML element and applies color based on the two-threshold system."""
@@ -1034,19 +1285,23 @@ def _process_element_three_color(element, norm_trans, thresholds, colors):
         norm_para_text = normalize_line(full_text)
         best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
         
-        color_to_apply = None
         if best_score >= thresholds['high']:
             color_to_apply = colors['GREEN']
         elif best_score >= thresholds['low']:
             color_to_apply = colors['RED']
-        
-        if color_to_apply:
-            _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+        else:
+            color_to_apply = colors['ORANGE']
+
+        _apply_color_to_paragraph_runs(p_element, color_to_apply)
 
 def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
     """Highlights text in a DOCX using the Green/Red/Black system."""
     document = docx.Document(docx_path)
-    colors = {"GREEN": RGBColor(0, 176, 80), "RED": RGBColor(255, 0, 0)}
+    colors = {
+        "GREEN": "C6EFCE",   # light green for correct matches
+        "RED": "FFC7CE",     # light red for mismatches
+        "ORANGE": "FFEB9C",  # light orange for unspoken content
+    }
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
     # Process main body, headers, and footers for complete coverage
