@@ -8,12 +8,13 @@ from .models import *
 from django.db import IntegrityError, transaction
 from rest_framework.views import APIView
 from knox.models import AuthToken
-from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from rest_framework import generics, status
 
+from .rag_integration import ensure_rag_token  # NEW
 
-# @method_decorator(csrf_exempt, name='dispatch')
+# ---------------- Register ----------------
+
 class RegisterView(generics.CreateAPIView):
     serializer_class = UserProfileSerializer
 
@@ -33,18 +34,14 @@ class RegisterView(generics.CreateAPIView):
         username = data['username']
         email = data['email']
         password = data['password']
-        role = data.get('role', 'operator')  # Default to 'user'
+        role = data.get('role', 'operator')
 
         if role not in dict(UserProfile.ROLE_CHOICES):
             raise serializers.ValidationError({"error": f"Invalid role: {role}"})
 
-        # Check if email already exists
         if UserProfile.objects.filter(email=email).exists():
-            raise serializers.ValidationError(
-                {"error": "Email already exists. Please choose a different email."}
-            )
+            raise serializers.ValidationError({"error": "Email already exists. Please choose a different email."})
 
-        # Create user with custom logic
         try:
             user = UserProfile.objects.create_user(
                 username=username,
@@ -56,40 +53,30 @@ class RegisterView(generics.CreateAPIView):
             serializer.instance = user
         except IntegrityError as e:
             if 'user_profile.username' in str(e):
-                raise serializers.ValidationError(
-                    {"error": "Username already exists. Please choose a different username."}
-                )
+                raise serializers.ValidationError({"error": "Username already exists. Please choose a different username."})
             if 'user_profile.email' in str(e):
-                raise serializers.ValidationError(
-                    {"error": "Email already exists. Please choose a different email."}
-                )
-            raise serializers.ValidationError(
-                {"error": "An error occurred during registration."}
-            )
+                raise serializers.ValidationError({"error": "Email already exists. Please choose a different email."})
+            raise serializers.ValidationError({"error": "An error occurred during registration."})
 
-# @method_decorator(csrf_exempt, name='dispatch')
+# ---------------- Login ----------------
+
 class LoginViewAPI(generics.CreateAPIView):
     serializer_class = LoginSerializer
-    # permission_classes = [AllowAny]  # Allow anyone to access this view
 
     def post(self, request):
         serializer = self.serializer_class(data=request.data)
         if serializer.is_valid(raise_exception=True):
             username = serializer.validated_data['username']
             password = serializer.validated_data['password']
-            # Authenticate the user
             user = authenticate(username=username, password=password)
             if user is not None:
                 login(request, user)
                 try:
                     token_instance, token = AuthToken.objects.create(user)
-                except Exception as e:
-                    print("Error creating token:", e)
+                except Exception:
                     return Response({'message': "Failed to create token"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-                # Retrieve user profile
                 profile = UserProfile.objects.get(username=username)
-
                 profile_info = {
                     "last_login": profile.last_login,
                     "username": profile.username,
@@ -105,48 +92,52 @@ class LoginViewAPI(generics.CreateAPIView):
                     "role": profile.role
                 }
 
-                return Response(
-                    {
+                # NEW: ensure RAG token (non-blocking if disabled)
+                ensure_rag_token(profile)
+
+                return Response({
                         'message': "Login Successful",
                         "data": profile_info,
-                        'token': token,  # Return the token
-                    },
-                    status=status.HTTP_200_OK,
-                )
+                        'token': token,
+                    }, status=status.HTTP_200_OK)
             else:
                 return Response({'message': "Invalid username or password"}, status=status.HTTP_401_UNAUTHORIZED)
-            
+
+# ---------------- Logout ----------------
 @method_decorator(csrf_exempt, name='dispatch')
 class LogoutViewAPI(APIView):
-    
-    # permission_classes = [IsAuthenticated]  # Only authenticated users can log out
-
-    def post(self, request,token):
-        print('aa')
-        # Retrieve the user's token instance from the request
+    def post(self, request, token):
         try:
             auth_token_instance = KnoxAuthtoken.objects.get(token_key=token[:8])
         except :
             return Response({"message": "Invalid Token"}, status=status.HTTP_400_BAD_REQUEST)
 
-        # auth_token_instance = request.auth  # Knox sets the AuthToken object in request.auth
         if auth_token_instance:
             try:
-                # Delete the token from the database
                 auth_token_instance.delete()
+                # NOTE: Do NOT clear RAG token here (per requirements)
                 return Response({"message": "Logout successful"}, status=status.HTTP_200_OK)
             except Exception as e:
                 return Response({"message": f"Error during logout: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         else:
             return Response({"message": "Invalid token or already logged out"}, status=status.HTTP_400_BAD_REQUEST)
 
+# ---------------- Token check helper (used by views) ----------------
 
-def token_verification(token):
+def token_verification(token_key: str):
+    """
+    Verifies a 3PC (Knox) token and returns a standardized dict.
+    Does not touch or clear any RAG tokens.
+    """
     try:
-        user = KnoxAuthtoken.objects.get(token_key= token).user
-    except:
-        return {'status':400,'error':'Invalid Token'}
-    if user:
-        return {'status':200,'user':user}
-    else:
-        return {'status':400,'error':'user not Found'}
+        token = AuthToken.objects.get(token_key=token_key)
+    except AuthToken.DoesNotExist:
+        return {"status": 401, "error": "Invalid or expired token."}
+
+    try:
+        user: UserProfile = token.user
+        if not user or not user.is_active:
+            return {"status": 401, "error": "User inactive or not found."}
+        return {"status": 200, "user": user}
+    except Exception:
+        return {"status": 401, "error": "Authentication failed."}

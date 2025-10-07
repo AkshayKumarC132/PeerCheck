@@ -7,16 +7,18 @@ import threading
 from datetime import datetime, timedelta
 
 import numpy as np
-from django.conf import settings
+from peercheck import settings
 from django.db import close_old_connections
 from django.http import HttpResponse, Http404
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.generics import CreateAPIView, GenericAPIView
 from rest_framework.response import Response
+from rest_framework.views import APIView
 from drf_yasg.utils import swagger_auto_schema
 from drf_yasg import openapi
 import traceback
+
 from .models import (
     ReferenceDocument,
     AudioFile,
@@ -24,6 +26,7 @@ from .models import (
     UserProfile,
     AuditLog,
     SpeakerProfile,
+    RAGAssistant, RAGThread, RAGMessage, RAGRun
 )
 from .new_utils import (
     extract_text_from_s3,
@@ -49,8 +52,29 @@ from .new_serializers import (
     ReferenceDocumentSerializer,
     RunDiarizationSerializer,
     SpeakerProfileMappingSerializer,
+    RAGAssistantSerializer, RAGThreadSerializer, RAGMessageSerializer, RAGRunSerializer
 )
 
+# RAG helpers
+from .rag_integration import ensure_user_vector_store_id, ensure_rag_token
+from .ragitify_client import (
+    document_ingest, document_status,
+    assistant_create, assistant_list, assistant_detail,
+    thread_create, thread_list, thread_detail, thread_messages,
+    message_create, message_list, message_detail,
+    run_create, run_list, run_detail, run_submit_tool_outputs
+)
+
+# --------------- RAG helper ---------------
+def rag_feature_enabled() -> bool:
+    return bool(getattr(settings, "RAGITIFY_ENABLED", False)) and bool(getattr(settings, "RAGITIFY_BASE_URL", ""))
+
+logger = logging.getLogger(__name__)
+
+def _bg(target, *args, **kwargs):
+    t = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True)
+    t.start()
+    return t
 
 def _start_diarization_thread(audio_file_id, audio_source, transcript_segments, transcript_words):
     """Kick off background diarization work for the given audio file."""
@@ -58,95 +82,63 @@ def _start_diarization_thread(audio_file_id, audio_source, transcript_segments, 
     def _run_diarization():
         close_old_connections()
         try:
-            segments = diarization_from_audio(
-                audio_source,
-                transcript_segments,
-                transcript_words,
-            )
-            payload = {
-                "segments": segments,
-                "speakers": build_speaker_summary(segments),
-            }
+            segments = diarization_from_audio(audio_source, transcript_segments, transcript_words)
+            payload = {"segments": segments, "speakers": build_speaker_summary(segments)}
             AudioFile.objects.filter(id=audio_file_id).update(diarization=payload)
         except Exception:
-            logging.exception("Failed to complete diarization for audio %s", audio_file_id)
+            logger.exception("Failed to complete diarization for audio %s", audio_file_id)
             AudioFile.objects.filter(id=audio_file_id).update(diarization=None)
 
     thread = threading.Thread(target=_run_diarization, daemon=True)
     thread.start()
     return thread
 
+# --------------------------- CORE: Upload + Process ---------------------------
+
 class UploadAndProcessView(CreateAPIView):
     """
     Upload text and audio files to S3, process them, and return analysis results
     """
     serializer_class = UploadAndProcessSerializer
-    #authentication_classes = [KnoxTokenAuthentication]
     
     @swagger_auto_schema(
         operation_description="Upload and process text document with audio file",
-        responses={
-            200: ProcessingResultSerializer,
-            400: ErrorResponseSerializer,
-            401: ErrorResponseSerializer,
-            500: ErrorResponseSerializer
-        }
+        responses={200: ProcessingResultSerializer, 400: ErrorResponseSerializer, 401: ErrorResponseSerializer, 500: ErrorResponseSerializer}
     )
     def create(self, request, token, *args, **kwargs):
-        # Verify token manually since authentication might not work with URL token
         auth_result = token_verification(token)
         if auth_result['status'] != 200:
-            error_data = {
-                'error': auth_result['error'],
-                'timestamp': timezone.now()
-            }
-            error_serializer = ErrorResponseSerializer(data=error_data)
-            error_serializer.is_valid()
-            return Response(error_data, status=status.HTTP_401_UNAUTHORIZED)
+            return Response({'error': auth_result['error'], 'timestamp': timezone.now()}, status=status.HTTP_401_UNAUTHORIZED)
         
         user = auth_result['user']
-        
-        # Validate input data
         serializer = self.get_serializer(data=request.data)
         if not serializer.is_valid():
-            error_data = {
-                'error': 'Invalid input data',
-                'details': serializer.errors,
-                'timestamp': timezone.now()
-            }
-            error_serializer = ErrorResponseSerializer(data=error_data)
-            error_serializer.is_valid()
-            return Response(error_data, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Invalid input data', 'details': serializer.errors, 'timestamp': timezone.now()}, status=status.HTTP_400_BAD_REQUEST)
         
         start_time = time.time()
         reference_doc = None
         audio_obj = None
         
         try:
-            validated_data = serializer.validated_data
+            validated = serializer.validated_data
             user_profile = user
-            audio_file = validated_data['audio_file']
+            audio_file = validated['audio_file']
 
-            # --- MODIFIED LOGIC: Handle document creation/fetching ---
-            
-            if 'text_file' in validated_data:
-                # --- PATH 1: A new text file was uploaded ---
-                text_file = validated_data['text_file']
-                document_type = validated_data.get('document_type', 'sop')
-                document_name = validated_data.get('document_name', '')
-
-                # Upload text file to S3
+            # Create or fetch ReferenceDocument
+            if 'text_file' in validated and validated.get('text_file'):
+                text_file = validated['text_file']
+                document_type = validated.get('document_type', 'sop')
+                document_name = validated.get('document_name', '')
                 text_s3_key = f'documents/{user.id}/{uuid.uuid4()}_{text_file.name}'
                 text_s3_url = upload_file_to_s3(text_file, text_s3_key)
                 
-                # Create ReferenceDocument
                 reference_doc = ReferenceDocument.objects.create(
                     name=document_name or text_file.name,
                     document_type=document_type,
                     file_path=text_s3_url,
                     original_filename=text_file.name,
                     file_size=text_file.size,
-                    content_type=text_file.content_type or 'application/octet-stream',
+                    content_type=getattr(text_file, "content_type", None) or 'application/octet-stream',
                     uploaded_by=user_profile,
                     upload_status='processing'
                 )
@@ -156,24 +148,59 @@ class UploadAndProcessView(CreateAPIView):
                 reference_doc.extracted_text = text_content
                 reference_doc.upload_status = 'processed'
                 reference_doc.save()
-            
             else:
-                # --- PATH 2: An existing document ID was provided ---
-                doc_id = validated_data['existing_document_id']
+                doc_id = validated['existing_document_id']
                 reference_doc = ReferenceDocument.objects.get(id=doc_id)
-                
-                # Optional: Ensure text is extracted if it was missed before
                 if not reference_doc.extracted_text and reference_doc.file_path:
-                    print(f"Extracting missing text for existing document: {reference_doc.id}")
-                    text_content = extract_text_from_s3(reference_doc.file_path)
-                    reference_doc.extracted_text = text_content
+                    txt = extract_text_from_s3(reference_doc.file_path)
+                    reference_doc.extracted_text = txt
                     reference_doc.save(update_fields=['extracted_text'])
             
-            # Upload audio file to S3
+            # --- RAG ingestion (document) ---
+            if rag_feature_enabled():
+                token_val, vs_id, err_vs = ensure_user_vector_store_id(user)
+                if token_val and vs_id:
+                    try:
+                        # store the user’s VS id into the document if not already set
+                        if not reference_doc.rag_vector_store_id:
+                            reference_doc.rag_enabled = True
+                            reference_doc.rag_vector_store_id = vs_id
+                            reference_doc.save(update_fields=["rag_enabled", "rag_vector_store_id"])
+
+                        # ingest document by S3 URL
+                        if reference_doc.rag_vector_store_id and not reference_doc.rag_document_id:
+                            ingest = document_ingest(token_val, vector_store_id=reference_doc.rag_vector_store_id, s3_file_url=reference_doc.file_path)
+                            doc_id = (ingest or {}).get("id") or (ingest or {}).get("document_id")
+                            status_str = (ingest or {}).get("status") or "queued"
+                            reference_doc.rag_document_id = str(doc_id) if doc_id else None
+                            reference_doc.rag_status = status_str
+                            reference_doc.rag_uploaded_at = timezone.now()
+                            reference_doc.rag_last_error = None
+                            reference_doc.rag_metadata = ingest or {}
+                            reference_doc.save(update_fields=["rag_document_id","rag_status","rag_uploaded_at","rag_last_error","rag_metadata"])
+
+                            # non-blocking status check (one shot)
+                            try:
+                                st = document_status(token_val, document_id=str(doc_id)) or {}
+                                s = st.get("status") or st.get("state")
+                                if s:
+                                    reference_doc.rag_status = s
+                                if (s or "").lower() in ("completed", "ready", "processed"):
+                                    reference_doc.rag_ingested_at = timezone.now()
+                                if st.get("error"):
+                                    reference_doc.rag_last_error = st.get("error")
+                                reference_doc.rag_metadata = {**(reference_doc.rag_metadata or {}), "status_check": st}
+                                reference_doc.save(update_fields=["rag_status","rag_ingested_at","rag_last_error","rag_metadata"])
+                            except Exception:
+                                pass
+                    except Exception as e:
+                        reference_doc.rag_enabled = True
+                        reference_doc.rag_last_error = str(e)
+                        reference_doc.save(update_fields=["rag_enabled","rag_last_error"])
+
+            # Upload audio file
             audio_s3_key = f'audio/{user.id}/{uuid.uuid4()}_{audio_file.name}'
             audio_s3_url = upload_file_to_s3(audio_file, audio_s3_key)
-            
-            # Create AudioFile
             audio_obj = AudioFile.objects.create(
                 file_path=audio_s3_url,
                 original_filename=audio_file.name,
@@ -182,12 +209,12 @@ class UploadAndProcessView(CreateAPIView):
                 status='processing'
             )
             
-            # # Extract text from document
+            # Extract text again (ensures current)
             text_content = extract_text_from_s3(reference_doc.file_path)
             reference_doc.extracted_text = text_content
             reference_doc.upload_status = 'processed'
             reference_doc.save()
-            
+
             # Transcribe audio
             transcript_result = transcribe_audio_from_s3(audio_s3_url)
             transcript = transcript_result["text"]
@@ -196,33 +223,19 @@ class UploadAndProcessView(CreateAPIView):
             audio_obj.transcription = transcript_result
             audio_obj.save()
 
-            # --- Speaker Diarization (using diarization_from_audio) ---
-            diarization_payload = None
-            diarization_error = None
+            # Speaker diarization
             audio_obj.diarization = None
             audio_obj.save(update_fields=['diarization'])
-            _start_diarization_thread(
-                audio_obj.id,
-                audio_s3_url,
-                transcript_segments,
-                transcript_words,
-            )
-            # --- End Speaker Diarization ---
+            _start_diarization_thread(audio_obj.id, audio_s3_url, transcript_segments, transcript_words)
             
-            # Perform comparison analysis
-            matched_html, missing_html, matched_words, total_words, entire_html = find_missing(
-                text_content, transcript
-            )
-            
-            # Calculate coverage
+            # Compare and compute coverage
+            matched_html, missing_html, matched_words, total_words, entire_html = find_missing(text_content, transcript)
             coverage = (matched_words / total_words * 100) if total_words > 0 else 0
-            
-            # Update audio object with results
             audio_obj.coverage = coverage
             audio_obj.status = 'processed'
             audio_obj.save()
             
-            # Create processing session for download
+            # Create processing session
             expires_at = timezone.now() + timedelta(hours=24)
             session = ProcessingSession.objects.create(
                 reference_document=reference_doc,
@@ -232,14 +245,11 @@ class UploadAndProcessView(CreateAPIView):
                 coverage=coverage,
                 expires_at=expires_at
             )
-            
             processing_time = time.time() - start_time
-
             audio_obj.processing_session = session.id
             audio_obj.save()
             
-            # Prepare response data - include diarization
-            response_data = {
+            return Response({
                 'session_id': str(session.id),
                 'matched_words': matched_words,
                 'total_words': total_words,
@@ -250,35 +260,22 @@ class UploadAndProcessView(CreateAPIView):
                 'missing_content': missing_html,
                 'entire_document': entire_html,
                 'processing_time': round(processing_time, 2),
-                'diarization': diarization_payload,
-                'diarization_error': diarization_error,
-                'diarization_status': 'processing' if diarization_payload is None else 'completed',
-            }
-
-            # Don't validate response data with serializer, just return it directly
-            return Response(response_data, status=status.HTTP_200_OK)
+                'diarization': None,
+                'diarization_error': None,
+                'diarization_status': 'processing',
+            }, status=status.HTTP_200_OK)
             
         except Exception as e:
-            # Clean up on error
             if reference_doc:
                 reference_doc.upload_status = 'failed'
                 reference_doc.save()
             if audio_obj:
                 audio_obj.status = 'failed'
                 audio_obj.save()
-            
-            # Log the error for debugging
-            import traceback
-            print(f"Error in UploadAndProcessView: {str(e)}")
-            print(traceback.format_exc())
-            
-            error_data = {
-                'error': f'Processing failed: {str(e)}',
-                'timestamp': timezone.now().isoformat()  # Convert datetime to string
-            }
-            
-            return Response(error_data, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.exception("UploadAndProcessView failed")
+            return Response({'error': f'Processing failed: {str(e)}','timestamp': timezone.now().isoformat()}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+# ---------------- Other original endpoints (kept intact) ----------------
 
 class RunDiarizationView(CreateAPIView):
     """API to rerun speaker diarization for a processed audio file."""
@@ -749,88 +746,385 @@ class GetProcessingSessionView(GenericAPIView):
             return Response(error_data, status=status.HTTP_404_NOT_FOUND)
 
 class UploadReferenceDocumentView(CreateAPIView):
-    """
-    Upload Reference Document files to S3, process them and return analysis results
-    """
     serializer_class = ReferenceDocumentSerializer
 
-    @swagger_auto_schema(
-        operation_description="Upload Reference Document files to S3, process them and return analysis results",
-        responses={
-            200: ReferenceDocumentSerializer,
-            400: ErrorResponseSerializer,
-            401: ErrorResponseSerializer,
-            500: ErrorResponseSerializer
-        }
-    )
-    def create(self, request, token, *args, **kwargs):
-        # Verify token manually since authentication might not work with URL token
+    def post(self, request, token, *args, **kwargs):
         auth_result = token_verification(token)
         if auth_result['status'] != 200:
-            error_data = {
-                'error': auth_result['error'],
-                'timestamp': timezone.now()
-            }
-            return Response(error_data, status=status.HTTP_401_UNAUTHORIZED)
-        
+            return Response({'error': auth_result['error']}, status=401)
         user = auth_result['user']
-        
-        # Validate input data
-        serializer = self.get_serializer(data=request.data)
-        if not serializer.is_valid():
-            error_data = {
-                'error': 'Invalid input data',
-                'details': serializer.errors,
-                'timestamp': timezone.now()
-            }
-            return Response(error_data, status=status.HTTP_400_BAD_REQUEST)
-        
-        try:
-            # Get validated data
-            text_file = serializer.validated_data['file_path']
-            document_type = serializer.validated_data.get('document_type', 'sop')
-            document_name = serializer.validated_data.get('document_name', '')
-            
-            # Since UserProfile extends AbstractUser, the user IS the UserProfile
-            user_profile = user
-            
-            # Upload text file to S3
-            text_s3_key = f'documents/{user.id}/{uuid.uuid4()}_{text_file.name}'
-            text_s3_url = upload_file_to_s3(text_file, text_s3_key)
-            
-            # Create ReferenceDocument
-            reference_doc = ReferenceDocument.objects.create(
-                name=document_name or text_file.name,
-                document_type=document_type,
-                file_path=text_s3_url,
-                original_filename=text_file.name,
-                file_size=text_file.size,
-                content_type=text_file.content_type or 'application/octet-stream',
-                uploaded_by=user_profile,
-                upload_status='processing'
-            )
-            # Extract text from document
-            text_content = extract_text_from_s3(text_s3_url)
-            reference_doc.extracted_text = text_content
-            reference_doc.upload_status = 'processed'
-            reference_doc.save()
-            # AuditLog.objects.create(
-            #     action='Upload Document',
-            #     user=auth_result['user'],
-            #     # object_id=str(reference_doc.id).replace('-',''),
-            #     object_type='DocumentFile',
-            #     details={
-            #         "document_id":str(reference_doc.id).replace('-',''),
-            #         "name":reference_doc.name,
-            #         "size":reference_doc.file_size
-            #         }
-            # )
-            return Response({"message":"Docuemnt Upload Success"}, status=status.HTTP_200_OK)    
 
+        # ---- input & upload to S3 ----
+        try:
+            f = request.FILES['file_path']
+        except Exception:
+            return Response({"error": "file_path is required"}, status=400)
+
+        doc_type = request.data.get("document_type", "sop")
+        doc_name = request.data.get("document_name") or f.name
+
+        s3_key = f'documents/{user.id}/{uuid.uuid4()}_{f.name}'
+        s3_url = upload_file_to_s3(f, s3_key)
+
+        ref = ReferenceDocument.objects.create(
+            name=doc_name,
+            document_type=doc_type,
+            file_path=s3_url,
+            original_filename=f.name,
+            file_size=f.size,
+            content_type=getattr(f, "content_type", None) or "application/octet-stream",
+            uploaded_by=user,
+            upload_status="processing",
+        )
+
+        # Extract text for local features/reporting
+        text_content = extract_text_from_s3(s3_url)
+        ref.extracted_text = text_content
+        ref.upload_status = 'processed'
+        ref.save()
+
+        # ---- RAG ingestion (aligned to RAGitify payloads) ----
+        if rag_feature_enabled():
+            token_val, vs_id, err_vs = ensure_user_vector_store_id(user)
+            if token_val and vs_id:
+                try:
+                    # set the user’s VS on this document if missing
+                    if not ref.rag_vector_store_id:
+                        ref.rag_enabled = True
+                        ref.rag_vector_store_id = str(vs_id)
+                        ref.save(update_fields=["rag_enabled", "rag_vector_store_id"])
+
+                    # Ingest via S3 URL (no 'text', 'filename', or 'metadata' — not supported)
+                    if ref.rag_vector_store_id and not ref.rag_document_id:
+                        ingest = document_ingest(
+                            token=token_val,
+                            vector_store_id=ref.rag_vector_store_id,
+                            # file=f,   # <-- correct field
+                            s3_file_url=ref.file_path,  # <- use URL, not the file object
+                        )
+                        print("Document ingest response:", ingest)
+                        doc_id = (ingest or {}).get("id") or (ingest or {}).get("document_id")
+                        status_str = (ingest or {}).get("status") or "queued"
+
+                        if doc_id:
+                            ref.rag_document_id = str(doc_id)
+                            ref.rag_status = status_str
+                            ref.rag_uploaded_at = timezone.now()
+                            ref.rag_last_error = None
+                            ref.rag_metadata = ingest or {}
+                            ref.save(update_fields=[
+                                "rag_document_id", "rag_status",
+                                "rag_uploaded_at", "rag_last_error", "rag_metadata"
+                            ])
+
+                            # Optional: quick status check
+                            try:
+                                st = document_status(token_val, document_id=str(doc_id)) or {}
+                                s = st.get("status") or st.get("state")
+                                if s:
+                                    ref.rag_status = s
+                                if (s or "").lower() in ("completed", "ready", "processed"):
+                                    ref.rag_ingested_at = timezone.now()
+                                if st.get("error"):
+                                    ref.rag_last_error = st.get("error")
+                                ref.rag_metadata = {**(ref.rag_metadata or {}), "status_check": st}
+                                ref.save(update_fields=["rag_status", "rag_ingested_at", "rag_last_error", "rag_metadata"])
+                            except Exception:
+                                # Best-effort — ignore errors from the status poll
+                                pass
+                except Exception as e:
+                    ref.rag_enabled = True
+                    ref.rag_last_error = str(e)
+                    ref.save(update_fields=["rag_enabled", "rag_last_error"])
+
+        return Response(
+            {"message": "Document Upload Success", "reference_document_id": str(ref.id)},
+            status=200
+        )
+
+# -------------------------- RAG Conversational APIs --------------------------
+
+class RAGAssistantCreateView(CreateAPIView):
+    serializer_class = RAGAssistantSerializer
+    @swagger_auto_schema(operation_description="Create RAG Assistant bound to vector_store_ids")
+    def post(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error'], 'timestamp': timezone.now()}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+
+        user: UserProfile = auth['user']
+        rag_token, err = ensure_rag_token(user)
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+
+        name = request.data.get("name") or "3PC Assistant"
+        vector_store_ids = request.data.get("vector_store_ids") or []
+        model = request.data.get("model") or "gpt-4o"
+
+        try:
+            resp = assistant_create(rag_token, name=name, vector_store_ids=vector_store_ids, model=model)
+            asst_id = (resp or {}).get("id") or (resp or {}).get("assistant_id")
+            if asst_id:
+                RAGAssistant.objects.get_or_create(
+                    external_id=asst_id,
+                    defaults={
+                        "name": name, "model": model,
+                        "vector_store_ids": vector_store_ids, "owner": user
+                    }
+                )
+            return Response(resp, status=201)
         except Exception as e:
-            print(f"Error in UploadAndProcessView: {str(e)}")
-            print(traceback.format_exc())
-            return Response({
-                'error': f'Processing failed: {str(e)}',
-                'timestamp': timezone.now().isoformat()  # Convert datetime to string
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            logger.exception("assistant_create failed")
+            return Response({'error': str(e)}, status=500)
+
+class RAGAssistantListView(APIView):
+    def get(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(assistant_list(rag_token), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGAssistantDetailView(APIView):
+    def get(self, request, token, assistant_id):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(assistant_detail(rag_token, assistant_id), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGThreadCreateView(CreateAPIView):
+    serializer_class = RAGThreadSerializer
+    def post(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        user = auth['user']
+        rag_token, err = ensure_rag_token(user)
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+
+        assistant_id = request.data.get("assistant_id")
+        title = request.data.get("title")
+        try:
+            resp = thread_create(rag_token, assistant_id=assistant_id, title=title)
+            thread_id = (resp or {}).get("id") or (resp or {}).get("thread_id")
+            if thread_id:
+                RAGThread.objects.get_or_create(
+                    external_id=thread_id,
+                    defaults={"assistant_external_id": assistant_id, "title": title, "owner": user}
+                )
+            return Response(resp, status=201)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGThreadListView(APIView):
+    def get(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(thread_list(rag_token), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGThreadDetailView(APIView):
+    def get(self, request, token, thread_id):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(thread_detail(rag_token, thread_id), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGThreadMessagesView(APIView):
+    def get(self, request, token, thread_id):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            msgs = thread_messages(rag_token, thread_id)
+            # persist locally (best-effort)
+            for m in msgs or []:
+                mid = m.get("id") or m.get("message_id")
+                if not mid: continue
+                RAGMessage.objects.get_or_create(
+                    external_id=mid,
+                    defaults={
+                        "thread_external_id": thread_id,
+                        "role": m.get("role", "assistant"),
+                        "content": m.get("content", ""),
+                    }
+                )
+            return Response(msgs, status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGMessageCreateView(CreateAPIView):
+    serializer_class = RAGMessageSerializer
+    def post(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+
+        thread_id = request.data.get("thread_id")
+        content = request.data.get("content")
+        role = request.data.get("role", "user")
+        try:
+            resp = message_create(rag_token, thread_id=thread_id, content=content, role=role)
+            mid = (resp or {}).get("id") or (resp or {}).get("message_id")
+            if mid:
+                RAGMessage.objects.get_or_create(
+                    external_id=mid,
+                    defaults={"thread_external_id": thread_id, "role": role, "content": content}
+                )
+            return Response(resp, status=201)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGMessageListView(APIView):
+    def get(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(message_list(rag_token), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGMessageDetailView(APIView):
+    def get(self, request, token, message_id):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(message_detail(rag_token, message_id), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGRunCreateView(CreateAPIView):
+    serializer_class = RAGRunSerializer
+    def post(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        user = auth['user']
+        rag_token, err = ensure_rag_token(user)
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+
+        thread_id = request.data.get("thread_id")
+        assistant_id = request.data.get("assistant_id")
+        try:
+            resp = run_create(rag_token, thread_id=thread_id, assistant_id=assistant_id)
+            rid = (resp or {}).get("id") or (resp or {}).get("run_id")
+            if rid:
+                RAGRun.objects.get_or_create(
+                    external_id=rid,
+                    defaults={
+                        "thread_external_id": thread_id,
+                        "assistant_external_id": assistant_id,
+                        "status": (resp or {}).get("status"),
+                        "raw": resp or {}
+                    }
+                )
+            return Response(resp, status=201)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGRunListView(APIView):
+    def get(self, request, token):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(run_list(rag_token), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGRunDetailView(APIView):
+    def get(self, request, token, run_id):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        try:
+            return Response(run_detail(rag_token, run_id), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+
+class RAGRunSubmitToolOutputsView(CreateAPIView):
+    def post(self, request, token, run_id):
+        auth = token_verification(token)
+        if auth['status'] != 200:
+            return Response({'error': auth['error']}, status=401)
+        if not rag_feature_enabled():
+            return Response({'error': 'RAG disabled'}, status=404)
+        rag_token, err = ensure_rag_token(auth['user'])
+        if not rag_token:
+            return Response({'error': f'No RAG token: {err}'}, status=500)
+        tool_outputs = request.data.get("tool_outputs") or []
+        try:
+            return Response(run_submit_tool_outputs(rag_token, run_id, tool_outputs), status=200)
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)

@@ -125,7 +125,7 @@ WSGI_APPLICATION = 'peercheck.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'new_peercheck1.sqlite3',
+        'NAME': BASE_DIR / 'rag_3pc_check.sqlite3',
     },
     'development': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
@@ -246,4 +246,51 @@ CELERY_BEAT_SCHEDULE = {
         'task': 'api.tasks.process_missing_diarizations',
         'schedule': 900,  # 900 seconds = 15 minutes
     },
+}
+
+
+# --- RAGitify Plug-and-Play ---
+RAGITIFY_ENABLED = os.getenv("RAGITIFY_ENABLED", "true").lower() == "true"
+RAGITIFY_BASE_URL = os.getenv("RAGITIFY_BASE_URL", "http://127.0.0.1:5000/").rstrip("/")
+RAGITIFY_TIMEOUT_SECONDS = int(os.getenv("RAGITIFY_TIMEOUT_SECONDS", "30"))
+RAGITIFY_DEFAULT_PASSWORD = os.getenv("RAGITIFY_DEFAULT_PASSWORD", "ChangeMe!123")
+
+RAGITIFY_PATHS = {
+    # Auth
+    "register": "/rag/register/",
+    "login": "/rag/login/",
+    "protected": "/rag/protected/{token}/",
+
+    # Vector stores
+    "vector_store_create": "/rag/vector-store/{token}/",
+    "vector_store_list": "/rag/vector-store/{token}/list/",
+    "vector_store_detail": "/rag/vector-store/{token}/{id}/",
+
+    # Documents
+    "document_ingest": "/rag/document/{token}/ingest/",
+    "document_list": "/rag/document/{token}/list/",
+    "document_detail": "/rag/document/{token}/{id}/",
+    "document_status": "/rag/document/{token}/{document_id}/status/",
+
+    # Assistants
+    "assistant_create": "/rag/assistant/{token}/",
+    "assistant_list": "/rag/assistant/{token}/list/",
+    "assistant_detail": "/rag/assistant/{token}/{id}/",
+
+    # Threads
+    "thread_create": "/rag/thread/{token}/",
+    "thread_list": "/rag/thread/{token}/list/",
+    "thread_detail": "/rag/thread/{token}/{id}/",
+    "thread_messages": "/rag/thread/{token}/{thread_id}/messages/",
+
+    # Messages
+    "message_create": "/rag/message/{token}/",
+    "message_list": "/rag/message/{token}/list/",
+    "message_detail": "/rag/message/{token}/{id}/",
+
+    # Runs
+    "run_create": "/rag/run/{token}/",
+    "run_list": "/rag/run/{token}/list/",
+    "run_detail": "/rag/run/{token}/{id}/",
+    "run_submit_tool_outputs": "/rag/run/{token}/{run_id}/submit-tool-outputs/",
 }
