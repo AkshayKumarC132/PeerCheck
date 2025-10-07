@@ -159,20 +159,22 @@ class UploadAndProcessView(CreateAPIView):
         start_time = time.time()
         reference_doc = None
         audio_obj = None
-        
+        text_content: Optional[str] = None
+
         try:
             validated = serializer.validated_data
             user_profile = user
             audio_file = validated['audio_file']
+            text_file = validated.get('text_file')
+            existing_document_id = validated.get('existing_document_id')
 
-            # Create or fetch ReferenceDocument
-            if 'text_file' in validated and validated.get('text_file'):
-                text_file = validated['text_file']
+            # Create or fetch ReferenceDocument when provided
+            if text_file:
                 document_type = validated.get('document_type', 'sop')
                 document_name = validated.get('document_name', '')
                 text_s3_key = f'documents/{user.id}/{uuid.uuid4()}_{text_file.name}'
                 text_s3_url = upload_file_to_s3(text_file, text_s3_key)
-                
+
                 reference_doc = ReferenceDocument.objects.create(
                     name=document_name or text_file.name,
                     document_type=document_type,
@@ -183,22 +185,30 @@ class UploadAndProcessView(CreateAPIView):
                     uploaded_by=user_profile,
                     upload_status='processing'
                 )
-                
-                # Extract text from the newly uploaded document
+
                 text_content = extract_text_from_s3(text_s3_url)
                 reference_doc.extracted_text = text_content
                 reference_doc.upload_status = 'processed'
-                reference_doc.save()
-            else:
-                doc_id = validated['existing_document_id']
-                reference_doc = ReferenceDocument.objects.get(id=doc_id)
-                if not reference_doc.extracted_text and reference_doc.file_path:
-                    txt = extract_text_from_s3(reference_doc.file_path)
-                    reference_doc.extracted_text = txt
+                reference_doc.save(update_fields=['extracted_text', 'upload_status'])
+
+            elif existing_document_id:
+                try:
+                    reference_doc = ReferenceDocument.objects.get(id=existing_document_id, uploaded_by=user_profile)
+                except ReferenceDocument.DoesNotExist:
+                    return Response({
+                        'error': 'Reference document not found',
+                        'details': {'existing_document_id': [f"No ReferenceDocument with ID '{existing_document_id}'."]},
+                        'timestamp': timezone.now()
+                    }, status=status.HTTP_404_NOT_FOUND)
+
+                text_content = reference_doc.extracted_text
+                if (not text_content) and reference_doc.file_path:
+                    text_content = extract_text_from_s3(reference_doc.file_path)
+                    reference_doc.extracted_text = text_content
                     reference_doc.save(update_fields=['extracted_text'])
-            
+
             # --- RAG ingestion (document) ---
-            if rag_feature_enabled():
+            if reference_doc and rag_feature_enabled():
                 token_val, vs_id, err_vs = ensure_user_vector_store_id(user)
                 if token_val and vs_id:
                     try:
@@ -249,12 +259,6 @@ class UploadAndProcessView(CreateAPIView):
                 reference_document=reference_doc,
                 status='processing'
             )
-            
-            # Extract text again (ensures current)
-            text_content = extract_text_from_s3(reference_doc.file_path)
-            reference_doc.extracted_text = text_content
-            reference_doc.upload_status = 'processed'
-            reference_doc.save()
 
             # Transcribe audio
             transcript_result = transcribe_audio_from_s3(audio_s3_url)
@@ -269,10 +273,20 @@ class UploadAndProcessView(CreateAPIView):
             audio_obj.save(update_fields=['diarization'])
             _start_diarization_thread(audio_obj.id, audio_s3_url, transcript_segments, transcript_words)
             
-            # Compare and compute coverage
-            matched_html, missing_html, matched_words, total_words, entire_html = find_missing(text_content, transcript)
-            coverage = (matched_words / total_words * 100) if total_words > 0 else 0
-            audio_obj.coverage = coverage
+            matched_html = ''
+            missing_html = ''
+            entire_html = ''
+            matched_words = 0
+            total_words = 0
+            coverage = None
+
+            if text_content:
+                matched_html, missing_html, matched_words, total_words, entire_html = find_missing(text_content, transcript)
+                coverage = (matched_words / total_words * 100) if total_words > 0 else 0
+                audio_obj.coverage = coverage
+            else:
+                audio_obj.coverage = None
+
             audio_obj.status = 'processed'
             audio_obj.save()
 
@@ -286,23 +300,23 @@ class UploadAndProcessView(CreateAPIView):
                 audio_file=audio_obj,
                 matched_words=matched_words,
                 total_words=total_words,
-                coverage=coverage,
+                coverage=coverage if coverage is not None else 0,
                 expires_at=expires_at
             )
             processing_time = time.time() - start_time
             audio_obj.processing_session = session.id
             audio_obj.save()
-            
+
             return Response({
                 'session_id': str(session.id),
                 'matched_words': matched_words,
                 'total_words': total_words,
-                'coverage': round(coverage, 2),
-                'reference_document_id': str(reference_doc.id),
+                'coverage': round(coverage, 2) if coverage is not None else None,
+                'reference_document_id': str(reference_doc.id) if reference_doc else None,
                 'audio_file_id': str(audio_obj.id),
-                'matched_content': matched_html,
-                'missing_content': missing_html,
-                'entire_document': entire_html,
+                'matched_content': matched_html if text_content else None,
+                'missing_content': missing_html if text_content else None,
+                'entire_document': entire_html if text_content else None,
                 'processing_time': round(processing_time, 2),
                 'diarization': None,
                 'diarization_error': None,

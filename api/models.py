@@ -232,7 +232,12 @@ class SpeakerProfile(models.Model):
 class ProcessingSession(models.Model):
     """Track processing sessions for download tokens"""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.CASCADE)
+    reference_document = models.ForeignKey(
+        ReferenceDocument,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     audio_file = models.ForeignKey(AudioFile, on_delete=models.CASCADE)
     matched_words = models.IntegerField(default=0)
     total_words = models.IntegerField(default=0)

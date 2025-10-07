@@ -8,21 +8,19 @@ from peercheck import settings
 class UploadAndProcessSerializer(serializers.Serializer):
     """
     Serializer for the main processing endpoint.
-    Validates that either a new text file is uploaded or an existing document ID is provided.
+    Callers may upload a new reference document, reuse an existing one, or rely
+    entirely on automatic RAG matching by supplying only an audio file.
     """
-    # --- MODIFIED: text_file is no longer always required ---
     text_file = serializers.FileField(
-        help_text="Upload a new text document (PDF, DOCX, or TXT). Required if 'existing_document_id' is not provided.",
-        required=False # Changed from True
-    )
-    
-    # --- NEW: Field for existing document ID ---
-    existing_document_id = serializers.UUIDField(
-        help_text="ID of an existing reference document to use. Required if 'text_file' is not provided.",
+        help_text="Upload a new text document (PDF, DOCX, or TXT). Optional.",
         required=False
     )
 
-    # --- UNCHANGED: audio_file is always required ---
+    existing_document_id = serializers.UUIDField(
+        help_text="ID of an existing reference document to use. Optional.",
+        required=False
+    )
+
     audio_file = serializers.FileField(
         help_text="Upload an audio file (MP3, WAV, M4A, MPEG, MP4)",
         required=True
@@ -45,12 +43,10 @@ class UploadAndProcessSerializer(serializers.Serializer):
         text_file = data.get('text_file')
         doc_id = data.get('existing_document_id')
 
-        # Ensure either text_file or existing_document_id is provided, not both
-        if not text_file and not doc_id:
-            raise serializers.ValidationError("Provide either 'text_file' or 'existing_document_id'.")
+        # Ensure the client does not upload a new document while also pointing to an existing one
         if text_file and doc_id:
             raise serializers.ValidationError("Provide only one of 'text_file' or 'existing_document_id'.")
-        
+
         # If existing_document_id is provided, ensure the document exists
         if doc_id:
             try:
