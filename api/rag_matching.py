@@ -110,7 +110,18 @@ def schedule_document_match(audio_file: AudioFile) -> Optional[threading.Thread]
     audio_file.rag_document_match_status = "pending"
     audio_file.rag_document_match_error = None
     audio_file.rag_document_match_updated_at = timezone.now()
-    audio_file.save(update_fields=["rag_document_match_status", "rag_document_match_error", "rag_document_match_updated_at"])
+    audio_file.rag_document_matches = {
+        "documents": [],
+        "selected_reference_document_id": None,
+    }
+    audio_file.save(
+        update_fields=[
+            "rag_document_match_status",
+            "rag_document_match_error",
+            "rag_document_match_updated_at",
+            "rag_document_matches",
+        ]
+    )
 
     thread = threading.Thread(target=_run_document_match, args=(audio_file.id,), daemon=True)
     thread.start()
@@ -289,6 +300,6 @@ def _persist_result(audio: AudioFile, result: MatchResult):
             audio.reference_document = ref
             ProcessingSession.objects.filter(audio_file=audio).update(reference_document=ref)
             updates["rag_document_matches"]["selected_reference_document_name"] = ref.name
+            updates["reference_document"] = ref
 
     AudioFile.objects.filter(id=audio.id).update(**updates)
-*** End of File
