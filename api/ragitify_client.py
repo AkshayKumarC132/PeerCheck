@@ -205,11 +205,13 @@ def thread_messages(token: str, thread_id: str):
     return data if isinstance(data, list) else data.get("results", data) or []
 
 # ---------------- MESSAGE ----------------
-# RAG MessageSerializer: thread_id (required), content (required); role is server-set/read-only
-def message_create(token: str, *, thread_id: str, content: str):
+# RAG MessageSerializer: thread_id (required), content (required); role defaults to "user"
+def message_create(token: str, *, thread_id: str, content: str, role: str = "user"):
     if not _enabled(): return {}
     url = _path("message_create", token=token)
     payload = {"thread_id": thread_id, "content": content}
+    if role:
+        payload["role"] = role
     return _req("POST", url, json=payload)
 
 def message_list(token: str):

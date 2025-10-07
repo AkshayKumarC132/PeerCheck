@@ -5,6 +5,7 @@ import time
 import logging
 import threading
 from datetime import datetime, timedelta
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from peercheck import settings
@@ -57,6 +58,7 @@ from .new_serializers import (
 
 # RAG helpers
 from .rag_integration import ensure_user_vector_store_id, ensure_rag_token
+from .rag_matching import schedule_document_match
 from .ragitify_client import (
     document_ingest, document_status,
     assistant_create, assistant_list, assistant_detail,
@@ -92,6 +94,45 @@ def _start_diarization_thread(audio_file_id, audio_source, transcript_segments, 
     thread = threading.Thread(target=_run_diarization, daemon=True)
     thread.start()
     return thread
+
+
+def _build_document_option(reference: ReferenceDocument, confidence: Optional[float], rag_document_id: Optional[str]) -> Dict[str, Any]:
+    return {
+        "reference_document_id": str(reference.id),
+        "name": reference.name,
+        "rag_document_id": rag_document_id or reference.rag_document_id,
+        "confidence": confidence,
+        "file_path": reference.file_path,
+        "document_type": reference.document_type,
+    }
+
+
+def _serialize_rag_candidates(user: UserProfile, candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    options: List[Dict[str, Any]] = []
+    for item in candidates:
+        rag_doc_id = item.get("rag_document_id")
+        ref_id = item.get("reference_document_id")
+        confidence = item.get("confidence")
+        reference = None
+        if ref_id:
+            reference = ReferenceDocument.objects.filter(id=ref_id, uploaded_by=user).first()
+        elif rag_doc_id:
+            reference = ReferenceDocument.objects.filter(rag_document_id=rag_doc_id, uploaded_by=user).first()
+        if reference:
+            options.append(_build_document_option(reference, confidence, rag_doc_id))
+        else:
+            options.append({
+                "reference_document_id": None,
+                "rag_document_id": rag_doc_id,
+                "reference_document_name": item.get("reference_document_name"),
+                "confidence": confidence,
+            })
+    return options
+
+
+def _all_user_document_options(user: UserProfile) -> List[Dict[str, Any]]:
+    docs = ReferenceDocument.objects.filter(uploaded_by=user)
+    return [_build_document_option(doc, None, doc.rag_document_id) for doc in docs]
 
 # --------------------------- CORE: Upload + Process ---------------------------
 
@@ -234,7 +275,10 @@ class UploadAndProcessView(CreateAPIView):
             audio_obj.coverage = coverage
             audio_obj.status = 'processed'
             audio_obj.save()
-            
+
+            # Kick off asynchronous document matching with RAGitify
+            schedule_document_match(audio_obj)
+
             # Create processing session
             expires_at = timezone.now() + timedelta(hours=24)
             session = ProcessingSession.objects.create(
@@ -492,7 +536,75 @@ class DownloadProcessedDocumentView(GenericAPIView):
             
             reference_doc = session.reference_document
             audio_file = session.audio_file
-            
+
+            if rag_feature_enabled():
+                match_status = audio_file.rag_document_match_status or ""
+                match_payload = audio_file.rag_document_matches or {}
+
+                if match_status in ("", None, "pending"):
+                    return Response({
+                        'status': 'matching',
+                        'message': 'Automatic document matching is still running. Please retry shortly.',
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_202_ACCEPTED)
+
+                if match_status == "matched":
+                    selected_id = match_payload.get("selected_reference_document_id")
+                    if selected_id:
+                        resolved = ReferenceDocument.objects.filter(id=selected_id, uploaded_by=user).first()
+                        if resolved:
+                            reference_doc = resolved
+
+                elif match_status == "needs_selection":
+                    options = _serialize_rag_candidates(user, match_payload.get("documents", []))
+                    return Response({
+                        'status': 'needs_selection',
+                        'message': 'Multiple documents closely match this transcript. Please select the correct reference document.',
+                        'options': options,
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_409_CONFLICT)
+
+                elif match_status in ("no_match", "low_confidence"):
+                    options = _all_user_document_options(user)
+                    return Response({
+                        'status': 'manual_selection_required',
+                        'message': 'We could not confidently identify the reference document. Please choose from your available documents.',
+                        'options': options,
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_409_CONFLICT)
+
+                elif match_status == "error":
+                    options = _all_user_document_options(user)
+                    return Response({
+                        'status': 'manual_selection_required',
+                        'message': f"Automatic document matching failed: {audio_file.rag_document_match_error or 'Unknown error'}. Please select the correct document manually.",
+                        'options': options,
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_409_CONFLICT)
+
+            if reference_doc is None:
+                options = _all_user_document_options(user)
+                return Response({
+                    'status': 'manual_selection_required',
+                    'message': 'No reference document is linked to this audio. Please select one to continue.',
+                    'options': options,
+                    'timestamp': timezone.now().isoformat(),
+                }, status=status.HTTP_409_CONFLICT)
+
+            if session.reference_document_id != reference_doc.id or not session.processed_docx_path:
+                # ensure session reference matches and clear stale processed files when switching documents
+                if session.reference_document_id != reference_doc.id:
+                    session.reference_document = reference_doc
+                    session.processed_docx_path = None
+                    session.save(update_fields=['reference_document', 'processed_docx_path'])
+                else:
+                    session.reference_document = reference_doc
+                    session.save(update_fields=['reference_document'])
+
+            if audio_file.reference_document_id != reference_doc.id:
+                audio_file.reference_document = reference_doc
+                audio_file.save(update_fields=['reference_document'])
+
             # Check if processed DOCX already exists in S3
             if session.processed_docx_path:
                 print(f"Using existing processed document: {session.processed_docx_path}")

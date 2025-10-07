@@ -97,6 +97,10 @@ class AudioFile(models.Model):
     coverage = models.FloatField(null=True, blank=True)
     processing_session = models.CharField(max_length=100, default = '')
     reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_comparisons')
+    rag_document_match_status = models.CharField(max_length=32, null=True, blank=True)
+    rag_document_matches = models.JSONField(default=dict, blank=True)
+    rag_document_match_error = models.TextField(null=True, blank=True)
+    rag_document_match_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)  # Fixed: was auto_now=True
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -246,6 +250,7 @@ class RAGAccount(models.Model):
     rag_email = models.EmailField(max_length=255, blank=True, null=True)
     access_token = models.CharField(max_length=512, blank=True, null=True)
     vector_store_id = models.CharField(max_length=128, blank=True, null=True, db_index=True)
+    document_match_assistant_id = models.CharField(max_length=128, blank=True, null=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
