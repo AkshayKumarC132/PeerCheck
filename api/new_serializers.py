@@ -200,6 +200,17 @@ class ReferenceDocumentSerializer(serializers.Serializer):
     #         'created_at',
     #         'extracted_text' # Included for response, but not for input
     #     ]
+
+
+class RunDiarizationSerializer(serializers.Serializer):
+    audio_id = serializers.UUIDField()
+
+
+class SpeakerProfileMappingSerializer(serializers.Serializer):
+    audio_id = serializers.UUIDField()
+    speaker_label = serializers.CharField(max_length=50)
+    name = serializers.CharField(max_length=255)
+    profile_id = serializers.IntegerField(required=False)
     #     # These fields are set by the server, not provided by the client on upload.
     #     read_only_fields = [
     #         'id', 
