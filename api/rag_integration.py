@@ -1,10 +1,12 @@
 # rag_integration.py
+import datetime
 from typing import Optional, Tuple
 from peercheck import settings
 from django.db import transaction
 from .models import UserProfile, RAGAccount
 from .ragitify_client import login, protected, register_user, vector_store_create, vector_store_list
 import requests
+import uuid
 
 def rag_on() -> bool:
     return bool(getattr(settings, "RAGITIFY_ENABLED", False))
@@ -14,15 +16,6 @@ def _base_url() -> str:
 
 def _timeout() -> int:
     return int(getattr(settings, "RAGITIFY_TIMEOUT_SECONDS", 30))
-
-def _make_3pc_email(email_fallback: str, username: str) -> str:
-    base_email = (email_fallback or f"{username}@example.com").strip().lower()
-    if "@" in base_email:
-        local, domain = base_email.split("@", 1)
-        local = local.strip() or (username or "user")
-        domain = domain.strip() or "example.com"
-        return f"3pc_{local}@{domain}"
-    return f"3pc_{(username or 'user').lower()}@example.com"
 
 @transaction.atomic
 def ensure_rag_token(user: UserProfile) -> Tuple[Optional[str], Optional[str]]:
@@ -34,7 +27,7 @@ def ensure_rag_token(user: UserProfile) -> Tuple[Optional[str], Optional[str]]:
         return None, "RAG base URL not configured"
 
     default_password = getattr(settings, "RAGITIFY_DEFAULT_PASSWORD", "ChangeMe!123")
-    rag_email = _make_3pc_email(user.email, user.username)
+    rag_email = f"3pc_{user.email}"
 
     acct, _created = RAGAccount.objects.get_or_create(user=user, defaults={"rag_email": rag_email})
     if acct.rag_email != rag_email:
@@ -54,8 +47,8 @@ def ensure_rag_token(user: UserProfile) -> Tuple[Optional[str], Optional[str]]:
             username=rag_email,
             email=rag_email,
             password=default_password,
-            tenant_name=f"3PC_{user.username}",
-            collection_name=f"3PC_Collection-{user.username}",
+            tenant_name=f"3PC_{user.email}_{datetime.datetime.utcnow().isoformat()}",
+            collection_name=f"{rag_email}_{uuid.uuid4()}",
         )
     except requests.HTTPError as e:
         try:
@@ -98,7 +91,7 @@ def ensure_user_vector_store_id(user: UserProfile) -> Tuple[Optional[str], Optio
         return token, acct.vector_store_id, None
 
     # Canonical VS name for this user
-    canonical_name = f"3PC-{user.username}"
+    canonical_name = f"3PC_VectorStore_{acct.rag_email}_{uuid.uuid4()}"
 
     # Try to discover an existing VS from RAG by name
     try:

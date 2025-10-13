@@ -261,12 +261,27 @@ class UploadAndProcessView(CreateAPIView):
             )
 
             # Transcribe audio
-            transcript_result = transcribe_audio_from_s3(audio_s3_url)
-            transcript = transcript_result["text"]
-            transcript_segments = transcript_result.get("segments", [])
-            transcript_words = transcript_result.get("words", [])
-            audio_obj.transcription = transcript_result
-            audio_obj.save()
+            try:
+                transcript_result = transcribe_audio_from_s3(audio_s3_url)
+                transcript = transcript_result["text"]
+                transcript_segments = transcript_result.get("segments", [])
+                transcript_words = transcript_result.get("words", [])
+                audio_obj.transcription = transcript_result
+                audio_obj.save()
+            except ValueError as ve:
+                logging.error(f"Transcription error: {ve}")
+                return Response({
+                    'error': 'Failed to transcribe audio. Please check the audio file.',
+                    'details': str(ve),
+                    'timestamp': timezone.now().isoformat()
+                }, status=status.HTTP_400_BAD_REQUEST)
+            except Exception as e:
+                logging.exception("Unexpected error during transcription")
+                return Response({
+                    'error': 'An unexpected error occurred during transcription.',
+                    'details': str(e),
+                    'timestamp': timezone.now().isoformat()
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
             # Speaker diarization
             audio_obj.diarization = None

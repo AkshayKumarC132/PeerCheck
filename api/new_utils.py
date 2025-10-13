@@ -164,7 +164,12 @@ def transcribe_audio_from_s3(s3_url):
     try:
         # Use word_timestamps=True to get word-level info
         result = model.transcribe(temp_path, word_timestamps=True)
+        if not result or not result.get("text"):
+            raise ValueError("Transcription result is empty or invalid.")
         return result  # Return the full result dict
+    except Exception as e:
+        logging.error(f"Failed to transcribe audio from S3: {e}")
+        raise
     finally:
         os.unlink(temp_path)
 

@@ -20,7 +20,7 @@ class RegisterView(generics.CreateAPIView):
 
     def perform_create(self, serializer):
         data = self.request.data
-        required_fields = ['username', 'email', 'password']
+        required_fields = ['email', 'password']
         missing_or_empty_fields = [
             field for field in required_fields
             if field not in data or not data[field].strip()
@@ -31,10 +31,9 @@ class RegisterView(generics.CreateAPIView):
                 {"error": f"Fields cannot be null or empty: {', '.join(missing_or_empty_fields)}"}
             )
 
-        username = data['username']
         email = data['email']
         password = data['password']
-        role = data.get('role', 'operator')
+        role = data.get('role', 'admin').lower()
 
         if role not in dict(UserProfile.ROLE_CHOICES):
             raise serializers.ValidationError({"error": f"Invalid role: {role}"})
@@ -44,10 +43,10 @@ class RegisterView(generics.CreateAPIView):
 
         try:
             user = UserProfile.objects.create_user(
-                username=username,
+                username=email,
                 email=email,
                 password=password,
-                name=username,
+                name=email,
                 role=role
             )
             serializer.instance = user
@@ -66,9 +65,9 @@ class LoginViewAPI(generics.CreateAPIView):
     def post(self, request):
         serializer = self.serializer_class(data=request.data)
         if serializer.is_valid(raise_exception=True):
-            username = serializer.validated_data['username']
+            user_email = serializer.validated_data['email']
             password = serializer.validated_data['password']
-            user = authenticate(username=username, password=password)
+            user = authenticate(username=user_email, password=password)
             if user is not None:
                 login(request, user)
                 try:
@@ -76,10 +75,10 @@ class LoginViewAPI(generics.CreateAPIView):
                 except Exception:
                     return Response({'message': "Failed to create token"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-                profile = UserProfile.objects.get(username=username)
+                profile = UserProfile.objects.get(email=user_email)
                 profile_info = {
                     "last_login": profile.last_login,
-                    "username": profile.username,
+                    "username": profile.email,
                     "first_name": profile.first_name,
                     "last_name": profile.last_name,
                     "email": profile.email,

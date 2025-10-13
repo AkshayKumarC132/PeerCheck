@@ -6,7 +6,7 @@ import ast
 class UserProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = UserProfile
-        fields = ['id', 'username', 'email', 'name', 'theme', 'password', 'role']
+        fields = ['id', 'email', 'name', 'theme', 'password', 'role']
         extra_kwargs = {
             'password': {'write_only': True}
         }
@@ -66,7 +66,7 @@ class SpeakerProfileSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'embedding', 'created_at', 'updated_at']
 
 class LoginSerializer(serializers.Serializer):
-    username = serializers.CharField()
+    email = serializers.CharField()
     password = serializers.CharField()
 
 class SOPStepSerializer(serializers.ModelSerializer):

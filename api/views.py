@@ -1667,12 +1667,16 @@ class AdminDashboardSummaryView(APIView):
         if request.validated_user.role != 'admin':
             return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
 
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
-            total_users = UserProfile.objects.count()
-            total_audio_files = AudioFile.objects.count()
-            processed_audio_files = AudioFile.objects.filter(status='processed').count()
-            failed_audio_files = AudioFile.objects.filter(status='failed').count()
-            total_documents = ReferenceDocument.objects.count()
+            total_users = UserProfile.objects.filter(id=user_data['user'].id).count()
+            total_audio_files = AudioFile.objects.filter(user=user_data['user'].id).count()
+            processed_audio_files = AudioFile.objects.filter(status='processed', user=user_data['user'].id).count()
+            failed_audio_files = AudioFile.objects.filter(status='failed', user=user_data['user'].id).count()
+            total_documents = ReferenceDocument.objects.filter(uploaded_by=user_data['user'].id).count()
 
             data = {
                 "total_users": total_users,
