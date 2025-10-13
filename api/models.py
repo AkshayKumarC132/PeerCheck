@@ -243,6 +243,7 @@ class ProcessingSession(models.Model):
     total_words = models.IntegerField(default=0)
     coverage = models.FloatField(default=0.0)
     processed_docx_path = models.CharField(max_length=500, null=True, blank=True)
+    processed_docx_with_diarization_path = models.CharField(max_length=500, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()  # Set expiration for cleanup
     

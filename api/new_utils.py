@@ -5,7 +5,7 @@ import tempfile
 import csv
 import logging
 import threading
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 import boto3
 import numpy as np
@@ -618,7 +618,13 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
+def create_highlighted_docx_from_s3(
+    text_s3_url,
+    transcript,
+    high_threshold=0.6,
+    low_threshold=0.3,
+    three_pc_entries: Optional[List[Dict]] = None,
+):
     """
     Generates a highlighted DOCX report from a reference document (PDF or DOCX)
     and a transcript, then uploads it to S3.
@@ -664,6 +670,9 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             high_threshold=high_threshold,
             low_threshold=low_threshold
         )
+
+        if three_pc_entries is not None:
+            append_three_pc_summary_to_docx(output_path, three_pc_entries)
         
         # --- UPLOAD THE FINAL REPORT TO S3 ---
         output_filename = os.path.basename(s3_key).rsplit('.', 1)[0]
@@ -1010,6 +1019,159 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
         entry['total_duration'] = round(entry['total_duration'], 2)
 
     return list(summary.values())
+
+
+def _format_timestamp(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    try:
+        total_seconds = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        return "-"
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def build_three_part_communication_summary(
+    reference_text: Optional[str],
+    diarization_segments: Optional[List[Dict]],
+    match_threshold: float = 0.6,
+    max_entries: int = 1000,
+) -> List[Dict[str, Any]]:
+    segments = diarization_segments or []
+    reference_lines: List[str] = []
+    normalized_reference: List[str] = []
+
+    if reference_text:
+        reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
+        normalized_reference = [normalize_line(ln) for ln in reference_lines]
+
+    used_reference_indices: Set[int] = set()
+    summary_entries: List[Dict[str, Any]] = []
+
+    for segment in segments:
+        spoken_text = (segment.get("text") or "").strip()
+        normalized_spoken = normalize_line(spoken_text) if spoken_text else ""
+        best_idx: Optional[int] = None
+        best_score = 0.0
+
+        if normalized_spoken and normalized_reference:
+            for idx, ref_norm in enumerate(normalized_reference):
+                if not ref_norm:
+                    continue
+                score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+
+        status = "correct" if (spoken_text and not normalized_reference) else "mismatch"
+        matched_reference = None
+        if spoken_text:
+            if best_idx is not None and best_score >= match_threshold:
+                status = "correct"
+                matched_reference = reference_lines[best_idx]
+                used_reference_indices.add(best_idx)
+        else:
+            status = "unspoken"
+
+        summary_entries.append(
+            {
+                "speaker": segment.get("speaker_name")
+                or segment.get("speaker_label")
+                or segment.get("speaker")
+                or "Unknown",
+                "start": segment.get("start"),
+                "end": segment.get("end"),
+                "content": spoken_text or matched_reference or "",
+                "status": status,
+                "reference": matched_reference,
+                "similarity": round(best_score, 2),
+            }
+        )
+
+    if normalized_reference:
+        for idx, line in enumerate(reference_lines):
+            if idx in used_reference_indices:
+                continue
+            summary_entries.append(
+                {
+                    "speaker": "Not Spoken",
+                    "start": None,
+                    "end": None,
+                    "content": line,
+                    "status": "unspoken",
+                    "reference": line,
+                    "similarity": 0.0,
+                }
+            )
+
+    def _sort_key(entry: Dict[str, Any]):
+        start = entry.get("start")
+        try:
+            start_val = float(start) if start is not None else None
+        except (TypeError, ValueError):
+            start_val = None
+        return (0 if start_val is not None else 1, start_val or 0.0, entry.get("speaker") or "")
+
+    summary_entries.sort(key=_sort_key)
+
+    if len(summary_entries) > max_entries:
+        summary_entries = summary_entries[:max_entries]
+
+    return summary_entries
+
+
+def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]]) -> None:
+    document = docx.Document(docx_path)
+    document.add_page_break()
+    document.add_heading("Three-Part Communication (3PC) Summary", level=1)
+
+    if not entries:
+        document.add_paragraph("No speaker diarization data was available to summarise.")
+        document.save(docx_path)
+        return
+
+    headers = ["Speaker", "Start", "End", "Content", "Status"]
+    table = document.add_table(rows=1, cols=len(headers))
+    try:
+        table.style = "Light Grid Accent 1"
+    except KeyError:
+        table.style = "Light Grid"
+    for cell, title in zip(table.rows[0].cells, headers):
+        cell.text = title
+
+    status_colors = {
+        "correct": RGBColor(0, 128, 0),
+        "mismatch": RGBColor(192, 0, 0),
+        "unspoken": RGBColor(128, 128, 128),
+    }
+
+    for entry in entries:
+        row = table.add_row()
+        cells = row.cells
+        values = [
+            entry.get("speaker") or "Unknown",
+            _format_timestamp(entry.get("start")),
+            _format_timestamp(entry.get("end")),
+            entry.get("content") or "",
+        ]
+
+        for idx, value in enumerate(values):
+            cells[idx].text = value
+
+        status = (entry.get("status") or "").lower()
+        status_cell = cells[len(headers) - 1]
+        status_cell.text = status.capitalize() if status else "-"
+        if status in status_colors:
+            for paragraph in status_cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.color.rgb = status_colors[status]
+
+    document.save(docx_path)
 
 
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---

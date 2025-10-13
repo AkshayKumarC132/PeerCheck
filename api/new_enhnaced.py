@@ -39,6 +39,8 @@ from .new_utils import (
     get_s3_key_from_url,
     s3_client,
     create_highlighted_pdf_document,
+    create_highlighted_docx_from_s3,
+    build_three_part_communication_summary,
 )
 from .authentication import token_verification
 from .new_serializers import (
@@ -668,7 +670,6 @@ class DownloadProcessedDocumentView(GenericAPIView):
                             require_transcript_match=use_transcript,
                         )
                     elif file_ext == 'docx':
-                        from .new_utils import create_highlighted_docx_from_s3
                         processed_s3_url = create_highlighted_docx_from_s3(
                             reference_doc.file_path,
                             transcript
@@ -716,6 +717,195 @@ class DownloadProcessedDocumentView(GenericAPIView):
             
             return Response({
                 'error': f'Download failed: {str(e)}',
+                'timestamp': timezone.now().isoformat()
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
+    """Download highlighted document enriched with speaker diarization details."""
+
+    serializer_class = DownloadRequestSerializer
+
+    @swagger_auto_schema(
+        operation_description="Download processed document with speaker diarization summary",
+        responses={
+            200: openapi.Response(
+                description="Processed DOCX file with 3PC details",
+                content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+            ),
+            202: ErrorResponseSerializer,
+            401: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+            404: ErrorResponseSerializer,
+            409: ErrorResponseSerializer,
+            500: ErrorResponseSerializer,
+        }
+    )
+    def get(self, request, token, session_id, *args, **kwargs):
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({
+                'error': user_data['error'],
+                'timestamp': timezone.now().isoformat()
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        user = user_data['user']
+        print(f"User: {user.username}, Session ID: {session_id}")
+
+        try:
+            session = ProcessingSession.objects.get(id=session_id)
+
+            reference_doc = session.reference_document
+            audio_file = session.audio_file
+
+            if rag_feature_enabled():
+                match_status = audio_file.rag_document_match_status or ""
+                match_payload = audio_file.rag_document_matches or {}
+
+                if match_status in ("", None, "pending"):
+                    return Response({
+                        'status': 'matching',
+                        'message': 'Automatic document matching is still running. Please retry shortly.',
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_202_ACCEPTED)
+
+                if match_status == "matched":
+                    selected_id = match_payload.get("selected_reference_document_id")
+                    if selected_id:
+                        resolved = ReferenceDocument.objects.filter(id=selected_id, uploaded_by=user).first()
+                        if resolved:
+                            reference_doc = resolved
+
+                elif match_status == "needs_selection":
+                    options = _serialize_rag_candidates(user, match_payload.get("documents", []))
+                    return Response({
+                        'status': 'needs_selection',
+                        'message': 'Multiple documents closely match this transcript. Please select the correct reference document.',
+                        'options': options,
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_409_CONFLICT)
+
+                elif match_status in ("no_match", "low_confidence"):
+                    options = _all_user_document_options(user)
+                    return Response({
+                        'status': 'manual_selection_required',
+                        'message': 'We could not confidently identify the reference document. Please choose from your available documents.',
+                        'options': options,
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_409_CONFLICT)
+
+                elif match_status == "error":
+                    options = _all_user_document_options(user)
+                    return Response({
+                        'status': 'manual_selection_required',
+                        'message': f"Automatic document matching failed: {audio_file.rag_document_match_error or 'Unknown error'}. Please select the correct document manually.",
+                        'options': options,
+                        'timestamp': timezone.now().isoformat(),
+                    }, status=status.HTTP_409_CONFLICT)
+
+            if reference_doc is None:
+                options = _all_user_document_options(user)
+                return Response({
+                    'status': 'manual_selection_required',
+                    'message': 'No reference document is linked to this audio. Please select one to continue.',
+                    'options': options,
+                    'timestamp': timezone.now().isoformat(),
+                }, status=status.HTTP_409_CONFLICT)
+
+            if session.reference_document_id != reference_doc.id:
+                session.reference_document = reference_doc
+                session.processed_docx_with_diarization_path = None
+                session.save(update_fields=['reference_document', 'processed_docx_with_diarization_path'])
+
+            if audio_file.reference_document_id != reference_doc.id:
+                audio_file.reference_document = reference_doc
+                audio_file.save(update_fields=['reference_document'])
+
+            transcript = audio_file.transcription.get('text', '') if audio_file.transcription else ''
+            if not transcript:
+                return Response({
+                    'error': 'No transcript available for processing',
+                    'timestamp': timezone.now().isoformat()
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            diarization_payload = audio_file.diarization
+            if diarization_payload is None:
+                return Response({
+                    'status': 'diarization_pending',
+                    'message': 'Speaker diarization is still processing. Please try again shortly.',
+                    'timestamp': timezone.now().isoformat(),
+                }, status=status.HTTP_202_ACCEPTED)
+
+            if isinstance(diarization_payload, dict):
+                diarization_segments = diarization_payload.get('segments', [])
+            else:
+                diarization_segments = diarization_payload
+
+            reference_text = reference_doc.extracted_text or ''
+            if not reference_text and reference_doc.file_path:
+                try:
+                    reference_text = extract_text_from_s3(reference_doc.file_path)
+                except Exception as extraction_error:
+                    logger.warning("Failed to refresh reference text for 3PC summary: %s", extraction_error)
+                    reference_text = ''
+                else:
+                    reference_doc.extracted_text = reference_text
+                    reference_doc.save(update_fields=['extracted_text'])
+
+            three_pc_entries = build_three_part_communication_summary(reference_text, diarization_segments)
+
+            try:
+                previous_url = session.processed_docx_with_diarization_path
+                processed_s3_url = create_highlighted_docx_from_s3(
+                    reference_doc.file_path,
+                    transcript,
+                    three_pc_entries=three_pc_entries,
+                )
+
+                if previous_url and previous_url != processed_s3_url:
+                    try:
+                        if previous_url.startswith('s3://') or ('amazonaws.com/' in previous_url):
+                            s3_key = get_s3_key_from_url(previous_url)
+                            s3_client.delete_object(
+                                Bucket=settings.AWS_STORAGE_BUCKET_NAME,
+                                Key=s3_key,
+                            )
+                    except Exception:
+                        logger.info("Unable to delete previous diarization document %s", previous_url)
+
+                session.processed_docx_with_diarization_path = processed_s3_url
+                session.save(update_fields=['processed_docx_with_diarization_path'])
+
+            except Exception as doc_error:
+                print(f"Error creating diarization document: {str(doc_error)}")
+                print(traceback.format_exc())
+                return Response({
+                    'error': f'Failed to create processed document with diarization: {str(doc_error)}',
+                    'timestamp': timezone.now().isoformat()
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+            response_payload = {
+                'processed_docx_url': processed_s3_url,
+                'message': 'Processed document with speaker details is available at the above URL.',
+                'session_id': str(session.id),
+                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed_diarization.docx",
+                'three_pc_entries': three_pc_entries,
+            }
+
+            return Response(response_payload, status=status.HTTP_200_OK)
+
+        except ProcessingSession.DoesNotExist:
+            print(f"Session not found or expired: {session_id}")
+            return Response({
+                'error': 'Processing session not found or expired',
+                'session_id': str(session_id),
+                'timestamp': timezone.now().isoformat()
+            }, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            print(f"Unexpected error in DownloadProcessedDocumentWithDiarizationView: {str(e)}")
+            print(traceback.format_exc())
+            return Response({
+                'error': f'Download with diarization failed: {str(e)}',
                 'timestamp': timezone.now().isoformat()
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -813,17 +1003,21 @@ class CleanupExpiredSessionsView(CreateAPIView):
         cleaned_files = 0
         
         for session in expired_sessions:
-            # Delete processed DOCX file from S3
-            if session.processed_docx_path:
+            # Delete processed DOCX files from S3
+            for attr in ('processed_docx_path', 'processed_docx_with_diarization_path'):
+                doc_url = getattr(session, attr, None)
+                if not doc_url:
+                    continue
+                s3_key = None
                 try:
-                    s3_key = get_s3_key_from_url(session.processed_docx_path)
+                    s3_key = get_s3_key_from_url(doc_url)
                     s3_client.delete_object(
                         Bucket=settings.AWS_STORAGE_BUCKET_NAME,
                         Key=s3_key
                     )
                     cleaned_files += 1
                 except Exception as e:
-                    print(f"Failed to delete S3 object {s3_key}: {str(e)}")
+                    print(f"Failed to delete S3 object {s3_key or doc_url}: {str(e)}")
             deleted_count += 1
         
         # expired_sessions.delete()

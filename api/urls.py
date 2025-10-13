@@ -30,6 +30,7 @@ urlpatterns = [
 
     # ----------------- Download processed DOCX with highlighted text -----------------
     path('download/<str:token>/<str:session_id>/', new_enhnaced.DownloadProcessedDocumentView.as_view(), name='download_processed'),
+    path('download/with-diarization/<str:token>/<str:session_id>/', new_enhnaced.DownloadProcessedDocumentWithDiarizationView.as_view(), name='download_processed_with_diarization'),
 
     # ---------------- Run diarization on existing audio ----------------
     path('audio/<str:token>/diarization/run/', new_enhnaced.RunDiarizationView.as_view(), name='run-diarization'),
