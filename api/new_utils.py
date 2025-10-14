@@ -7,6 +7,7 @@ import logging
 import threading
 import textwrap
 import importlib.util
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Set
 
 import boto3
@@ -434,17 +435,59 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     )
                     break
 
+@contextmanager
+def _word_com_apartment() -> Any:
+    """Initialise a COM apartment suitable for Microsoft Word automation."""
+
+    spec = importlib.util.find_spec("pythoncom")
+    if spec is None:
+        raise ValueError(
+            "Converting Office documents to PDF requires the 'pywin32' package "
+            "and a Microsoft Word installation."
+        )
+
+    import pythoncom  # type: ignore
+
+    com_initialized = False
+    try:
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except Exception as exc:  # pragma: no cover - best effort initialisation
+            # RPC_E_CHANGED_MODE occurs when the thread is already initialised
+            # in a different COM apartment. In that case we fall back to
+            # explicitly initialising an STA apartment which Word automation
+            # requires.
+            if getattr(exc, "hresult", None) == -2147417850:
+                pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+                com_initialized = True
+            else:
+                raise ValueError(
+                    "Failed to initialise COM before launching Word: {0}".format(exc)
+                ) from exc
+
+        yield pythoncom
+    finally:
+        if com_initialized:
+            pythoncom.CoUninitialize()
+
+
 def _convert_office_document_to_pdf(source_path: str, output_path: str) -> None:
     """Convert DOCX or DOC files to PDF using the best available backend."""
 
     extension = os.path.splitext(source_path)[1].lower()
     if extension == ".docx":
-        convert(source_path, output_path)
+        try:
+            with _word_com_apartment():
+                convert(source_path, output_path)
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to convert DOCX file '{source_path}' to PDF using Word: {exc}"
+            ) from exc
         return
 
     if extension == ".doc":
-        spec = importlib.util.find_spec("win32com.client")
-        if spec is None:
+        if importlib.util.find_spec("win32com.client") is None:
             raise ValueError(
                 "Converting legacy .doc files to PDF requires the 'pywin32' package "
                 "and a Microsoft Word installation."
@@ -452,56 +495,33 @@ def _convert_office_document_to_pdf(source_path: str, output_path: str) -> None:
 
         from win32com.client import DispatchEx  # type: ignore
 
-        try:
-            import pythoncom  # type: ignore
-        except ImportError as exc:  # pragma: no cover - environment specific
-            raise ValueError(
-                "Converting legacy .doc files to PDF requires the 'pywin32' package "
-                "and a Microsoft Word installation."
-            ) from exc
-
-        com_initialized = False
-        try:
+        with _word_com_apartment():
             try:
-                pythoncom.CoInitialize()
-                com_initialized = True
-            except Exception as exc:  # pragma: no cover - best effort initialisation
-                # RPC_E_CHANGED_MODE occurs when the thread is already initialised
-                # in a different COM apartment. In that case we fall back to
-                # explicitly initialising an STA apartment which Word automation
-                # requires.
-                if getattr(exc, "hresult", None) == -2147417850:
-                    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
-                    com_initialized = True
-                else:
-                    raise ValueError(
-                        "Failed to initialise COM before launching Word: {0}".format(exc)
-                    ) from exc
-
-            word = DispatchEx("Word.Application")
-            word.Visible = False
-        except Exception:
-            if com_initialized:
-                pythoncom.CoUninitialize()
-            raise
-        try:
-            try:
-                document = word.Documents.Open(os.path.abspath(source_path))
-            except Exception as exc:
-                raise ValueError(f"Failed to open DOC file '{source_path}' with Word: {exc}")
-
-            try:
-                document.SaveAs(os.path.abspath(output_path), FileFormat=17)
+                word = DispatchEx("Word.Application")
             except Exception as exc:
                 raise ValueError(
-                    f"Failed to export DOC file '{source_path}' to PDF using Word: {exc}"
-                )
+                    f"Failed to launch Microsoft Word for DOC conversion: {exc}"
+                ) from exc
+
+            word.Visible = False
+            try:
+                try:
+                    document = word.Documents.Open(os.path.abspath(source_path))
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to open DOC file '{source_path}' with Word: {exc}"
+                    ) from exc
+
+                try:
+                    document.SaveAs(os.path.abspath(output_path), FileFormat=17)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to export DOC file '{source_path}' to PDF using Word: {exc}"
+                    ) from exc
+                finally:
+                    document.Close(False)
             finally:
-                document.Close(False)
-        finally:
-            word.Quit()
-            if com_initialized:
-                pythoncom.CoUninitialize()
+                word.Quit()
 
         return
 
