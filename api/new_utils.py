@@ -1302,6 +1302,24 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
 
         page, y_cursor = _new_page()
 
+        def _save_document():
+            save_kwargs = {"deflate": True}
+            try:
+                if doc.can_save_incrementally():
+                    save_kwargs["incremental"] = True
+            except AttributeError:
+                # Older PyMuPDF versions may not expose can_save_incrementally.
+                pass
+
+            try:
+                doc.save(pdf_path, **save_kwargs)
+            except RuntimeError as exc:  # pragma: no cover - defensive fallback
+                if "incremental" in str(exc).lower():
+                    save_kwargs.pop("incremental", None)
+                    doc.save(pdf_path, **save_kwargs)
+                else:
+                    raise
+
         if not entries:
             page.insert_text(
                 (margin, y_cursor),
@@ -1309,7 +1327,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 fontsize=body_font_size,
                 fontname="helv",
             )
-            doc.save(pdf_path, incremental=True, deflate=True)
+            _save_document()
             return
 
         for entry in entries:
@@ -1322,7 +1340,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             ]
             page, y_cursor = _draw_row(page, y_cursor, row_values)
 
-        doc.save(pdf_path, incremental=True, deflate=True)
+        _save_document()
     finally:
         doc.close()
 
