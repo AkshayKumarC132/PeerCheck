@@ -1093,7 +1093,7 @@ def build_three_part_communication_summary(
             }
         )
 
-    if normalized_reference:
+    if normalized_reference and not segments:
         for idx, line in enumerate(reference_lines):
             if idx in used_reference_indices:
                 continue
@@ -1188,27 +1188,64 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
         color_element.set(qn('w:val'), color_hex_str)
         rPr.append(color_element)
 
-def _process_element_three_color(element, norm_trans, thresholds, colors):
-    """Finds all paragraphs in an XML element and applies color based on the two-threshold system."""
+def _collect_non_empty_paragraphs(element):
     if element is None:
-        return
-        
+        return []
+
+    paragraphs = []
     for p_element in element.xpath('.//w:p'):
         full_text = "".join(p_element.xpath('.//w:t/text()')).strip()
         if not full_text:
             continue
-            
-        norm_para_text = normalize_line(full_text)
-        best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
-        
+        paragraphs.append((p_element, full_text, normalize_line(full_text)))
+    return paragraphs
+
+
+def _detect_highlight_anchor(paragraphs, norm_trans, threshold):
+    if not paragraphs or not norm_trans:
+        return 0
+
+    K = min(len(norm_trans), len(paragraphs), 3)
+    if K == 0:
+        return 0
+
+    best_avg, best_idx = 0.0, 0
+    for i in range(len(paragraphs) - K + 1):
+        avg = sum(
+            SequenceMatcher(None, paragraphs[i + j][2], norm_trans[j]).ratio()
+            for j in range(K)
+        ) / K
+        if avg > best_avg:
+            best_avg = avg
+            best_idx = i
+
+    return best_idx if best_avg >= threshold else 0
+
+
+def _apply_highlighting_to_paragraphs(paragraphs, norm_trans, thresholds, colors, start_index=0):
+    if not paragraphs:
+        return
+
+    for idx, (p_element, _full_text, normalized_text) in enumerate(paragraphs):
+        if idx < start_index:
+            continue
+
+        best_score = max((fuzz.token_set_ratio(normalized_text, t) for t in norm_trans), default=0) / 100.0
+
         color_to_apply = None
         if best_score >= thresholds['high']:
             color_to_apply = colors['GREEN']
         elif best_score >= thresholds['low']:
             color_to_apply = colors['RED']
-        
+
         if color_to_apply:
             _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+
+
+def _process_element_three_color(element, norm_trans, thresholds, colors, start_index=0):
+    paragraphs = _collect_non_empty_paragraphs(element)
+    _apply_highlighting_to_paragraphs(paragraphs, norm_trans, thresholds, colors, start_index)
+
 
 def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
     """Highlights text in a DOCX using the Green/Red/Black system."""
@@ -1217,9 +1254,11 @@ def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshol
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
     # Process main body, headers, and footers for complete coverage
-    _process_element_three_color(document.element.body, norm_trans, thresholds, colors)
+    body_paragraphs = _collect_non_empty_paragraphs(document.element.body)
+    body_start_index = _detect_highlight_anchor(body_paragraphs, norm_trans, thresholds['low'])
+    _apply_highlighting_to_paragraphs(body_paragraphs, norm_trans, thresholds, colors, body_start_index)
     for section in document.sections:
-        for part in [section.header, section.footer, section.first_page_header, 
+        for part in [section.header, section.footer, section.first_page_header,
                      section.first_page_footer, section.even_page_header, section.even_page_footer]:
             _process_element_three_color(part._element, norm_trans, thresholds, colors)
 
