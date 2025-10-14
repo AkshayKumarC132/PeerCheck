@@ -1239,8 +1239,14 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             return textwrap.wrap(text, width=approx_char_width) or [""]
 
         def _draw_row(page, y_pos, values: List[str]):
-            width = page.rect.width
-            height = page.rect.height
+            """Render a single summary row, creating a new page if required."""
+
+            if page is None:
+                page, y_pos = _new_page()
+
+            current_page = page
+            width = current_page.rect.width
+            height = current_page.rect.height
             available_height = height - margin
             content_width = width - 2 * margin
 
@@ -1255,9 +1261,9 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
 
             if y_pos + row_height > available_height:
-                page, y_pos = _new_page()
-                width = page.rect.width
-                height = page.rect.height
+                current_page, y_pos = _new_page()
+                width = current_page.rect.width
+                height = current_page.rect.height
                 available_height = height - margin
                 content_width = width - 2 * margin
                 columns.clear()
@@ -1272,7 +1278,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             x = margin
             for idx, (col_width, lines) in enumerate(columns):
                 rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
-                page.draw_rect(rect, color=(0.7, 0.7, 0.7))
+                current_page.draw_rect(rect, color=(0.7, 0.7, 0.7))
 
                 text_y = y_pos + row_padding + body_font_size
                 color = (0, 0, 0)
@@ -1281,7 +1287,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     color = status_colors.get(status_key, color)
 
                 for line in lines:
-                    page.insert_text(
+                    current_page.insert_text(
                         (x + row_padding, text_y),
                         line,
                         fontsize=body_font_size,
@@ -1292,7 +1298,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
 
                 x += col_width
 
-            return y_pos + row_height
+            return current_page, y_pos + row_height
 
         page, y_cursor = _new_page()
 
@@ -1314,7 +1320,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 entry.get("content") or "",
                 (entry.get("status") or "").capitalize() or "-",
             ]
-            y_cursor = _draw_row(page, y_cursor, row_values)
+            page, y_cursor = _draw_row(page, y_cursor, row_values)
 
         doc.save(pdf_path, incremental=True, deflate=True)
     finally:
