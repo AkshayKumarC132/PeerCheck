@@ -1201,7 +1201,18 @@ def _collect_non_empty_paragraphs(element):
     return paragraphs
 
 
-def _detect_highlight_anchor(paragraphs, norm_trans, threshold):
+def _paragraph_index_for_offset(paragraphs, offset):
+    """Map a character offset within the concatenated paragraph text to its index."""
+    running = 0
+    for idx, (_element, _text, normalized) in enumerate(paragraphs):
+        end = running + len(normalized)
+        if offset <= end:
+            return idx
+        running = end + 1  # account for the joining newline
+    return max(len(paragraphs) - 1, 0)
+
+
+def _detect_highlight_anchor_sliding(paragraphs, norm_trans, threshold):
     if not paragraphs or not norm_trans:
         return 0
 
@@ -1220,6 +1231,43 @@ def _detect_highlight_anchor(paragraphs, norm_trans, threshold):
             best_idx = i
 
     return best_idx if best_avg >= threshold else 0
+
+
+def _detect_highlight_anchor(paragraphs, norm_trans, threshold):
+    if not paragraphs or not norm_trans:
+        return 0
+
+    doc_blob = "\n".join(p[2] for p in paragraphs if p[2])
+    transcript_blob = "\n".join(t for t in norm_trans if t)
+
+    if doc_blob and transcript_blob:
+        matcher = SequenceMatcher(None, doc_blob, transcript_blob, autojunk=False)
+        best_block = None
+        best_quality = 0.0
+        for block in matcher.get_matching_blocks():
+            if not block.size:
+                continue
+
+            transcript_ratio = block.size / max(len(transcript_blob), 1)
+            doc_ratio = block.size / max(len(doc_blob), 1)
+            quality = max(transcript_ratio, doc_ratio)
+
+            if block.size < 30 and transcript_ratio < threshold and doc_ratio < threshold:
+                # Skip tiny overlaps unless they represent a sufficiently strong match.
+                continue
+
+            # Prefer longer, higher-quality matches to anchor the highlights.
+            if quality > best_quality or (
+                quality == best_quality and best_block and block.size > best_block.size
+            ):
+                best_quality = quality
+                best_block = block
+
+        if best_block and (best_quality >= threshold or best_block.size >= 80):
+            return _paragraph_index_for_offset(paragraphs, best_block.a)
+
+    # Fall back to the sliding window heuristic when we cannot locate a strong block
+    return _detect_highlight_anchor_sliding(paragraphs, norm_trans, threshold)
 
 
 def _apply_highlighting_to_paragraphs(paragraphs, norm_trans, thresholds, colors, start_index=0):
