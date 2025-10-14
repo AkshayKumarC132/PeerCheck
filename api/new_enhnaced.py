@@ -39,7 +39,6 @@ from .new_utils import (
     get_s3_key_from_url,
     s3_client,
     create_highlighted_pdf_document,
-    create_highlighted_docx_from_s3,
     build_three_part_communication_summary,
 )
 from .authentication import token_verification
@@ -636,16 +635,22 @@ class DownloadProcessedDocumentView(GenericAPIView):
                 audio_file.reference_document = reference_doc
                 audio_file.save(update_fields=['reference_document'])
 
-            # Check if processed DOCX already exists in S3
-            if session.processed_docx_path:
-                print(f"Using existing processed document: {session.processed_docx_path}")
-                processed_s3_url = session.processed_docx_path
+            # Check if processed document already exists in S3
+            previous_processed_url = session.processed_docx_path
+            processed_s3_url = (
+                previous_processed_url
+                if previous_processed_url and previous_processed_url.lower().endswith('.pdf')
+                else None
+            )
+
+            if processed_s3_url:
+                print(f"Using existing processed document: {processed_s3_url}")
             else:
                 print("Creating new processed document...")
                 try:
-                    # Create highlighted DOCX and upload to S3
+                    # Create highlighted PDF and upload to S3
                     transcript = audio_file.transcription.get('text', '') if audio_file.transcription else ''
-                    
+
                     if not transcript:
                         return Response({
                             'error': 'No transcript available for processing',
@@ -663,26 +668,32 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         "validate_abbreviations=%s in DownloadProcessedDocumentView",
                         use_transcript,
                     )
-                    if file_ext == 'pdf':
-                        processed_s3_url = create_highlighted_pdf_document(
-                            reference_doc.file_path,
-                            transcript,
-                            require_transcript_match=use_transcript,
-                        )
-                    elif file_ext == 'docx':
-                        processed_s3_url = create_highlighted_docx_from_s3(
-                            reference_doc.file_path,
-                            transcript
-                        )
-                    else:
+                    if file_ext not in ('pdf', 'docx'):
                         return Response({
                             'error': f'Unsupported file type for highlighting: {file_ext}',
                             'timestamp': timezone.now().isoformat()
                         }, status=status.HTTP_400_BAD_REQUEST)
+
+                    processed_s3_url = create_highlighted_pdf_document(
+                        reference_doc.file_path,
+                        transcript,
+                        require_transcript_match=use_transcript,
+                    )
                     print(f"Created processed document: {processed_s3_url}")
                     # Save S3 URL to session
                     session.processed_docx_path = processed_s3_url
                     session.save()
+
+                    if previous_processed_url and previous_processed_url != processed_s3_url:
+                        try:
+                            if previous_processed_url.startswith('s3://') or ('amazonaws.com/' in previous_processed_url):
+                                s3_key = get_s3_key_from_url(previous_processed_url)
+                                s3_client.delete_object(
+                                    Bucket=settings.AWS_STORAGE_BUCKET_NAME,
+                                    Key=s3_key,
+                                )
+                        except Exception:
+                            logger.info("Unable to delete previous processed document %s", previous_processed_url)
                     
                 except Exception as doc_error:
                     print(f"Error creating highlighted document: {str(doc_error)}")
@@ -701,7 +712,7 @@ class DownloadProcessedDocumentView(GenericAPIView):
                 'processed_docx_url': processed_s3_url,
                 'message': 'Processed document is available at the above URL.',
                 'session_id': str(session.id),
-                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed.docx"
+                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed.pdf"
             }, status=status.HTTP_200_OK)
         except ProcessingSession.DoesNotExist:
             print(f"Session not found or expired: {session_id}")
@@ -856,11 +867,21 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
 
             try:
                 previous_url = session.processed_docx_with_diarization_path
-                processed_s3_url = create_highlighted_docx_from_s3(
-                    reference_doc.file_path,
-                    transcript,
-                    three_pc_entries=three_pc_entries,
+                reusable_url = (
+                    previous_url
+                    if previous_url and previous_url.lower().endswith('.pdf')
+                    else None
                 )
+
+                if reusable_url:
+                    print(f"Using existing diarization document: {reusable_url}")
+                    processed_s3_url = reusable_url
+                else:
+                    processed_s3_url = create_highlighted_pdf_document(
+                        reference_doc.file_path,
+                        transcript,
+                        three_pc_entries=three_pc_entries,
+                    )
 
                 if previous_url and previous_url != processed_s3_url:
                     try:
@@ -888,7 +909,7 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                 'processed_docx_url': processed_s3_url,
                 'message': 'Processed document with speaker details is available at the above URL.',
                 'session_id': str(session.id),
-                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed_diarization.docx",
+                'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed_diarization.pdf",
                 'three_pc_entries': three_pc_entries,
             }
 

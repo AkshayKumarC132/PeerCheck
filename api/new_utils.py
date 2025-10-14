@@ -5,6 +5,7 @@ import tempfile
 import csv
 import logging
 import threading
+import textwrap
 from typing import Any, Dict, List, Optional, Set
 
 import boto3
@@ -580,16 +581,22 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
 
     return output_path
 
-def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_match=True):
+def create_highlighted_pdf_document(
+    text_s3_url,
+    transcript,
+    require_transcript_match=True,
+    three_pc_entries: Optional[List[Dict]] = None,
+):
     """
-    Orchestrates the generation of a highlighted PDF using the new logic.
+    Orchestrates the generation of a highlighted PDF using the new logic and optionally
+    appends Three-Part Communication (3PC) summary pages.
     """
     output_filename = f"processed/{uuid.uuid4()}_highlighted_report.pdf"
-    
+
     # Download the reference document
     s3_key = get_s3_key_from_url(text_s3_url)
     temp_input_path = download_file_from_s3(s3_key)
-    
+
     temp_output_path = ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
@@ -601,6 +608,9 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
             temp_output_path,
             require_transcript_match=require_transcript_match,
         )
+
+        if three_pc_entries is not None:
+            append_three_pc_summary_to_pdf(temp_output_path, three_pc_entries)
 
         with open(temp_output_path, 'rb') as f_out:
             output_s3_url = upload_file_to_s3(f_out, output_filename)
@@ -1172,6 +1182,143 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
                     run.font.color.rgb = status_colors[status]
 
     document.save(docx_path)
+
+
+def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]]) -> None:
+    doc = fitz.open(pdf_path)
+
+    try:
+        margin = 36
+        title_font_size = 16
+        body_font_size = 10
+        row_padding = 4
+        content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
+        headers = ["Speaker", "Start", "End", "Content", "Status"]
+        status_colors = {
+            "correct": (0, 0.5, 0),
+            "mismatch": (0.75, 0, 0),
+            "unspoken": (0.3, 0.3, 0.3),
+        }
+
+        def _new_page(include_header: bool = True):
+            page = doc.new_page()
+            width = page.rect.width
+            height = page.rect.height
+            y_pos = margin
+            if include_header:
+                page.insert_text(
+                    (margin, y_pos),
+                    "Three-Part Communication (3PC) Summary",
+                    fontsize=title_font_size,
+                    fontname="helv",
+                )
+                y_pos += title_font_size + 8
+
+                content_width = width - 2 * margin
+                x = margin
+                for header, ratio in zip(headers, content_width_ratio):
+                    col_width = content_width * ratio
+                    rect = fitz.Rect(x, y_pos, x + col_width, y_pos + body_font_size + 8)
+                    page.draw_rect(rect, color=(0, 0, 0))
+                    page.insert_textbox(
+                        rect,
+                        header,
+                        fontsize=body_font_size,
+                        fontname="helv",
+                        align=fitz.TEXT_ALIGN_CENTER,
+                    )
+                    x += col_width
+                y_pos += body_font_size + 8
+
+            return page, y_pos
+
+        def _wrap_cell(text: str, max_width: float) -> List[str]:
+            if not text:
+                return [""]
+            approx_char_width = max(int(max_width / (body_font_size * 0.6)), 1)
+            return textwrap.wrap(text, width=approx_char_width) or [""]
+
+        def _draw_row(page, y_pos, values: List[str]):
+            width = page.rect.width
+            height = page.rect.height
+            available_height = height - margin
+            content_width = width - 2 * margin
+
+            columns = []
+            max_lines = 1
+            for value, ratio in zip(values, content_width_ratio):
+                col_width = content_width * ratio
+                lines = _wrap_cell(value, col_width - (2 * row_padding))
+                columns.append((col_width, lines))
+                max_lines = max(max_lines, len(lines))
+
+            row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+
+            if y_pos + row_height > available_height:
+                page, y_pos = _new_page()
+                width = page.rect.width
+                height = page.rect.height
+                available_height = height - margin
+                content_width = width - 2 * margin
+                columns.clear()
+                max_lines = 1
+                for value, ratio in zip(values, content_width_ratio):
+                    col_width = content_width * ratio
+                    lines = _wrap_cell(value, col_width - (2 * row_padding))
+                    columns.append((col_width, lines))
+                    max_lines = max(max_lines, len(lines))
+                row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+
+            x = margin
+            for idx, (col_width, lines) in enumerate(columns):
+                rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
+                page.draw_rect(rect, color=(0.7, 0.7, 0.7))
+
+                text_y = y_pos + row_padding + body_font_size
+                color = (0, 0, 0)
+                if headers[idx] == "Status":
+                    status_key = values[idx].strip().lower()
+                    color = status_colors.get(status_key, color)
+
+                for line in lines:
+                    page.insert_text(
+                        (x + row_padding, text_y),
+                        line,
+                        fontsize=body_font_size,
+                        fontname="helv",
+                        fill=color,
+                    )
+                    text_y += body_font_size + 2
+
+                x += col_width
+
+            return y_pos + row_height
+
+        page, y_cursor = _new_page()
+
+        if not entries:
+            page.insert_text(
+                (margin, y_cursor),
+                "No speaker diarization data was available to summarise.",
+                fontsize=body_font_size,
+                fontname="helv",
+            )
+            doc.save(pdf_path, incremental=True, deflate=True)
+            return
+
+        for entry in entries:
+            row_values = [
+                entry.get("speaker") or "Unknown",
+                _format_timestamp(entry.get("start")),
+                _format_timestamp(entry.get("end")),
+                entry.get("content") or "",
+                (entry.get("status") or "").capitalize() or "-",
+            ]
+            y_cursor = _draw_row(page, y_cursor, row_values)
+
+        doc.save(pdf_path, incremental=True, deflate=True)
+    finally:
+        doc.close()
 
 
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---
