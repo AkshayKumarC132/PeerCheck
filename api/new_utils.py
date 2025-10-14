@@ -1303,22 +1303,10 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         page, y_cursor = _new_page()
 
         def _save_document():
-            save_kwargs = {"deflate": True}
-            try:
-                if doc.can_save_incrementally():
-                    save_kwargs["incremental"] = True
-            except AttributeError:
-                # Older PyMuPDF versions may not expose can_save_incrementally.
-                pass
-
-            try:
-                doc.save(pdf_path, **save_kwargs)
-            except RuntimeError as exc:  # pragma: no cover - defensive fallback
-                if "incremental" in str(exc).lower():
-                    save_kwargs.pop("incremental", None)
-                    doc.save(pdf_path, **save_kwargs)
-                else:
-                    raise
+            # Incremental saves have repeatedly triggered encryption-related
+            # failures in the field, so prefer a full rewrite which is more
+            # broadly compatible across inputs.
+            doc.save(pdf_path, deflate=True)
 
         if not entries:
             page.insert_text(
