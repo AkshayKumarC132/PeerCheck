@@ -108,12 +108,17 @@ def download_file_from_s3(s3_key):
             Bucket=settings.AWS_STORAGE_BUCKET_NAME,
             Key=s3_key
         )
-        
-        # Create temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
+
+        _, ext = os.path.splitext(s3_key)
+        suffix = ext if ext else None
+
+        # Create temporary file while preserving the original extension so
+        # downstream consumers can perform extension-based handling (for
+        # example, DOCX conversion before PDF highlighting).
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_file.write(response['Body'].read())
         temp_file.close()
-        
+
         return temp_file.name
     except Exception as e:
         raise Exception(f"Failed to download from S3: {str(e)}")
