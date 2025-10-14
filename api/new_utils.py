@@ -6,6 +6,7 @@ import csv
 import logging
 import threading
 import textwrap
+import importlib.util
 from typing import Any, Dict, List, Optional, Set
 
 import boto3
@@ -433,6 +434,50 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     )
                     break
 
+def _convert_office_document_to_pdf(source_path: str, output_path: str) -> None:
+    """Convert DOCX or DOC files to PDF using the best available backend."""
+
+    extension = os.path.splitext(source_path)[1].lower()
+    if extension == ".docx":
+        convert(source_path, output_path)
+        return
+
+    if extension == ".doc":
+        spec = importlib.util.find_spec("win32com.client")
+        if spec is None:
+            raise ValueError(
+                "Converting legacy .doc files to PDF requires the 'pywin32' package "
+                "and a Microsoft Word installation."
+            )
+
+        from win32com.client import DispatchEx  # type: ignore
+
+        word = DispatchEx("Word.Application")
+        word.Visible = False
+        try:
+            try:
+                document = word.Documents.Open(os.path.abspath(source_path))
+            except Exception as exc:
+                raise ValueError(f"Failed to open DOC file '{source_path}' with Word: {exc}")
+
+            try:
+                document.SaveAs(os.path.abspath(output_path), FileFormat=17)
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to export DOC file '{source_path}' to PDF using Word: {exc}"
+                )
+            finally:
+                document.Close(False)
+        finally:
+            word.Quit()
+
+        return
+
+    raise ValueError(
+        f"Unsupported Office document extension '{extension}' for PDF conversion."
+    )
+
+
 def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcript_match=True):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
@@ -445,7 +490,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     if source_was_office_doc:
         temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
         try:
-            convert(doc_path, temp_pdf_path)
+            _convert_office_document_to_pdf(doc_path, temp_pdf_path)
         except Exception as exc:
             if os.path.exists(temp_pdf_path):
                 os.unlink(temp_pdf_path)
