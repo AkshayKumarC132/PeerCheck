@@ -1186,6 +1186,9 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
 
 def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]]) -> None:
     doc = fitz.open(pdf_path)
+    fd, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    saved = False
 
     try:
         margin = 36
@@ -1302,12 +1305,6 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
 
         page, y_cursor = _new_page()
 
-        def _save_document():
-            # Incremental saves have repeatedly triggered encryption-related
-            # failures in the field, so prefer a full rewrite which is more
-            # broadly compatible across inputs.
-            doc.save(pdf_path, deflate=True)
-
         if not entries:
             page.insert_text(
                 (margin, y_cursor),
@@ -1315,22 +1312,33 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 fontsize=body_font_size,
                 fontname="helv",
             )
-            _save_document()
-            return
+        else:
+            for entry in entries:
+                row_values = [
+                    entry.get("speaker") or "Unknown",
+                    _format_timestamp(entry.get("start")),
+                    _format_timestamp(entry.get("end")),
+                    entry.get("content") or "",
+                    (entry.get("status") or "").capitalize() or "-",
+                ]
+                page, y_cursor = _draw_row(page, y_cursor, row_values)
 
-        for entry in entries:
-            row_values = [
-                entry.get("speaker") or "Unknown",
-                _format_timestamp(entry.get("start")),
-                _format_timestamp(entry.get("end")),
-                entry.get("content") or "",
-                (entry.get("status") or "").capitalize() or "-",
-            ]
-            page, y_cursor = _draw_row(page, y_cursor, row_values)
-
-        _save_document()
+        doc.save(temp_pdf_path, deflate=True)
+        saved = True
     finally:
         doc.close()
+
+        try:
+            if saved:
+                os.replace(temp_pdf_path, pdf_path)
+        finally:
+            if os.path.exists(temp_pdf_path):
+                try:
+                    os.unlink(temp_pdf_path)
+                except OSError:
+                    logging.warning(
+                        "Temp file in use, skipping deletion: %s", temp_pdf_path
+                    )
 
 
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---
