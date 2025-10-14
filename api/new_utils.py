@@ -452,8 +452,38 @@ def _convert_office_document_to_pdf(source_path: str, output_path: str) -> None:
 
         from win32com.client import DispatchEx  # type: ignore
 
-        word = DispatchEx("Word.Application")
-        word.Visible = False
+        try:
+            import pythoncom  # type: ignore
+        except ImportError as exc:  # pragma: no cover - environment specific
+            raise ValueError(
+                "Converting legacy .doc files to PDF requires the 'pywin32' package "
+                "and a Microsoft Word installation."
+            ) from exc
+
+        com_initialized = False
+        try:
+            try:
+                pythoncom.CoInitialize()
+                com_initialized = True
+            except Exception as exc:  # pragma: no cover - best effort initialisation
+                # RPC_E_CHANGED_MODE occurs when the thread is already initialised
+                # in a different COM apartment. In that case we fall back to
+                # explicitly initialising an STA apartment which Word automation
+                # requires.
+                if getattr(exc, "hresult", None) == -2147417850:
+                    pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+                    com_initialized = True
+                else:
+                    raise ValueError(
+                        "Failed to initialise COM before launching Word: {0}".format(exc)
+                    ) from exc
+
+            word = DispatchEx("Word.Application")
+            word.Visible = False
+        except Exception:
+            if com_initialized:
+                pythoncom.CoUninitialize()
+            raise
         try:
             try:
                 document = word.Documents.Open(os.path.abspath(source_path))
@@ -470,6 +500,8 @@ def _convert_office_document_to_pdf(source_path: str, output_path: str) -> None:
                 document.Close(False)
         finally:
             word.Quit()
+            if com_initialized:
+                pythoncom.CoUninitialize()
 
         return
 
