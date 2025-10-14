@@ -667,7 +667,19 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     finally:
         target_doc.close()
         if source_was_office_doc and os.path.exists(pdf_path):
-            os.unlink(pdf_path)
+            try:
+                os.unlink(pdf_path)
+            except PermissionError:
+                logging.warning(
+                    "Temp file in use after Office conversion, skipping deletion: %s",
+                    pdf_path,
+                )
+            except OSError as exc:
+                logging.warning(
+                    "Failed to delete temporary Office conversion file %s: %s",
+                    pdf_path,
+                    exc,
+                )
 
     return output_path
 
