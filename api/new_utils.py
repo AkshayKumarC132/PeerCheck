@@ -441,9 +441,17 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     """
     import logging
     pdf_path = doc_path
-    if doc_path.lower().endswith('.docx'):
+    source_was_office_doc = doc_path.lower().endswith(('.docx', '.doc'))
+    if source_was_office_doc:
         temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
-        convert(doc_path, temp_pdf_path)
+        try:
+            convert(doc_path, temp_pdf_path)
+        except Exception as exc:
+            if os.path.exists(temp_pdf_path):
+                os.unlink(temp_pdf_path)
+            raise ValueError(
+                f"Failed to convert Office document '{doc_path}' to PDF: {exc}"
+            )
         pdf_path = temp_pdf_path
 
     # --- Robust PDF Validation ---
@@ -581,7 +589,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
         target_doc.save(output_path, garbage=4, deflate=True)
     finally:
         target_doc.close()
-        if doc_path.lower().endswith('.docx') and os.path.exists(pdf_path):
+        if source_was_office_doc and os.path.exists(pdf_path):
             os.unlink(pdf_path)
 
     return output_path
