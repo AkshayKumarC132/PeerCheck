@@ -8,7 +8,7 @@ import threading
 import textwrap
 import importlib.util
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import boto3
 import numpy as np
@@ -216,14 +216,17 @@ def _create_step_block(step_id: str, lines: List[str], order: int) -> Dict[str, 
         heading_match = _STEP_HEADING_PATTERN.match(display_lines[0])
 
     cleaned_lines: List[str] = []
+    normalized_lines: List[str] = []
     for idx, line in enumerate(display_lines):
         is_heading = idx == 0 and heading_match is not None
         cleaned = line.strip()
         if cleaned and not is_heading:
             cleaned = _strip_list_prefix(cleaned)
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
-        if cleaned:
-            cleaned_lines.append(cleaned)
+        if not cleaned:
+            continue
+        cleaned_lines.append(cleaned)
+        normalized_lines.append(normalize_line(cleaned))
 
     semantic_text = " ".join(cleaned_lines).strip()
     if not semantic_text:
@@ -236,9 +239,13 @@ def _create_step_block(step_id: str, lines: List[str], order: int) -> Dict[str, 
         "id": step_id,
         "order": order,
         "display": "\n".join(display_lines),
+        "display_lines": display_lines,
+        "clean_lines": cleaned_lines,
+        "normalized_lines": normalized_lines,
         "semantic": semantic_text,
         "normalized": normalized,
         "tokens": tokens,
+        "is_context": heading_match is None,
     }
 
 
@@ -307,6 +314,45 @@ def _step_penalty(last_index: Optional[int], candidate_index: int) -> float:
     if distance == 3:
         return 0.6
     return 0.5
+
+
+def _select_step_context(step: Dict[str, Any], normalized_spoken: str) -> str:
+    display_lines: List[str] = step.get("display_lines") or []
+    if not display_lines:
+        return step.get("display") or ""
+
+    if len(display_lines) == 1:
+        return display_lines[0]
+
+    heading_line = display_lines[0]
+    body_display = display_lines[1:]
+    body_clean = (step.get("clean_lines") or [])[1:]
+
+    best_score = 0.0
+    best_range: Optional[Tuple[int, int]] = None
+    max_window = 4
+
+    for start in range(len(body_display)):
+        max_end = min(len(body_display), start + max_window)
+        for end in range(start + 1, max_end + 1):
+            segment_clean = " ".join(body_clean[start:end]).strip()
+            if not segment_clean:
+                continue
+            if not normalized_spoken:
+                score = 0.0
+            else:
+                score = fuzz.token_set_ratio(normalized_spoken, segment_clean) / 100.0
+            if score > best_score:
+                best_score = score
+                best_range = (start, end)
+
+    if best_range and best_score >= 0.35:
+        start, end = best_range
+        selected_lines = body_display[start:end]
+        context_lines = [heading_line] + selected_lines
+        return "\n".join(context_lines)
+
+    return "\n".join(display_lines)
 
 def find_missing(text, transcript, threshold=0.6):
     """
@@ -1303,6 +1349,7 @@ def build_three_part_communication_summary(
 ) -> List[Dict[str, Any]]:
     segments = diarization_segments or []
     reference_steps = _extract_procedural_steps(reference_text)
+    has_numbered_steps = any(not step.get("is_context") for step in reference_steps)
     summary_entries: List[Dict[str, Any]] = []
     last_matched_index: Optional[int] = None
 
@@ -1331,6 +1378,7 @@ def build_three_part_communication_summary(
         best_index: Optional[int] = None
         best_score = 0.0
         matched_reference: Optional[str] = None
+        selected_context: Optional[str] = None
 
         if step_embeddings is not None and similarity_model is not None and spoken_text:
             spoken_embedding = similarity_model.encode([spoken_text], convert_to_tensor=True)
@@ -1341,6 +1389,8 @@ def build_three_part_communication_summary(
             for idx, base_score in enumerate(score_values):
                 base_value = float(base_score)
                 penalty = _step_penalty(last_matched_index, idx)
+                if has_numbered_steps and reference_steps[idx].get("is_context"):
+                    penalty *= 0.65
                 weighted = base_value * penalty
                 if weighted > best_weighted:
                     best_weighted = weighted
@@ -1349,9 +1399,27 @@ def build_three_part_communication_summary(
 
             if best_index is not None:
                 matched_reference = reference_steps[best_index]["display"]
+                selected_context = _select_step_context(
+                    reference_steps[best_index], normalized_spoken
+                )
 
         status = "mismatch"
         raw_similarity = float(best_score) if best_index is not None else 0.0
+
+        if best_index is not None and normalized_spoken:
+            reference_norm = reference_steps[best_index].get("normalized") or ""
+            context_norm = normalize_line(selected_context) if selected_context else ""
+            token_score = (
+                fuzz.token_set_ratio(normalized_spoken, reference_norm) / 100.0
+                if reference_norm
+                else 0.0
+            )
+            context_score = (
+                fuzz.token_set_ratio(normalized_spoken, context_norm) / 100.0
+                if context_norm
+                else 0.0
+            )
+            raw_similarity = max(raw_similarity, token_score, context_score)
 
         if not spoken_text:
             status = "unspoken"
@@ -1378,6 +1446,8 @@ def build_three_part_communication_summary(
                 if raw_similarity >= partial_threshold:
                     last_matched_index = best_index
 
+        original_context = selected_context or matched_reference or ""
+
         summary_entries.append(
             {
                 "speaker": segment.get("speaker_name")
@@ -1389,7 +1459,7 @@ def build_three_part_communication_summary(
                 "content": spoken_text or matched_reference or "",
                 "status": status,
                 "reference": matched_reference,
-                "original_context": matched_reference,
+                "original_context": original_context,
                 "similarity": round(max(raw_similarity, 0.0), 2),
             }
         )
