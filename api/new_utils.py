@@ -43,6 +43,7 @@ model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
 
 _DIARIZATION_PIPELINE: Optional[Pipeline] = None
 _EMBEDDING_INFERENCE: Optional[Inference] = None
+_SENTENCE_SIMILARITY_MODEL: Optional[SentenceTransformer] = None
 _MODEL_LOCK = threading.Lock()
 
 
@@ -186,6 +187,126 @@ def normalize_line(s: str) -> str:
     s = re.sub(r"[\[\]\(\)\{\}\<\>]", "", s)
     s = s.translate(str.maketrans('', '', string.punctuation))
     return ' '.join(s.split())
+
+
+def _get_sentence_similarity_model() -> SentenceTransformer:
+    global _SENTENCE_SIMILARITY_MODEL
+    if _SENTENCE_SIMILARITY_MODEL is None:
+        with _MODEL_LOCK:
+            if _SENTENCE_SIMILARITY_MODEL is None:
+                _SENTENCE_SIMILARITY_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    return _SENTENCE_SIMILARITY_MODEL
+
+
+_STEP_HEADING_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)+[A-Za-z]?)")
+_BULLET_PREFIX_PATTERN = re.compile(r"^(?:[\-\*\u2022•●◦▪■‣⋅]+|--+|\u2013|\u2014)\s*")
+_SUBPOINT_PREFIX_PATTERN = re.compile(r"^(?:\(?[a-zA-Z0-9]+\)|\d+\.)\s*")
+
+
+def _strip_list_prefix(text: str) -> str:
+    text = _BULLET_PREFIX_PATTERN.sub("", text)
+    text = _SUBPOINT_PREFIX_PATTERN.sub("", text)
+    return text.strip()
+
+
+def _create_step_block(step_id: str, lines: List[str], order: int) -> Dict[str, Any]:
+    display_lines = [ln.strip() for ln in lines if ln and ln.strip()]
+    heading_match = None
+    if display_lines:
+        heading_match = _STEP_HEADING_PATTERN.match(display_lines[0])
+
+    cleaned_lines: List[str] = []
+    for idx, line in enumerate(display_lines):
+        is_heading = idx == 0 and heading_match is not None
+        cleaned = line.strip()
+        if cleaned and not is_heading:
+            cleaned = _strip_list_prefix(cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        if cleaned:
+            cleaned_lines.append(cleaned)
+
+    semantic_text = " ".join(cleaned_lines).strip()
+    if not semantic_text:
+        semantic_text = " ".join(display_lines).strip()
+
+    normalized = normalize_line(semantic_text) if semantic_text else ""
+    tokens = set(normalized.split()) if normalized else set()
+
+    return {
+        "id": step_id,
+        "order": order,
+        "display": "\n".join(display_lines),
+        "semantic": semantic_text,
+        "normalized": normalized,
+        "tokens": tokens,
+    }
+
+
+def _extract_procedural_steps(reference_text: Optional[str]) -> List[Dict[str, Any]]:
+    if not reference_text:
+        return []
+
+    steps: List[Dict[str, Any]] = []
+    current_lines: List[str] = []
+    current_id: Optional[str] = None
+    context_counter = 0
+
+    def _commit() -> None:
+        nonlocal current_lines, current_id, context_counter
+        if not current_lines:
+            return
+        step_id = current_id
+        if not step_id:
+            context_counter += 1
+            step_id = f"context_{context_counter}"
+        block = _create_step_block(step_id, current_lines, len(steps))
+        steps.append(block)
+        current_lines = []
+        current_id = None
+
+    for raw_line in reference_text.splitlines():
+        stripped_line = raw_line.strip()
+        if not stripped_line:
+            continue
+
+        heading_match = _STEP_HEADING_PATTERN.match(stripped_line)
+        if heading_match:
+            _commit()
+            current_id = heading_match.group(1)
+            current_lines = [stripped_line]
+        else:
+            if not current_lines:
+                current_lines = [stripped_line]
+                current_id = None
+            else:
+                current_lines.append(stripped_line)
+
+    _commit()
+
+    if not steps:
+        cleaned_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
+        if cleaned_lines:
+            steps.append(_create_step_block("document", cleaned_lines, 0))
+
+    for idx, step in enumerate(steps):
+        step["order"] = idx
+
+    return steps
+
+
+def _step_penalty(last_index: Optional[int], candidate_index: int) -> float:
+    if last_index is None:
+        return 1.0
+    distance = abs(candidate_index - last_index)
+    if distance == 0:
+        return 1.0
+    if distance == 1:
+        return 0.9
+    if distance == 2:
+        return 0.75
+    if distance == 3:
+        return 0.6
+    return 0.5
 
 def find_missing(text, transcript, threshold=0.6):
     """
@@ -1181,102 +1302,81 @@ def build_three_part_communication_summary(
     max_entries: int = 1000,
 ) -> List[Dict[str, Any]]:
     segments = diarization_segments or []
-    reference_lines: List[str] = []
-    normalized_reference: List[str] = []
-    reference_snippets: List[Dict[str, Any]] = []
-
-    if reference_text:
-        reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
-        normalized_reference = [normalize_line(ln) for ln in reference_lines]
-        max_window = 3
-
-        def _tokenize(text: str) -> Set[str]:
-            return {token for token in text.split() if token}
-
-        for start_idx in range(len(reference_lines)):
-            for window_size in range(1, max_window + 1):
-                end_idx = min(len(reference_lines), start_idx + window_size)
-                snippet_lines = reference_lines[start_idx:end_idx]
-                snippet_display = "\n".join(snippet_lines)
-                normalized_snippet = normalize_line(" ".join(snippet_lines))
-                if not normalized_snippet:
-                    continue
-                reference_snippets.append(
-                    {
-                        "indices": tuple(range(start_idx, end_idx)),
-                        "text": snippet_display,
-                        "normalized": normalized_snippet,
-                        "tokens": _tokenize(normalized_snippet),
-                    }
-                )
-
-    used_reference_indices: Set[int] = set()
+    reference_steps = _extract_procedural_steps(reference_text)
     summary_entries: List[Dict[str, Any]] = []
-    next_reference_index = 0
+    last_matched_index: Optional[int] = None
+
+    partial_threshold = max(match_threshold, 0.6)
+    partial_threshold = min(partial_threshold, 0.8)
+    match_threshold_high = 0.8
+
+    similarity_model: Optional[SentenceTransformer] = None
+    step_embeddings = None
+    if reference_steps:
+        similarity_model = _get_sentence_similarity_model()
+        step_texts = [
+            step.get("semantic")
+            or step.get("normalized")
+            or step.get("display")
+            or ""
+            for step in reference_steps
+        ]
+        step_embeddings = similarity_model.encode(step_texts, convert_to_tensor=True)
 
     for segment in segments:
         spoken_text = (segment.get("text") or "").strip()
         normalized_spoken = normalize_line(spoken_text) if spoken_text else ""
         spoken_tokens: Set[str] = set(normalized_spoken.split()) if normalized_spoken else set()
-        best_snippet: Optional[Dict[str, Any]] = None
+
+        best_index: Optional[int] = None
         best_score = 0.0
-        best_overlap = 0.0
+        matched_reference: Optional[str] = None
 
-        if reference_snippets and normalized_spoken:
-            for snippet in reference_snippets:
-                start_idx = snippet["indices"][0]
+        if step_embeddings is not None and similarity_model is not None and spoken_text:
+            spoken_embedding = similarity_model.encode([spoken_text], convert_to_tensor=True)
+            cosine_scores = util.cos_sim(spoken_embedding, step_embeddings)[0]
+            score_values = cosine_scores.detach().cpu().numpy()
 
-                if start_idx < next_reference_index:
-                    distance = next_reference_index - start_idx
-                    if distance > 3:
-                        continue
-                    penalty = 1 / (1 + distance)
-                else:
-                    penalty = 1.0
+            best_weighted = float("-inf")
+            for idx, base_score in enumerate(score_values):
+                base_value = float(base_score)
+                penalty = _step_penalty(last_matched_index, idx)
+                weighted = base_value * penalty
+                if weighted > best_weighted:
+                    best_weighted = weighted
+                    best_index = idx
+                    best_score = base_value
 
-                snippet_norm = snippet["normalized"]
-                token_score = fuzz.token_set_ratio(normalized_spoken, snippet_norm) / 100.0
-                partial_score = fuzz.partial_ratio(normalized_spoken, snippet_norm) / 100.0
-                seq_score = SequenceMatcher(None, normalized_spoken, snippet_norm).ratio()
-                overlap = 0.0
-                if spoken_tokens:
-                    overlap = len(spoken_tokens & snippet["tokens"]) / max(len(spoken_tokens), 1)
+            if best_index is not None:
+                matched_reference = reference_steps[best_index]["display"]
 
-                score = max(token_score, partial_score, seq_score, overlap) * penalty
-
-                if score > best_score or (
-                    score == best_score and overlap > best_overlap
-                ):
-                    best_score = score
-                    best_overlap = overlap
-                    best_snippet = snippet
-
-        matched_reference = best_snippet["text"] if best_snippet is not None else None
         status = "mismatch"
+        raw_similarity = float(best_score) if best_index is not None else 0.0
 
         if not spoken_text:
             status = "unspoken"
-        elif not normalized_reference:
+        elif not reference_steps:
             status = "correct"
-        elif best_snippet is None or best_score < match_threshold:
+        elif best_index is None:
             status = "mismatch"
         else:
-            ref_tokens = best_snippet["tokens"] or set()
-            missing_tokens = ref_tokens - spoken_tokens
-            extra_tokens = spoken_tokens - ref_tokens
-
-            if not missing_tokens and not extra_tokens:
+            if raw_similarity >= match_threshold_high:
                 status = "match"
-            elif not missing_tokens and extra_tokens:
-                status = "extra_words"
-            else:
+            elif raw_similarity >= partial_threshold:
                 status = "partial_match"
+            else:
+                status = "mismatch"
 
-            for idx in best_snippet["indices"]:
-                used_reference_indices.add(idx)
+            if status != "mismatch":
+                ref_tokens = reference_steps[best_index]["tokens"] or set()
+                missing_tokens = ref_tokens - spoken_tokens if ref_tokens else set()
+                extra_tokens = spoken_tokens - ref_tokens if ref_tokens else set()
 
-        if best_snippet is not None and best_score >= 0.3:
-            next_reference_index = max(next_reference_index, best_snippet["indices"][-1] + 1)
+                if raw_similarity >= partial_threshold and extra_tokens and not missing_tokens:
+                    status = "extra_words"
+
+                if raw_similarity >= partial_threshold:
+                    last_matched_index = best_index
 
         summary_entries.append(
             {
@@ -1290,23 +1390,22 @@ def build_three_part_communication_summary(
                 "status": status,
                 "reference": matched_reference,
                 "original_context": matched_reference,
-                "similarity": round(best_score, 2),
+                "similarity": round(max(raw_similarity, 0.0), 2),
             }
         )
 
-    if normalized_reference and not segments:
-        for idx, line in enumerate(reference_lines):
-            if idx in used_reference_indices:
-                continue
+    if reference_steps and not segments:
+        for step in reference_steps:
+            display_text = step.get("display") or ""
             summary_entries.append(
                 {
                     "speaker": "Not Spoken",
                     "start": None,
                     "end": None,
-                    "content": line,
+                    "content": display_text,
                     "status": "unspoken",
-                    "reference": line,
-                    "original_context": line,
+                    "reference": display_text,
+                    "original_context": display_text,
                     "similarity": 0.0,
                 }
             )
