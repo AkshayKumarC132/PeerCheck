@@ -1183,43 +1183,85 @@ def build_three_part_communication_summary(
     segments = diarization_segments or []
     reference_lines: List[str] = []
     normalized_reference: List[str] = []
+    reference_snippets: List[Dict[str, Any]] = []
 
     if reference_text:
         reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
         normalized_reference = [normalize_line(ln) for ln in reference_lines]
+        max_window = 3
+
+        def _tokenize(text: str) -> Set[str]:
+            return {token for token in text.split() if token}
+
+        for start_idx in range(len(reference_lines)):
+            for window_size in range(1, max_window + 1):
+                end_idx = min(len(reference_lines), start_idx + window_size)
+                snippet_lines = reference_lines[start_idx:end_idx]
+                snippet_display = "\n".join(snippet_lines)
+                normalized_snippet = normalize_line(" ".join(snippet_lines))
+                if not normalized_snippet:
+                    continue
+                reference_snippets.append(
+                    {
+                        "indices": tuple(range(start_idx, end_idx)),
+                        "text": snippet_display,
+                        "normalized": normalized_snippet,
+                        "tokens": _tokenize(normalized_snippet),
+                    }
+                )
 
     used_reference_indices: Set[int] = set()
     summary_entries: List[Dict[str, Any]] = []
+    next_reference_index = 0
 
     for segment in segments:
         spoken_text = (segment.get("text") or "").strip()
         normalized_spoken = normalize_line(spoken_text) if spoken_text else ""
-        best_idx: Optional[int] = None
+        spoken_tokens: Set[str] = set(normalized_spoken.split()) if normalized_spoken else set()
+        best_snippet: Optional[Dict[str, Any]] = None
         best_score = 0.0
+        best_overlap = 0.0
 
-        if normalized_reference:
-            for idx, ref_norm in enumerate(normalized_reference):
-                if not ref_norm:
-                    continue
-                score = 0.0
-                if normalized_spoken:
-                    score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
-                if score > best_score:
+        if reference_snippets and normalized_spoken:
+            for snippet in reference_snippets:
+                start_idx = snippet["indices"][0]
+
+                if start_idx < next_reference_index:
+                    distance = next_reference_index - start_idx
+                    if distance > 3:
+                        continue
+                    penalty = 1 / (1 + distance)
+                else:
+                    penalty = 1.0
+
+                snippet_norm = snippet["normalized"]
+                token_score = fuzz.token_set_ratio(normalized_spoken, snippet_norm) / 100.0
+                partial_score = fuzz.partial_ratio(normalized_spoken, snippet_norm) / 100.0
+                seq_score = SequenceMatcher(None, normalized_spoken, snippet_norm).ratio()
+                overlap = 0.0
+                if spoken_tokens:
+                    overlap = len(spoken_tokens & snippet["tokens"]) / max(len(spoken_tokens), 1)
+
+                score = max(token_score, partial_score, seq_score, overlap) * penalty
+
+                if score > best_score or (
+                    score == best_score and overlap > best_overlap
+                ):
                     best_score = score
-                    best_idx = idx
+                    best_overlap = overlap
+                    best_snippet = snippet
 
-        matched_reference = reference_lines[best_idx] if best_idx is not None else None
+        matched_reference = best_snippet["text"] if best_snippet is not None else None
         status = "mismatch"
 
         if not spoken_text:
             status = "unspoken"
         elif not normalized_reference:
             status = "correct"
-        elif best_idx is None or best_score < match_threshold:
+        elif best_snippet is None or best_score < match_threshold:
             status = "mismatch"
         else:
-            ref_tokens = set(normalized_reference[best_idx].split())
-            spoken_tokens = set(normalized_spoken.split())
+            ref_tokens = best_snippet["tokens"] or set()
             missing_tokens = ref_tokens - spoken_tokens
             extra_tokens = spoken_tokens - ref_tokens
 
@@ -1230,7 +1272,11 @@ def build_three_part_communication_summary(
             else:
                 status = "partial_match"
 
-            used_reference_indices.add(best_idx)
+            for idx in best_snippet["indices"]:
+                used_reference_indices.add(idx)
+
+        if best_snippet is not None and best_score >= 0.3:
+            next_reference_index = max(next_reference_index, best_snippet["indices"][-1] + 1)
 
         summary_entries.append(
             {
