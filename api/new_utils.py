@@ -1168,6 +1168,12 @@ def _format_timestamp(seconds: Optional[float]) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+def _format_status_label(status: Optional[str]) -> str:
+    if not status:
+        return "-"
+    return status.replace("_", " ").strip().title()
+
+
 def build_three_part_communication_summary(
     reference_text: Optional[str],
     diarization_segments: Optional[List[Dict]],
@@ -1191,24 +1197,40 @@ def build_three_part_communication_summary(
         best_idx: Optional[int] = None
         best_score = 0.0
 
-        if normalized_spoken and normalized_reference:
+        if normalized_reference:
             for idx, ref_norm in enumerate(normalized_reference):
                 if not ref_norm:
                     continue
-                score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+                score = 0.0
+                if normalized_spoken:
+                    score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
                 if score > best_score:
                     best_score = score
                     best_idx = idx
 
-        status = "correct" if (spoken_text and not normalized_reference) else "mismatch"
-        matched_reference = None
-        if spoken_text:
-            if best_idx is not None and best_score >= match_threshold:
-                status = "correct"
-                matched_reference = reference_lines[best_idx]
-                used_reference_indices.add(best_idx)
-        else:
+        matched_reference = reference_lines[best_idx] if best_idx is not None else None
+        status = "mismatch"
+
+        if not spoken_text:
             status = "unspoken"
+        elif not normalized_reference:
+            status = "correct"
+        elif best_idx is None or best_score < match_threshold:
+            status = "mismatch"
+        else:
+            ref_tokens = set(normalized_reference[best_idx].split())
+            spoken_tokens = set(normalized_spoken.split())
+            missing_tokens = ref_tokens - spoken_tokens
+            extra_tokens = spoken_tokens - ref_tokens
+
+            if not missing_tokens and not extra_tokens:
+                status = "match"
+            elif not missing_tokens and extra_tokens:
+                status = "extra_words"
+            else:
+                status = "partial_match"
+
+            used_reference_indices.add(best_idx)
 
         summary_entries.append(
             {
@@ -1221,6 +1243,7 @@ def build_three_part_communication_summary(
                 "content": spoken_text or matched_reference or "",
                 "status": status,
                 "reference": matched_reference,
+                "original_context": matched_reference,
                 "similarity": round(best_score, 2),
             }
         )
@@ -1237,6 +1260,7 @@ def build_three_part_communication_summary(
                     "content": line,
                     "status": "unspoken",
                     "reference": line,
+                    "original_context": line,
                     "similarity": 0.0,
                 }
             )
@@ -1267,7 +1291,7 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         document.save(docx_path)
         return
 
-    headers = ["Speaker", "Start", "End", "Content", "Status"]
+    headers = ["Speaker", "Start", "End", "Content", "Original Context", "Status"]
     table = document.add_table(rows=1, cols=len(headers))
     try:
         table.style = "Light Grid Accent 1"
@@ -1278,6 +1302,9 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
 
     status_colors = {
         "correct": RGBColor(0, 128, 0),
+        "match": RGBColor(0, 128, 0),
+        "partial_match": RGBColor(255, 165, 0),
+        "extra_words": RGBColor(0, 102, 204),
         "mismatch": RGBColor(192, 0, 0),
         "unspoken": RGBColor(128, 128, 128),
     }
@@ -1290,18 +1317,22 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
             _format_timestamp(entry.get("start")),
             _format_timestamp(entry.get("end")),
             entry.get("content") or "",
+            entry.get("original_context")
+            or entry.get("reference")
+            or "",
         ]
 
         for idx, value in enumerate(values):
             cells[idx].text = value
 
-        status = (entry.get("status") or "").lower()
+        status = (entry.get("status") or "").strip().lower()
         status_cell = cells[len(headers) - 1]
-        status_cell.text = status.capitalize() if status else "-"
-        if status in status_colors:
+        status_cell.text = _format_status_label(status)
+        color_key = status.replace(" ", "_")
+        if color_key in status_colors:
             for paragraph in status_cell.paragraphs:
                 for run in paragraph.runs:
-                    run.font.color.rgb = status_colors[status]
+                    run.font.color.rgb = status_colors[color_key]
 
     document.save(docx_path)
 
@@ -1317,11 +1348,14 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         title_font_size = 16
         body_font_size = 10
         row_padding = 4
-        content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
-        headers = ["Speaker", "Start", "End", "Content", "Status"]
+        content_width_ratio = [0.13, 0.08, 0.08, 0.29, 0.27, 0.15]
+        headers = ["Speaker", "Start", "End", "Content", "Original Context", "Status"]
         status_colors = {
-            "correct": (0, 0.5, 0),
-            "mismatch": (0.75, 0, 0),
+            "correct": (0.0, 0.5, 0.0),
+            "match": (0.0, 0.5, 0.0),
+            "partial_match": (1.0, 0.65, 0.0),
+            "extra_words": (0.0, 0.4, 0.8),
+            "mismatch": (0.75, 0.0, 0.0),
             "unspoken": (0.3, 0.3, 0.3),
         }
 
@@ -1408,7 +1442,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 text_y = y_pos + row_padding + body_font_size
                 color = (0, 0, 0)
                 if headers[idx] == "Status":
-                    status_key = values[idx].strip().lower()
+                    status_key = values[idx].strip().lower().replace(" ", "_")
                     color = status_colors.get(status_key, color)
 
                 for line in lines:
@@ -1441,7 +1475,10 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     _format_timestamp(entry.get("start")),
                     _format_timestamp(entry.get("end")),
                     entry.get("content") or "",
-                    (entry.get("status") or "").capitalize() or "-",
+                    entry.get("original_context")
+                    or entry.get("reference")
+                    or "",
+                    _format_status_label(entry.get("status")),
                 ]
                 page, y_cursor = _draw_row(page, y_cursor, row_values)
 
