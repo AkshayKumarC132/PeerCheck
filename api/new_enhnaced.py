@@ -40,6 +40,7 @@ from .new_utils import (
     s3_client,
     create_highlighted_pdf_document,
     build_three_part_communication_summary,
+    get_media_duration,
 )
 from .authentication import token_verification
 from .new_serializers import (
@@ -153,7 +154,7 @@ class UploadAndProcessView(CreateAPIView):
             return Response({'error': auth_result['error'], 'timestamp': timezone.now()}, status=status.HTTP_401_UNAUTHORIZED)
         
         user = auth_result['user']
-        serializer = self.get_serializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         if not serializer.is_valid():
             return Response({'error': 'Invalid input data', 'details': serializer.errors, 'timestamp': timezone.now()}, status=status.HTTP_400_BAD_REQUEST)
         
@@ -250,6 +251,11 @@ class UploadAndProcessView(CreateAPIView):
                         reference_doc.rag_last_error = str(e)
                         reference_doc.save(update_fields=["rag_enabled","rag_last_error"])
 
+            # --- New: Get media duration before upload ---
+            audio_file.seek(0)
+            audio_duration = get_media_duration(audio_file)
+            audio_file.seek(0)  # reset for upload
+
             # Upload audio file
             audio_s3_key = f'audio/{user.id}/{uuid.uuid4()}_{audio_file.name}'
             audio_s3_url = upload_file_to_s3(audio_file, audio_s3_key)
@@ -258,7 +264,8 @@ class UploadAndProcessView(CreateAPIView):
                 original_filename=audio_file.name,
                 user=user_profile,
                 reference_document=reference_doc,
-                status='processing'
+                status='processing',
+                duration=audio_duration,
             )
 
             # Transcribe audio
@@ -364,7 +371,7 @@ class RunDiarizationView(CreateAPIView):
                 'timestamp': timezone.now(),
             }, status=status.HTTP_401_UNAUTHORIZED)
 
-        serializer = self.get_serializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         audio_id = serializer.validated_data['audio_id']
 
@@ -409,7 +416,7 @@ class SpeakerProfileMappingView(CreateAPIView):
                 'timestamp': timezone.now(),
             }, status=status.HTTP_401_UNAUTHORIZED)
 
-        serializer = self.get_serializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
 
         audio_id = serializer.validated_data['audio_id']
@@ -956,6 +963,7 @@ class GetUserDocumentsView(GenericAPIView):
             user_profile = UserProfile.objects.get(**{UserProfile.USERNAME_FIELD: getattr(user, UserProfile.USERNAME_FIELD)})
             
             documents = ReferenceDocument.objects.filter(uploaded_by=user_profile)
+            print("Documents", documents)
             audio_files = AudioFile.objects.filter(user=user_profile)
             
             response_data = {
@@ -965,7 +973,7 @@ class GetUserDocumentsView(GenericAPIView):
                 'total_audio_files': audio_files.count()
             }
             
-            serializer = self.get_serializer(response_data)
+            serializer = self.serializer_class(response_data)
             return Response(serializer.data, status=status.HTTP_200_OK)
             
         except UserProfile.DoesNotExist:
@@ -975,7 +983,7 @@ class GetUserDocumentsView(GenericAPIView):
                 'total_documents': 0,
                 'total_audio_files': 0
             }
-            serializer = self.get_serializer(response_data)
+            serializer = self.serializer_class(response_data)
             return Response(serializer.data, status=status.HTTP_200_OK)
 
 class CleanupExpiredSessionsView(CreateAPIView):
@@ -1008,7 +1016,7 @@ class CleanupExpiredSessionsView(CreateAPIView):
             }
             return Response(error_data, status=status.HTTP_403_FORBIDDEN)
         
-        serializer = self.get_serializer(data=request.data)
+        serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         force_cleanup = serializer.validated_data.get('force_cleanup', False)
@@ -1091,7 +1099,7 @@ class GetProcessingSessionView(GenericAPIView):
                 error_serializer.is_valid()
                 return Response(error_serializer.data, status=status.HTTP_403_FORBIDDEN)
             
-            serializer = self.get_serializer(session)
+            serializer = self.serializer_class(session)
             return Response(serializer.data, status=status.HTTP_200_OK)
             
         except ProcessingSession.DoesNotExist:

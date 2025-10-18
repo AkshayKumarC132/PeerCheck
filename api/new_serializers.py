@@ -89,14 +89,11 @@ class DownloadRequestSerializer(serializers.Serializer):
 class ReferenceDocumentDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReferenceDocument
-        fields = [
-            'id', 'name', 'document_type', 'original_filename',
-            'file_size', 'content_type', 'upload_status',
-            'created_at', 'updated_at',
-            # RAG fields
-            'rag_enabled', 'rag_vector_store_id', 'rag_document_id',
-            'rag_status', 'rag_uploaded_at', 'rag_ingested_at',
-            'rag_last_error', 'rag_metadata'
+        fields = '__all__'  # or list specific fields
+        read_only_fields = [
+            'id', 'created_at', 'updated_at',  # typically system fields
+            'file_path', 'extracted_text',  # add any fields you want to be read-only
+            # add other fields as needed
         ]
 
 class AudioFileDetailSerializer(serializers.ModelSerializer):

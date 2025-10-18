@@ -7,7 +7,7 @@ from .views import (
     SessionCreateView, SessionListView, SessionDetailView,
     SessionReviewView, SessionStatusUpdateView,
     AdminUserListView, AdminUserDetailView, AdminDashboardSummaryView,  # Added AdminDashboardSummaryView
-    UserSettingsView, SystemSettingsView, AuditLogView, UserProfileDetailsView,
+    UserSettingsView, SystemSettingsView, AuditLogView, UserProfileDetailsView,DashboardSummaryView,
     SpeakerProfileUpdateView, SpeakerProfileListView, GenerateSummaryFromAudioID
 )
 from .authentication import RegisterView, LoginViewAPI, LogoutViewAPI
@@ -47,6 +47,9 @@ urlpatterns = [
     path('admin/users/<str:token>/', AdminUserListView.as_view(), name='admin-user-list'),
     path('admin/user/<int:user_id>/<str:token>/', AdminUserDetailView.as_view(), name='admin-user-detail'),
     path('admin/dashboard-summary/<str:token>/', AdminDashboardSummaryView.as_view(), name='admin-dashboard-summary'),
+
+    # --------------- User Dashboard -------------
+    path('dashboard/summary/<str:token>/', DashboardSummaryView.as_view(), name = 'User Dashboard Summary')
 
     # # ---------------- Core audio & processing ----------------
     # path('process-audio/<str:token>/', ProcessAudioView.as_view(), name='process-audio'),

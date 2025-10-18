@@ -7,8 +7,8 @@ import logging
 import threading
 import textwrap
 import importlib.util
-from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Set
+from contextlib import contextmanager, suppress
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import boto3
 import numpy as np
@@ -1600,3 +1600,46 @@ def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshol
             _process_element_three_color(part._element, norm_trans, thresholds, colors)
 
     document.save(output_path)
+
+def get_media_duration(file_obj):
+    """
+    Returns duration in seconds for an audio or video file object.
+    Works on Windows by closing temp file before ffmpeg/moviepy reads it.
+    """
+    from moviepy import VideoFileClip, AudioFileClip
+
+    # pick a reasonable suffix (extension) so ffmpeg can infer format
+    suffix = os.path.splitext(getattr(file_obj, "name", ""))[-1] or ".media"
+
+    tmp_path = None
+    try:
+        # Write to a *closed* temp file path (delete=False) so ffmpeg can open it
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)  # VERY IMPORTANT on Windows
+        file_obj.seek(0)
+        with open(tmp_path, "wb") as out:
+            # If file_obj is large, copy in chunks
+            chunk = file_obj.read(1024 * 1024)
+            while chunk:
+                out.write(chunk)
+                chunk = file_obj.read(1024 * 1024)
+
+        # Try as video first
+        with suppress(Exception):
+            with VideoFileClip(tmp_path) as clip:
+                if clip.duration:
+                    return float(clip.duration)
+
+        # Then as audio
+        with suppress(Exception):
+            with AudioFileClip(tmp_path) as clip:
+                if clip.duration:
+                    return float(clip.duration)
+
+        return 0.0
+    except Exception:
+        return 0.0
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            with suppress(Exception):
+                os.remove(tmp_path)
