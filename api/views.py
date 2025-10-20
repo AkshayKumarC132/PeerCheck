@@ -895,17 +895,17 @@ class GetAudioRecordsView(APIView):
             return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST) # Should be caught by permission class ideally
         user = user_data['user']
         try:
-            # audio_records = AudioFile.objects.all().order_by("-id")
-            if user_data['user'].role == 'admin':
-                audio_records = AudioFile.objects.all()
-            elif user.role == 'operator':
-                audio_records = AudioFile.objects.filter(
-                    models.Q(user=user) | models.Q(sessions__user=user)
-                ).distinct()
-            else:  # reviewer
-                audio_records = AudioFile.objects.filter(
-                    sessions__session_users__user=user
-                ).distinct()
+            audio_records = AudioFile.objects.filter(user = user)
+            # if user_data['user'].role == 'admin':
+            #     audio_records = AudioFile.objects.all()
+            # elif user.role == 'operator':
+            #     audio_records = AudioFile.objects.filter(
+            #         models.Q(user=user) | models.Q(sessions__user=user)
+            #     ).distinct()
+            # else:  # reviewer
+            #     audio_records = AudioFile.objects.filter(
+            #         sessions__session_users__user=user
+            #     ).distinct()
             audio_records = audio_records.order_by("-created_at")
             
             paginator = PageNumberPagination()
@@ -1667,12 +1667,16 @@ class AdminDashboardSummaryView(APIView):
         if request.validated_user.role != 'admin':
             return Response({"error": "Forbidden. Admin access required."}, status=status.HTTP_403_FORBIDDEN)
 
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
-            total_users = UserProfile.objects.count()
-            total_audio_files = AudioFile.objects.count()
-            processed_audio_files = AudioFile.objects.filter(status='processed').count()
-            failed_audio_files = AudioFile.objects.filter(status='failed').count()
-            total_documents = ReferenceDocument.objects.count()
+            total_users = UserProfile.objects.filter(id=user_data['user'].id).count()
+            total_audio_files = AudioFile.objects.filter(user=user_data['user'].id).count()
+            processed_audio_files = AudioFile.objects.filter(status='processed', user=user_data['user'].id).count()
+            failed_audio_files = AudioFile.objects.filter(status='failed', user=user_data['user'].id).count()
+            total_documents = ReferenceDocument.objects.filter(uploaded_by=user_data['user'].id).count()
 
             data = {
                 "total_users": total_users,
@@ -1853,6 +1857,45 @@ class AdminUserDetailView(APIView):
         )
         logger.info(f"UserProfile {user_id} ({username_for_log}) deleted by admin {request.validated_user.username}")
         return Response(status=status.HTTP_204_NO_CONTENT)
+
+class DashboardSummaryView(APIView):
+    # You can use your custom RoleBasedPermission if you'd like
+    # permission_classes = [IsAuthenticated]
+
+    def get(self, request, token):
+        """
+        Returns dashboard summary metrics:
+        - Total Documents
+        - Total Audio Files
+        - Processed Sessions
+        - Average Coverage
+        """
+        from api.models import ProcessingSession
+        # Validate the token if your permission is not handling it
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=400)
+
+        total_documents = ReferenceDocument.objects.filter(uploaded_by=user_data['user'].id ).count()
+        total_audio_files = AudioFile.objects.filter(user=user_data['user'].id).count()
+        processed_audio = AudioFile.objects.filter(status='processed',diarization__isnull= False, user=user_data['user'].id).count()
+        pending_diarization  = AudioFile.objects.filter(status='processed',diarization__isnull= True, user=user_data['user'].id).count()
+        # Coverage: average coverage from all ProcessingSessions where coverage is not null
+        # coverage_queryset = ProcessingSession.objects.exclude(coverage__isnull=True)
+        # if coverage_queryset.exists():
+        #     avg_coverage = (
+        #         coverage_queryset.aggregate(avg=models.Avg('coverage'))["avg"] or 0
+        #     )
+        # else:
+        #     avg_coverage = 0
+
+        data = {
+            "total_documents": total_documents,
+            "total_audio_files": total_audio_files,
+            "processed_audio": processed_audio,
+            "pending_diarization": pending_diarization
+        }
+        return Response(data)
 
 # def transcribe_with_speaker_diarization(audio_url: str, model_path: str, speaker_model_path: str):
 #     """
@@ -2471,6 +2514,43 @@ class UserProfileDetailsView(APIView):
             logger.error(f"Error fetching user profile: {str(e)}")
             return Response({"error": "An error occurred while fetching the user profile."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    @extend_schema(
+        summary="Update User Profile",
+        description="Update the user's profile information such as name and theme.",
+        request=UserProfileSerializer,
+        responses={
+            200: UserProfileSerializer,
+            400: ErrorResponseSerializer,
+            404: ErrorResponseSerializer,
+            403: ErrorResponseSerializer,
+        },
+        tags=['User Profile']
+    )
+    def put(self, request, token):
+        """
+        Updates the user profile for the authenticated user.
+        """
+        # Validate the token
+        user_data = token_verification(token)
+        if user_data['status'] != 200:
+            return Response({'error': user_data['error']}, status=status.HTTP_400_BAD_REQUEST)
+
+        user = user_data['user']
+        try:
+            user_profile = UserProfile.objects.get(username=user)
+        except UserProfile.DoesNotExist:
+            return Response({"error": "User profile not found."}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            logger.error(f"Error fetching user profile for update: {str(e)}")
+            return Response({"error": "An error occurred while fetching the user profile."}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+        # Partial update: only update fields provided
+        serializer = UserProfileSerializer(user_profile, data=request.data, partial=True)
+        if serializer.is_valid():
+            serializer.save()
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        else:
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
 class SpeakerProfileUpdateView(APIView):
     """API to manually assign or update a speaker name."""

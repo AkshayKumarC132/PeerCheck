@@ -5,7 +5,10 @@ import tempfile
 import csv
 import logging
 import threading
-from typing import Dict, List, Optional
+import textwrap
+import importlib.util
+from contextlib import contextmanager, suppress
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import boto3
 import numpy as np
@@ -24,6 +27,22 @@ import docx.oxml
 import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
+# Add at top (after existing ML imports like whisper/pyannote)
+from sentence_transformers import SentenceTransformer
+import torch  # If not present, add to requirements
+
+# Lazy global model (thread-safe)
+_SENTENCE_MODEL = None
+_MODEL_LOCK = threading.Lock()
+
+def _get_sentence_model():
+    global _SENTENCE_MODEL
+    if _SENTENCE_MODEL is None:
+        with _MODEL_LOCK:
+            if _SENTENCE_MODEL is None:
+                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return _SENTENCE_MODEL
+
 from docx.enum.text import WD_COLOR_INDEX
 from docx.shared import RGBColor
 import fitz  # PyMuPDF
@@ -107,12 +126,17 @@ def download_file_from_s3(s3_key):
             Bucket=settings.AWS_STORAGE_BUCKET_NAME,
             Key=s3_key
         )
-        
-        # Create temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False)
+
+        _, ext = os.path.splitext(s3_key)
+        suffix = ext if ext else None
+
+        # Create temporary file while preserving the original extension so
+        # downstream consumers can perform extension-based handling (for
+        # example, DOCX conversion before PDF highlighting).
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
         temp_file.write(response['Body'].read())
         temp_file.close()
-        
+
         return temp_file.name
     except Exception as e:
         raise Exception(f"Failed to download from S3: {str(e)}")
@@ -164,7 +188,12 @@ def transcribe_audio_from_s3(s3_url):
     try:
         # Use word_timestamps=True to get word-level info
         result = model.transcribe(temp_path, word_timestamps=True)
+        if not result or not result.get("text"):
+            raise ValueError("Transcription result is empty or invalid.")
         return result  # Return the full result dict
+    except Exception as e:
+        logging.error(f"Failed to transcribe audio from S3: {e}")
+        raise
     finally:
         os.unlink(temp_path)
 
@@ -422,6 +451,101 @@ def _replace_validated_abbreviations(doc, validated_abbrs: dict) -> None:
                     )
                     break
 
+@contextmanager
+def _word_com_apartment() -> Any:
+    """Initialise a COM apartment suitable for Microsoft Word automation."""
+
+    spec = importlib.util.find_spec("pythoncom")
+    if spec is None:
+        raise ValueError(
+            "Converting Office documents to PDF requires the 'pywin32' package "
+            "and a Microsoft Word installation."
+        )
+
+    import pythoncom  # type: ignore
+
+    com_initialized = False
+    try:
+        try:
+            pythoncom.CoInitialize()
+            com_initialized = True
+        except Exception as exc:  # pragma: no cover - best effort initialisation
+            # RPC_E_CHANGED_MODE occurs when the thread is already initialised
+            # in a different COM apartment. In that case we fall back to
+            # explicitly initialising an STA apartment which Word automation
+            # requires.
+            if getattr(exc, "hresult", None) == -2147417850:
+                pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+                com_initialized = True
+            else:
+                raise ValueError(
+                    "Failed to initialise COM before launching Word: {0}".format(exc)
+                ) from exc
+
+        yield pythoncom
+    finally:
+        if com_initialized:
+            pythoncom.CoUninitialize()
+
+
+def _convert_office_document_to_pdf(source_path: str, output_path: str) -> None:
+    """Convert DOCX or DOC files to PDF using the best available backend."""
+
+    extension = os.path.splitext(source_path)[1].lower()
+    if extension == ".docx":
+        try:
+            with _word_com_apartment():
+                convert(source_path, output_path)
+        except Exception as exc:
+            raise ValueError(
+                f"Failed to convert DOCX file '{source_path}' to PDF using Word: {exc}"
+            ) from exc
+        return
+
+    if extension == ".doc":
+        if importlib.util.find_spec("win32com.client") is None:
+            raise ValueError(
+                "Converting legacy .doc files to PDF requires the 'pywin32' package "
+                "and a Microsoft Word installation."
+            )
+
+        from win32com.client import DispatchEx  # type: ignore
+
+        with _word_com_apartment():
+            try:
+                word = DispatchEx("Word.Application")
+            except Exception as exc:
+                raise ValueError(
+                    f"Failed to launch Microsoft Word for DOC conversion: {exc}"
+                ) from exc
+
+            word.Visible = False
+            try:
+                try:
+                    document = word.Documents.Open(os.path.abspath(source_path))
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to open DOC file '{source_path}' with Word: {exc}"
+                    ) from exc
+
+                try:
+                    document.SaveAs(os.path.abspath(output_path), FileFormat=17)
+                except Exception as exc:
+                    raise ValueError(
+                        f"Failed to export DOC file '{source_path}' to PDF using Word: {exc}"
+                    ) from exc
+                finally:
+                    document.Close(False)
+            finally:
+                word.Quit()
+
+        return
+
+    raise ValueError(
+        f"Unsupported Office document extension '{extension}' for PDF conversion."
+    )
+
+
 def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcript_match=True):
     """
     Opens a document, identifies relevant pages, highlights text on those pages based on semantic and numeric matching,
@@ -430,9 +554,17 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     """
     import logging
     pdf_path = doc_path
-    if doc_path.lower().endswith('.docx'):
+    source_was_office_doc = doc_path.lower().endswith(('.docx', '.doc'))
+    if source_was_office_doc:
         temp_pdf_path = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name
-        convert(doc_path, temp_pdf_path)
+        try:
+            _convert_office_document_to_pdf(doc_path, temp_pdf_path)
+        except Exception as exc:
+            if os.path.exists(temp_pdf_path):
+                os.unlink(temp_pdf_path)
+            raise ValueError(
+                f"Failed to convert Office document '{doc_path}' to PDF: {exc}"
+            )
         pdf_path = temp_pdf_path
 
     # --- Robust PDF Validation ---
@@ -570,21 +702,39 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
         target_doc.save(output_path, garbage=4, deflate=True)
     finally:
         target_doc.close()
-        if doc_path.lower().endswith('.docx') and os.path.exists(pdf_path):
-            os.unlink(pdf_path)
+        if source_was_office_doc and os.path.exists(pdf_path):
+            try:
+                os.unlink(pdf_path)
+            except PermissionError:
+                logging.warning(
+                    "Temp file in use after Office conversion, skipping deletion: %s",
+                    pdf_path,
+                )
+            except OSError as exc:
+                logging.warning(
+                    "Failed to delete temporary Office conversion file %s: %s",
+                    pdf_path,
+                    exc,
+                )
 
     return output_path
 
-def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_match=True):
+def create_highlighted_pdf_document(
+    text_s3_url,
+    transcript,
+    require_transcript_match=True,
+    three_pc_entries: Optional[List[Dict]] = None,
+):
     """
-    Orchestrates the generation of a highlighted PDF using the new logic.
+    Orchestrates the generation of a highlighted PDF using the new logic and optionally
+    appends Three-Part Communication (3PC) summary pages.
     """
     output_filename = f"processed/{uuid.uuid4()}_highlighted_report.pdf"
-    
+
     # Download the reference document
     s3_key = get_s3_key_from_url(text_s3_url)
     temp_input_path = download_file_from_s3(s3_key)
-    
+
     temp_output_path = ""
     try:
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
@@ -596,6 +746,9 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
             temp_output_path,
             require_transcript_match=require_transcript_match,
         )
+
+        if three_pc_entries is not None:
+            append_three_pc_summary_to_pdf(temp_output_path, three_pc_entries)
 
         with open(temp_output_path, 'rb') as f_out:
             output_s3_url = upload_file_to_s3(f_out, output_filename)
@@ -613,7 +766,13 @@ def create_highlighted_pdf_document(text_s3_url, transcript, require_transcript_
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
 
-def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6, low_threshold=0.3):
+def create_highlighted_docx_from_s3(
+    text_s3_url,
+    transcript,
+    high_threshold=0.6,
+    low_threshold=0.3,
+    three_pc_entries: Optional[List[Dict]] = None,
+):
     """
     Generates a highlighted DOCX report from a reference document (PDF or DOCX)
     and a transcript, then uploads it to S3.
@@ -659,6 +818,9 @@ def create_highlighted_docx_from_s3(text_s3_url, transcript, high_threshold=0.6,
             high_threshold=high_threshold,
             low_threshold=low_threshold
         )
+
+        if three_pc_entries is not None:
+            append_three_pc_summary_to_docx(output_path, three_pc_entries)
         
         # --- UPLOAD THE FINAL REPORT TO S3 ---
         output_filename = os.path.basename(s3_key).rsplit('.', 1)[0]
@@ -1007,6 +1169,370 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
     return list(summary.values())
 
 
+def _format_timestamp(seconds: Optional[float]) -> str:
+    if seconds is None:
+        return "-"
+    try:
+        total_seconds = max(0, int(round(float(seconds))))
+    except (TypeError, ValueError):
+        return "-"
+
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+def build_three_part_communication_summary(
+    reference_text: Optional[str],
+    diarization_segments: Optional[List[Dict]],
+    match_threshold: float = 0.6,
+    max_entries: int = 1000,
+) -> List[Dict[str, Any]]:
+    segments = diarization_segments or []
+    reference_lines: List[str] = []
+    normalized_reference: List[str] = []
+
+    if reference_text:
+        reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
+        normalized_reference = [normalize_line(ln) for ln in reference_lines]
+        
+    # Pre-encode references for semantic similarity (once per call)
+    model = _get_sentence_model()
+    ref_embeddings = None
+    if reference_lines and len(reference_lines) > 0:
+        try:
+            ref_embeddings = model.encode(reference_lines)  # Full text for semantics; (num_refs, 384)
+        except Exception as e:
+            logging.warning(f"Embedding pre-encode failed: {e}; fallback to fuzzy")
+            ref_embeddings = None  # Triggers fuzzy fallback below
+
+    used_reference_indices: Set[int] = set()
+    summary_entries: List[Dict[str, Any]] = []
+
+    for segment in segments:
+        spoken_text = (segment.get("text") or "").strip()
+        normalized_spoken = normalize_line(spoken_text) if spoken_text else ""
+        best_idx: Optional[int] = None
+        best_score = 0.0
+
+        # Semantic similarity computation (replaces fuzzy loop)
+        best_score = 0.0
+        best_idx = None
+        if normalized_spoken and normalized_reference:
+            if ref_embeddings is not None:
+                try:
+                    spoken_embedding = model.encode([spoken_text])  # Full spoken_text for intent
+                    similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]  # (num_refs,)
+                    best_idx = int(similarities.argmax())
+                    best_score = float(similarities[best_idx])
+                    logging.debug(f"Semantic score: {best_score:.2f} for '{spoken_text[:50]}...'")  # Optional debug
+                except Exception as e:
+                    logging.warning(f"Semantic compute failed: {e}; fallback to fuzzy")
+                    # Fallback fuzzy loop
+                    for idx, ref_norm in enumerate(normalized_reference):
+                        if not ref_norm:
+                            continue
+                        score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
+            else:
+                # No embeds: full fuzzy fallback
+                for idx, ref_norm in enumerate(normalized_reference):
+                    if not ref_norm:
+                        continue
+                    score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+                    if score > best_score:
+                        best_score = score
+                        best_idx = idx
+
+        # ANCHOR: Status computation start
+        matched_reference = None
+        partial_threshold = 0.3
+        short_word_threshold = 4
+        word_count = len(spoken_text.split()) if spoken_text else 0
+        is_short = word_count < short_word_threshold
+
+        if not normalized_reference:  # No reference text
+            if spoken_text:
+                status = "general conversation" if is_short else "match"
+            else:
+                status = "unspoken"
+        else:  # Has reference text
+            if spoken_text:
+                if best_idx is not None and best_score >= 0.5:  # Tighter semantic threshold (cosine 0-1)
+                    status = "match"
+                    matched_reference = reference_lines[best_idx]
+                    used_reference_indices.add(best_idx)
+                elif is_short:  # Prioritize shortness for chit-chat after ruling out full match
+                    status = "general conversation"
+                elif best_score >= partial_threshold:
+                    status = "partial match"
+                    matched_reference = reference_lines[best_idx] if best_idx else None
+                else:
+                    status = "mismatch"
+            else:
+                status = "unspoken"
+
+        summary_entries.append(
+            {
+                "speaker": segment.get("speaker_name")
+                or segment.get("speaker_label")
+                or segment.get("speaker")
+                or "Unknown",
+                "start": segment.get("start"),
+                "end": segment.get("end"),
+                "content": spoken_text or matched_reference or "",
+                "status": status,
+                "reference": matched_reference,
+                "similarity": round(best_score, 2),
+            }
+        )
+
+    if normalized_reference and not segments:
+        for idx, line in enumerate(reference_lines):
+            if idx in used_reference_indices:
+                continue
+            summary_entries.append(
+                {
+                    "speaker": "Not Spoken",
+                    "start": None,
+                    "end": None,
+                    "content": line,
+                    "status": "unspoken",
+                    "reference": line,
+                    "similarity": 0.0,
+                }
+            )
+
+    def _sort_key(entry: Dict[str, Any]):
+        start = entry.get("start")
+        try:
+            start_val = float(start) if start is not None else None
+        except (TypeError, ValueError):
+            start_val = None
+        return (0 if start_val is not None else 1, start_val or 0.0, entry.get("speaker") or "")
+
+    summary_entries.sort(key=_sort_key)
+
+    if len(summary_entries) > max_entries:
+        summary_entries = summary_entries[:max_entries]
+
+    return summary_entries
+
+
+def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]]) -> None:
+    document = docx.Document(docx_path)
+    document.add_page_break()
+    document.add_heading("Three-Part Communication (3PC) Summary", level=1)
+
+    if not entries:
+        document.add_paragraph("No speaker diarization data was available to summarise.")
+        document.save(docx_path)
+        return
+
+    headers = ["Speaker", "Start", "End", "Content", "Status"]
+    table = document.add_table(rows=1, cols=len(headers))
+    try:
+        table.style = "Light Grid Accent 1"
+    except KeyError:
+        table.style = "Light Grid"
+    for cell, title in zip(table.rows[0].cells, headers):
+        cell.text = title
+
+    status_colors = {
+        "match": RGBColor(0, 128, 0),  # Green
+        "partial match": RGBColor(255, 165, 0),  # Orange
+        "general conversation": RGBColor(0, 0, 255),  # Blue
+        "mismatch": RGBColor(192, 0, 0),  # Red (retained for substantive off-topic)
+        "unspoken": RGBColor(128, 128, 128),  # Gray
+    }
+
+    for entry in entries:
+        row = table.add_row()
+        cells = row.cells
+        values = [
+            entry.get("speaker") or "Unknown",
+            _format_timestamp(entry.get("start")),
+            _format_timestamp(entry.get("end")),
+            entry.get("content") or "",
+        ]
+
+        for idx, value in enumerate(values):
+            cells[idx].text = value
+
+        status = (entry.get("status") or "").lower()
+        status_cell = cells[len(headers) - 1]
+        status_cell.text = status.capitalize() if status else "-"
+        if status in status_colors:
+            for paragraph in status_cell.paragraphs:
+                for run in paragraph.runs:
+                    run.font.color.rgb = status_colors[status]
+
+    document.save(docx_path)
+
+
+def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]]) -> None:
+    doc = fitz.open(pdf_path)
+    fd, temp_pdf_path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    saved = False
+
+    try:
+        margin = 36
+        title_font_size = 16
+        body_font_size = 10
+        row_padding = 4
+        content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
+        headers = ["Speaker", "Start", "End", "Content", "Status"]
+        status_colors = {
+            "match": (0, 0.5, 0),  # Green
+            "partial match": (1, 0.65, 0),  # Orange
+            "general conversation": (0, 0, 0.8),  # Blue
+            "mismatch": (0.75, 0, 0),  # Red (retained)
+            "unspoken": (0.3, 0.3, 0.3),  # Gray
+        }
+
+        def _new_page(include_header: bool = True):
+            page = doc.new_page()
+            width = page.rect.width
+            height = page.rect.height
+            y_pos = margin
+            if include_header:
+                page.insert_text(
+                    (margin, y_pos),
+                    "Three-Part Communication (3PC) Summary",
+                    fontsize=title_font_size,
+                    fontname="helv",
+                )
+                y_pos += title_font_size + 8
+
+                content_width = width - 2 * margin
+                x = margin
+                for header, ratio in zip(headers, content_width_ratio):
+                    col_width = content_width * ratio
+                    rect = fitz.Rect(x, y_pos, x + col_width, y_pos + body_font_size + 8)
+                    page.draw_rect(rect, color=(0, 0, 0))
+                    page.insert_textbox(
+                        rect,
+                        header,
+                        fontsize=body_font_size,
+                        fontname="helv",
+                        align=fitz.TEXT_ALIGN_CENTER,
+                    )
+                    x += col_width
+                y_pos += body_font_size + 8
+
+            return page, y_pos
+
+        def _wrap_cell(text: str, max_width: float) -> List[str]:
+            if not text:
+                return [""]
+            approx_char_width = max(int(max_width / (body_font_size * 0.6)), 1)
+            return textwrap.wrap(text, width=approx_char_width) or [""]
+
+        def _draw_row(page, y_pos, values: List[str]):
+            """Render a single summary row, creating a new page if required."""
+
+            if page is None:
+                page, y_pos = _new_page()
+
+            current_page = page
+            width = current_page.rect.width
+            height = current_page.rect.height
+            available_height = height - margin
+            content_width = width - 2 * margin
+
+            columns = []
+            max_lines = 1
+            for value, ratio in zip(values, content_width_ratio):
+                col_width = content_width * ratio
+                lines = _wrap_cell(value, col_width - (2 * row_padding))
+                columns.append((col_width, lines))
+                max_lines = max(max_lines, len(lines))
+
+            row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+
+            if y_pos + row_height > available_height:
+                current_page, y_pos = _new_page()
+                width = current_page.rect.width
+                height = current_page.rect.height
+                available_height = height - margin
+                content_width = width - 2 * margin
+                columns.clear()
+                max_lines = 1
+                for value, ratio in zip(values, content_width_ratio):
+                    col_width = content_width * ratio
+                    lines = _wrap_cell(value, col_width - (2 * row_padding))
+                    columns.append((col_width, lines))
+                    max_lines = max(max_lines, len(lines))
+                row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+
+            x = margin
+            for idx, (col_width, lines) in enumerate(columns):
+                rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
+                current_page.draw_rect(rect, color=(0.7, 0.7, 0.7))
+
+                text_y = y_pos + row_padding + body_font_size
+                color = (0, 0, 0)
+                if headers[idx] == "Status":
+                    status_key = values[idx].strip().lower()
+                    color = status_colors.get(status_key, color)
+
+                for line in lines:
+                    current_page.insert_text(
+                        (x + row_padding, text_y),
+                        line,
+                        fontsize=body_font_size,
+                        fontname="helv",
+                        fill=color,
+                    )
+                    text_y += body_font_size + 2
+
+                x += col_width
+
+            return current_page, y_pos + row_height
+
+        page, y_cursor = _new_page()
+
+        if not entries:
+            page.insert_text(
+                (margin, y_cursor),
+                "No speaker diarization data was available to summarise.",
+                fontsize=body_font_size,
+                fontname="helv",
+            )
+        else:
+            for entry in entries:
+                row_values = [
+                    entry.get("speaker") or "Unknown",
+                    _format_timestamp(entry.get("start")),
+                    _format_timestamp(entry.get("end")),
+                    entry.get("content") or "",
+                    (entry.get("status") or "").capitalize() or "-",
+                ]
+                page, y_cursor = _draw_row(page, y_cursor, row_values)
+
+        doc.save(temp_pdf_path, deflate=True)
+        saved = True
+    finally:
+        doc.close()
+
+        try:
+            if saved:
+                os.replace(temp_pdf_path, pdf_path)
+        finally:
+            if os.path.exists(temp_pdf_path):
+                try:
+                    os.unlink(temp_pdf_path)
+                except OSError:
+                    logging.warning(
+                        "Temp file in use, skipping deletion: %s", temp_pdf_path
+                    )
+
+
 # --- CORE THREE-COLOR HIGHLIGHTING LOGIC ---
 
 def _apply_color_to_paragraph_runs(p_element, color_hex_str):
@@ -1021,27 +1547,112 @@ def _apply_color_to_paragraph_runs(p_element, color_hex_str):
         color_element.set(qn('w:val'), color_hex_str)
         rPr.append(color_element)
 
-def _process_element_three_color(element, norm_trans, thresholds, colors):
-    """Finds all paragraphs in an XML element and applies color based on the two-threshold system."""
+def _collect_non_empty_paragraphs(element):
     if element is None:
-        return
-        
+        return []
+
+    paragraphs = []
     for p_element in element.xpath('.//w:p'):
         full_text = "".join(p_element.xpath('.//w:t/text()')).strip()
         if not full_text:
             continue
-            
-        norm_para_text = normalize_line(full_text)
-        best_score = max((fuzz.token_set_ratio(norm_para_text, t) for t in norm_trans), default=0) / 100.0
-        
+        paragraphs.append((p_element, full_text, normalize_line(full_text)))
+    return paragraphs
+
+
+def _paragraph_index_for_offset(paragraphs, offset):
+    """Map a character offset within the concatenated paragraph text to its index."""
+    running = 0
+    for idx, (_element, _text, normalized) in enumerate(paragraphs):
+        end = running + len(normalized)
+        if offset <= end:
+            return idx
+        running = end + 1  # account for the joining newline
+    return max(len(paragraphs) - 1, 0)
+
+
+def _detect_highlight_anchor_sliding(paragraphs, norm_trans, threshold):
+    if not paragraphs or not norm_trans:
+        return 0
+
+    K = min(len(norm_trans), len(paragraphs), 3)
+    if K == 0:
+        return 0
+
+    best_avg, best_idx = 0.0, 0
+    for i in range(len(paragraphs) - K + 1):
+        avg = sum(
+            SequenceMatcher(None, paragraphs[i + j][2], norm_trans[j]).ratio()
+            for j in range(K)
+        ) / K
+        if avg > best_avg:
+            best_avg = avg
+            best_idx = i
+
+    return best_idx if best_avg >= threshold else 0
+
+
+def _detect_highlight_anchor(paragraphs, norm_trans, threshold):
+    if not paragraphs or not norm_trans:
+        return 0
+
+    doc_blob = "\n".join(p[2] for p in paragraphs if p[2])
+    transcript_blob = "\n".join(t for t in norm_trans if t)
+
+    if doc_blob and transcript_blob:
+        matcher = SequenceMatcher(None, doc_blob, transcript_blob, autojunk=False)
+        best_block = None
+        best_quality = 0.0
+        for block in matcher.get_matching_blocks():
+            if not block.size:
+                continue
+
+            transcript_ratio = block.size / max(len(transcript_blob), 1)
+            doc_ratio = block.size / max(len(doc_blob), 1)
+            quality = max(transcript_ratio, doc_ratio)
+
+            if block.size < 30 and transcript_ratio < threshold and doc_ratio < threshold:
+                # Skip tiny overlaps unless they represent a sufficiently strong match.
+                continue
+
+            # Prefer longer, higher-quality matches to anchor the highlights.
+            if quality > best_quality or (
+                quality == best_quality and best_block and block.size > best_block.size
+            ):
+                best_quality = quality
+                best_block = block
+
+        if best_block and (best_quality >= threshold or best_block.size >= 80):
+            return _paragraph_index_for_offset(paragraphs, best_block.a)
+
+    # Fall back to the sliding window heuristic when we cannot locate a strong block
+    return _detect_highlight_anchor_sliding(paragraphs, norm_trans, threshold)
+
+
+def _apply_highlighting_to_paragraphs(paragraphs, norm_trans, thresholds, colors, start_index=0):
+    if not paragraphs:
+        return
+
+    for idx, (p_element, _full_text, normalized_text) in enumerate(paragraphs):
+        if idx < start_index:
+            continue
+
+        best_score = max((fuzz.token_set_ratio(normalized_text, t) for t in norm_trans), default=0) / 100.0
+
         color_to_apply = None
         if best_score >= thresholds['high']:
             color_to_apply = colors['GREEN']
         elif best_score >= thresholds['low']:
             color_to_apply = colors['RED']
-        
+
         if color_to_apply:
             _apply_color_to_paragraph_runs(p_element, str(color_to_apply))
+
+
+def _process_element_three_color(element, norm_trans, thresholds, colors, start_index=0):
+    paragraphs = _collect_non_empty_paragraphs(element)
+    _apply_highlighting_to_paragraphs(paragraphs, norm_trans, thresholds, colors, start_index)
+
 
 def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshold=0.6, low_threshold=0.3):
     """Highlights text in a DOCX using the Green/Red/Black system."""
@@ -1050,10 +1661,55 @@ def highlight_docx_three_color(docx_path, norm_trans, output_path, high_threshol
     thresholds = {'high': high_threshold, 'low': low_threshold}
 
     # Process main body, headers, and footers for complete coverage
-    _process_element_three_color(document.element.body, norm_trans, thresholds, colors)
+    body_paragraphs = _collect_non_empty_paragraphs(document.element.body)
+    body_start_index = _detect_highlight_anchor(body_paragraphs, norm_trans, thresholds['low'])
+    _apply_highlighting_to_paragraphs(body_paragraphs, norm_trans, thresholds, colors, body_start_index)
     for section in document.sections:
-        for part in [section.header, section.footer, section.first_page_header, 
+        for part in [section.header, section.footer, section.first_page_header,
                      section.first_page_footer, section.even_page_header, section.even_page_footer]:
             _process_element_three_color(part._element, norm_trans, thresholds, colors)
 
     document.save(output_path)
+
+def get_media_duration(file_obj):
+    """
+    Returns duration in seconds for an audio or video file object.
+    Works on Windows by closing temp file before ffmpeg/moviepy reads it.
+    """
+    from moviepy import VideoFileClip, AudioFileClip
+
+    # pick a reasonable suffix (extension) so ffmpeg can infer format
+    suffix = os.path.splitext(getattr(file_obj, "name", ""))[-1] or ".media"
+
+    tmp_path = None
+    try:
+        # Write to a *closed* temp file path (delete=False) so ffmpeg can open it
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        os.close(fd)  # VERY IMPORTANT on Windows
+        file_obj.seek(0)
+        with open(tmp_path, "wb") as out:
+            # If file_obj is large, copy in chunks
+            chunk = file_obj.read(1024 * 1024)
+            while chunk:
+                out.write(chunk)
+                chunk = file_obj.read(1024 * 1024)
+
+        # Try as video first
+        with suppress(Exception):
+            with VideoFileClip(tmp_path) as clip:
+                if clip.duration:
+                    return float(clip.duration)
+
+        # Then as audio
+        with suppress(Exception):
+            with AudioFileClip(tmp_path) as clip:
+                if clip.duration:
+                    return float(clip.duration)
+
+        return 0.0
+    except Exception:
+        return 0.0
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            with suppress(Exception):
+                os.remove(tmp_path)

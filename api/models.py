@@ -42,6 +42,15 @@ class ReferenceDocument(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     
+    # ------------ RAGitify fields (persisted locally) ------------
+    rag_enabled = models.BooleanField(default=False)
+    rag_vector_store_id = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    rag_document_id = models.CharField(max_length=128, null=True, blank=True, db_index=True)
+    rag_status = models.CharField(max_length=50, null=True, blank=True)  # queued, processing, completed, failed
+    rag_uploaded_at = models.DateTimeField(null=True, blank=True)
+    rag_ingested_at = models.DateTimeField(null=True, blank=True)
+    rag_last_error = models.TextField(null=True, blank=True)
+    rag_metadata = models.JSONField(default=dict, blank=True)  # any extra response fields
     class Meta:
         db_table = "reference_documents"
         ordering = ['-created_at']
@@ -88,6 +97,10 @@ class AudioFile(models.Model):
     coverage = models.FloatField(null=True, blank=True)
     processing_session = models.CharField(max_length=100, default = '')
     reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_comparisons')
+    rag_document_match_status = models.CharField(max_length=32, null=True, blank=True)
+    rag_document_matches = models.JSONField(default=dict, blank=True)
+    rag_document_match_error = models.TextField(null=True, blank=True)
+    rag_document_match_updated_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)  # Fixed: was auto_now=True
     updated_at = models.DateTimeField(auto_now=True)
     
@@ -196,23 +209,18 @@ class AuditLog(models.Model):
         ('feedbackreview_delete', 'FeedbackReview Delete'), 
         ('userprofile_update', 'UserProfile Update'),
         ('userprofile_delete', 'UserProfile Delete'),
-        # ('session_status_update', 'Session Status Update'),
-        # ('session_update', 'Session Update'), 
-        # ('session_delete', 'Session Delete'), 
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
     timestamp = models.DateTimeField(auto_now_add=True)
-    # session = models.ForeignKey(Session, on_delete=models.SET_NULL, null=True, blank=True, related_name='audit_logs')
     object_id = models.IntegerField()
-    object_type = models.CharField(max_length=50)  # e.g., AudioFile, SOP, FeedbackReview
-    details = models.JSONField(default=dict)  # Additional context
+    object_type = models.CharField(max_length=50)
+    details = models.JSONField(default=dict)
 
     def __str__(self):
         return f"{self.action} by {self.user.username if self.user else 'Unknown'} at {self.timestamp}"
 
 class SpeakerProfile(models.Model):
-    """Stores a speaker voice embedding and optional assigned name."""
     name = models.CharField(max_length=255, null=True, blank=True)
     embedding = models.JSONField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -224,14 +232,59 @@ class SpeakerProfile(models.Model):
 class ProcessingSession(models.Model):
     """Track processing sessions for download tokens"""
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    reference_document = models.ForeignKey(ReferenceDocument, on_delete=models.CASCADE)
+    reference_document = models.ForeignKey(
+        ReferenceDocument,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     audio_file = models.ForeignKey(AudioFile, on_delete=models.CASCADE)
     matched_words = models.IntegerField(default=0)
     total_words = models.IntegerField(default=0)
     coverage = models.FloatField(default=0.0)
     processed_docx_path = models.CharField(max_length=500, null=True, blank=True)
+    processed_docx_with_diarization_path = models.CharField(max_length=500, null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()  # Set expiration for cleanup
     
     def __str__(self):
         return f"Session {self.id}"
+
+# --------- Per-user RAG token store ----------
+class RAGAccount(models.Model):
+    user = models.OneToOneField(UserProfile, on_delete=models.CASCADE, related_name="rag_account")
+    rag_email = models.EmailField(max_length=255, blank=True, null=True)
+    access_token = models.CharField(max_length=512, blank=True, null=True)
+    vector_store_id = models.CharField(max_length=128, blank=True, null=True, db_index=True)
+    document_match_assistant_id = models.CharField(max_length=128, blank=True, null=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+# --------- Optional local persistence for RAG conversational assets ---------
+class RAGAssistant(models.Model):
+    external_id = models.CharField(max_length=128, db_index=True, unique=True)
+    name = models.CharField(max_length=255)
+    model = models.CharField(max_length=128, blank=True, null=True)
+    vector_store_ids = models.JSONField(default=list, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class RAGThread(models.Model):
+    external_id = models.CharField(max_length=128, db_index=True, unique=True)
+    assistant_external_id = models.CharField(max_length=128, db_index=True, blank=True, null=True)
+    title = models.CharField(max_length=255, blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class RAGMessage(models.Model):
+    external_id = models.CharField(max_length=128, db_index=True, unique=True)
+    thread_external_id = models.CharField(max_length=128, db_index=True)
+    role = models.CharField(max_length=32)
+    content = models.TextField()
+    created_at = models.DateTimeField(auto_now_add=True)
+
+class RAGRun(models.Model):
+    external_id = models.CharField(max_length=128, db_index=True, unique=True)
+    thread_external_id = models.CharField(max_length=128, db_index=True)
+    assistant_external_id = models.CharField(max_length=128, db_index=True, blank=True, null=True)
+    status = models.CharField(max_length=32, default="queued")
+    raw = models.JSONField(default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)

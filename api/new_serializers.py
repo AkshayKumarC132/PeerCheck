@@ -1,29 +1,26 @@
 from rest_framework import serializers
-from django.core.files.uploadedfile import InMemoryUploadedFile, TemporaryUploadedFile
-from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile
-from .new_utils import allowed_file
-from django.conf import settings
 from django.core.exceptions import ObjectDoesNotExist
+from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, RAGAssistant, RAGThread, RAGMessage, RAGRun
+from .new_utils import allowed_file
+from peercheck import settings
 
 
 class UploadAndProcessSerializer(serializers.Serializer):
     """
     Serializer for the main processing endpoint.
-    Validates that either a new text file is uploaded or an existing document ID is provided.
+    Callers may upload a new reference document, reuse an existing one, or rely
+    entirely on automatic RAG matching by supplying only an audio file.
     """
-    # --- MODIFIED: text_file is no longer always required ---
     text_file = serializers.FileField(
-        help_text="Upload a new text document (PDF, DOCX, or TXT). Required if 'existing_document_id' is not provided.",
-        required=False # Changed from True
-    )
-    
-    # --- NEW: Field for existing document ID ---
-    existing_document_id = serializers.UUIDField(
-        help_text="ID of an existing reference document to use. Required if 'text_file' is not provided.",
+        help_text="Upload a new text document (PDF, DOCX, or TXT). Optional.",
         required=False
     )
 
-    # --- UNCHANGED: audio_file is always required ---
+    existing_document_id = serializers.UUIDField(
+        help_text="ID of an existing reference document to use. Optional.",
+        required=False
+    )
+
     audio_file = serializers.FileField(
         help_text="Upload an audio file (MP3, WAV, M4A, MPEG, MP4)",
         required=True
@@ -43,57 +40,34 @@ class UploadAndProcessSerializer(serializers.Serializer):
     )
 
     def validate(self, data):
-        """
-        Cross-field validation to ensure either text_file or existing_document_id is provided.
-        """
         text_file = data.get('text_file')
         doc_id = data.get('existing_document_id')
 
-        # Case 1: Neither is provided
-        if not text_file and not doc_id:
-            raise serializers.ValidationError(
-                "You must provide either a 'text_file' to upload or an 'existing_document_id' of a document to reuse."
-            )
-        
-        # Case 2: Both are provided
+        # Ensure the client does not upload a new document while also pointing to an existing one
         if text_file and doc_id:
-            raise serializers.ValidationError(
-                "Please provide either 'text_file' or 'existing_document_id', but not both."
-            )
-            
-        # Case 3: ID is provided, let's check if it's valid
+            raise serializers.ValidationError("Provide only one of 'text_file' or 'existing_document_id'.")
+
+        # If existing_document_id is provided, ensure the document exists
         if doc_id:
             try:
                 ReferenceDocument.objects.get(id=doc_id)
             except ObjectDoesNotExist:
-                raise serializers.ValidationError({
-                    "existing_document_id": f"No ReferenceDocument found with the ID '{doc_id}'."
-                })
+                raise serializers.ValidationError({"existing_document_id": f"No ReferenceDocument with ID '{doc_id}'."})
 
         return data
 
     def validate_text_file(self, value):
-        """Validate text file extension and size (unchanged)"""
         if not allowed_file(value.name, settings.ALLOWED_TEXT_EXTENSIONS):
-            raise serializers.ValidationError(
-                "Invalid file type. Please upload a PDF, DOCX, or TXT file."
-            )
+            raise serializers.ValidationError("Invalid file type. Upload PDF, DOCX, or TXT.")
         if value.size > 50 * 1024 * 1024:
-            raise serializers.ValidationError(
-                "File size too large. Maximum size is 50MB."
-            )
+            raise serializers.ValidationError("Max file size is 50MB.")
         return value
 
     def validate_audio_file(self, value):
-        """Validate audio file extension and size (unchanged)"""
         if not allowed_file(value.name, settings.ALLOWED_AUDIO_EXTENSIONS):
-            raise serializers.ValidationError(
-                "Invalid file type. Please upload an MP3, WAV, M4A, MPEG, or MP4 file."
-            )
+            raise serializers.ValidationError("Invalid audio type. Upload MP3, WAV, M4A, MPEG, or MP4.")
         if value.size > 100 * 1024 * 1024:
-            raise serializers.ValidationError(
-                "File size too large. Maximum size is 100MB."
-            )
+            raise serializers.ValidationError("Max audio size is 100MB.")
         return value
 
 
@@ -110,17 +84,16 @@ class ProcessingResultSerializer(serializers.Serializer):
     processing_time = serializers.FloatField(read_only=True, required=False)
 
 class DownloadRequestSerializer(serializers.Serializer):
-    session_id = serializers.CharField(
-        help_text="Processing session ID received from upload response"
-    )
+    session_id = serializers.CharField(help_text="Processing session ID received from upload response")
 
 class ReferenceDocumentDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReferenceDocument
-        fields = [
-            'id', 'name', 'document_type', 'original_filename',
-            'file_size', 'content_type', 'upload_status',
-            'created_at', 'updated_at'
+        fields = '__all__'  # or list specific fields
+        read_only_fields = [
+            'id', 'created_at', 'updated_at',  # typically system fields
+            'file_path', 'extracted_text',  # add any fields you want to be read-only
+            # add other fields as needed
         ]
 
 class AudioFileDetailSerializer(serializers.ModelSerializer):
@@ -149,10 +122,7 @@ class ProcessingSessionDetailSerializer(serializers.ModelSerializer):
         ]
 
 class CleanupRequestSerializer(serializers.Serializer):
-    force_cleanup = serializers.BooleanField(
-        default=False,
-        help_text="Force cleanup of all expired sessions"
-    )
+    force_cleanup = serializers.BooleanField(default=False, help_text="Force cleanup of all expired sessions")
 
 class CleanupResponseSerializer(serializers.Serializer):
     message = serializers.CharField(read_only=True)
@@ -165,61 +135,37 @@ class ErrorResponseSerializer(serializers.Serializer):
     timestamp = serializers.DateTimeField(read_only=True)
 
 class ReferenceDocumentSerializer(serializers.Serializer):
-    """
-    Serializer for the ReferenceDocument model.
-    Used to validate input and format the output.
-    """
-    file_path = serializers.FileField(
-        help_text="Upload a text document (PDF, DOCX, or TXT)",
-        required=True
-    )
-    document_type = serializers.ChoiceField(
-        choices=ReferenceDocument.DOCUMENT_TYPES,
-        default='sop',
-        required=False,
-        help_text="Type of the reference document"
-    )
-    document_name = serializers.CharField(
-        max_length=255,
-        required=False,
-        allow_blank=True,
-        help_text="Custom name for the document (optional)"
-    )
-    # class Meta:
-    #     model = ReferenceDocument
-    #     fields = [
-    #         'id', 
-    #         'name', 
-    #         'document_type', 
-    #         'file_path', 
-    #         'original_filename', 
-    #         'file_size', 
-    #         'content_type',
-    #         'upload_status', 
-    #         'uploaded_by', 
-    #         'created_at',
-    #         'extracted_text' # Included for response, but not for input
-    #     ]
-
+    file_path = serializers.FileField(required=True, help_text="Upload a text document (PDF, DOCX, or TXT)")
+    document_type = serializers.ChoiceField(choices=ReferenceDocument.DOCUMENT_TYPES, default='sop', required=False)
+    document_name = serializers.CharField(max_length=255, required=False, allow_blank=True)
 
 class RunDiarizationSerializer(serializers.Serializer):
     audio_id = serializers.UUIDField()
-
 
 class SpeakerProfileMappingSerializer(serializers.Serializer):
     audio_id = serializers.UUIDField()
     speaker_label = serializers.CharField(max_length=50)
     name = serializers.CharField(max_length=255)
     profile_id = serializers.IntegerField(required=False)
-    #     # These fields are set by the server, not provided by the client on upload.
-    #     read_only_fields = [
-    #         'id', 
-    #         'file_path', 
-    #         'original_filename', 
-    #         'file_size', 
-    #         'content_type', 
-    #         'upload_status',
-    #         'uploaded_by', 
-    #         'created_at', 
-    #         'extracted_text'
-    #     ]
+
+# --------- NEW: RAG conversational serializers (simple) ---------
+
+class RAGAssistantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RAGAssistant
+        fields = ['external_id','name','model','vector_store_ids','created_at']
+
+class RAGThreadSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RAGThread
+        fields = ['external_id','assistant_external_id','title','created_at']
+
+class RAGMessageSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RAGMessage
+        fields = ['external_id','thread_external_id','role','content','created_at']
+
+class RAGRunSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = RAGRun
+        fields = ['external_id','thread_external_id','assistant_external_id','status','raw','created_at']
