@@ -963,7 +963,6 @@ class GetUserDocumentsView(GenericAPIView):
             user_profile = UserProfile.objects.get(**{UserProfile.USERNAME_FIELD: getattr(user, UserProfile.USERNAME_FIELD)})
             
             documents = ReferenceDocument.objects.filter(uploaded_by=user_profile)
-            print("Documents", documents)
             audio_files = AudioFile.objects.filter(user=user_profile)
             
             response_data = {

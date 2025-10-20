@@ -27,6 +27,22 @@ import docx.oxml
 import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
+# Add at top (after existing ML imports like whisper/pyannote)
+from sentence_transformers import SentenceTransformer
+import torch  # If not present, add to requirements
+
+# Lazy global model (thread-safe)
+_SENTENCE_MODEL = None
+_MODEL_LOCK = threading.Lock()
+
+def _get_sentence_model():
+    global _SENTENCE_MODEL
+    if _SENTENCE_MODEL is None:
+        with _MODEL_LOCK:
+            if _SENTENCE_MODEL is None:
+                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+    return _SENTENCE_MODEL
+
 from docx.enum.text import WD_COLOR_INDEX
 from docx.shared import RGBColor
 import fitz  # PyMuPDF
@@ -1181,6 +1197,16 @@ def build_three_part_communication_summary(
     if reference_text:
         reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
         normalized_reference = [normalize_line(ln) for ln in reference_lines]
+        
+    # Pre-encode references for semantic similarity (once per call)
+    model = _get_sentence_model()
+    ref_embeddings = None
+    if reference_lines and len(reference_lines) > 0:
+        try:
+            ref_embeddings = model.encode(reference_lines)  # Full text for semantics; (num_refs, 384)
+        except Exception as e:
+            logging.warning(f"Embedding pre-encode failed: {e}; fallback to fuzzy")
+            ref_embeddings = None  # Triggers fuzzy fallback below
 
     used_reference_indices: Set[int] = set()
     summary_entries: List[Dict[str, Any]] = []
@@ -1191,24 +1217,64 @@ def build_three_part_communication_summary(
         best_idx: Optional[int] = None
         best_score = 0.0
 
+        # Semantic similarity computation (replaces fuzzy loop)
+        best_score = 0.0
+        best_idx = None
         if normalized_spoken and normalized_reference:
-            for idx, ref_norm in enumerate(normalized_reference):
-                if not ref_norm:
-                    continue
-                score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
-                if score > best_score:
-                    best_score = score
-                    best_idx = idx
+            if ref_embeddings is not None:
+                try:
+                    spoken_embedding = model.encode([spoken_text])  # Full spoken_text for intent
+                    similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]  # (num_refs,)
+                    best_idx = int(similarities.argmax())
+                    best_score = float(similarities[best_idx])
+                    logging.debug(f"Semantic score: {best_score:.2f} for '{spoken_text[:50]}...'")  # Optional debug
+                except Exception as e:
+                    logging.warning(f"Semantic compute failed: {e}; fallback to fuzzy")
+                    # Fallback fuzzy loop
+                    for idx, ref_norm in enumerate(normalized_reference):
+                        if not ref_norm:
+                            continue
+                        score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+                        if score > best_score:
+                            best_score = score
+                            best_idx = idx
+            else:
+                # No embeds: full fuzzy fallback
+                for idx, ref_norm in enumerate(normalized_reference):
+                    if not ref_norm:
+                        continue
+                    score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+                    if score > best_score:
+                        best_score = score
+                        best_idx = idx
 
-        status = "correct" if (spoken_text and not normalized_reference) else "mismatch"
+        # ANCHOR: Status computation start
         matched_reference = None
-        if spoken_text:
-            if best_idx is not None and best_score >= match_threshold:
-                status = "correct"
-                matched_reference = reference_lines[best_idx]
-                used_reference_indices.add(best_idx)
-        else:
-            status = "unspoken"
+        partial_threshold = 0.3
+        short_word_threshold = 4
+        word_count = len(spoken_text.split()) if spoken_text else 0
+        is_short = word_count < short_word_threshold
+
+        if not normalized_reference:  # No reference text
+            if spoken_text:
+                status = "general conversation" if is_short else "match"
+            else:
+                status = "unspoken"
+        else:  # Has reference text
+            if spoken_text:
+                if best_idx is not None and best_score >= 0.5:  # Tighter semantic threshold (cosine 0-1)
+                    status = "match"
+                    matched_reference = reference_lines[best_idx]
+                    used_reference_indices.add(best_idx)
+                elif is_short:  # Prioritize shortness for chit-chat after ruling out full match
+                    status = "general conversation"
+                elif best_score >= partial_threshold:
+                    status = "partial match"
+                    matched_reference = reference_lines[best_idx] if best_idx else None
+                else:
+                    status = "mismatch"
+            else:
+                status = "unspoken"
 
         summary_entries.append(
             {
@@ -1277,9 +1343,11 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         cell.text = title
 
     status_colors = {
-        "correct": RGBColor(0, 128, 0),
-        "mismatch": RGBColor(192, 0, 0),
-        "unspoken": RGBColor(128, 128, 128),
+        "match": RGBColor(0, 128, 0),  # Green
+        "partial match": RGBColor(255, 165, 0),  # Orange
+        "general conversation": RGBColor(0, 0, 255),  # Blue
+        "mismatch": RGBColor(192, 0, 0),  # Red (retained for substantive off-topic)
+        "unspoken": RGBColor(128, 128, 128),  # Gray
     }
 
     for entry in entries:
@@ -1320,9 +1388,11 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
         headers = ["Speaker", "Start", "End", "Content", "Status"]
         status_colors = {
-            "correct": (0, 0.5, 0),
-            "mismatch": (0.75, 0, 0),
-            "unspoken": (0.3, 0.3, 0.3),
+            "match": (0, 0.5, 0),  # Green
+            "partial match": (1, 0.65, 0),  # Orange
+            "general conversation": (0, 0, 0.8),  # Blue
+            "mismatch": (0.75, 0, 0),  # Red (retained)
+            "unspoken": (0.3, 0.3, 0.3),  # Gray
         }
 
         def _new_page(include_header: bool = True):
