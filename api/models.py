@@ -204,6 +204,7 @@ class AuditLog(models.Model):
         ('audio_upload', 'Audio Upload'),
         ('audio_process', 'Audio Process'),
         ('audio_download', 'Audio Download'),
+        ('audiofile_update', 'AudioFile Update'),
         ('feedback_submit', 'Feedback Submit'),
         ('sop_create', 'SOP Create'),
         ('sop_update', 'SOP Update'),
@@ -219,10 +220,13 @@ class AuditLog(models.Model):
         ('document_upload', 'Document Upload'),
         ('document_download', 'Document Download'),
         ('document_update', 'Document Update'),
+        ('document_delete', 'Document Delete'),
         ('diarization_start', 'Diarization Start'),
         ('diarization_complete', 'Diarization Complete'),
         ('diarization_failed', 'Diarization Failed'),
+        ('speaker_profile_create', 'Speaker Profile Create'),
         ('speaker_profile_update', 'Speaker Profile Update'),
+        ('speaker_profile_delete', 'Speaker Profile Delete'),
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
