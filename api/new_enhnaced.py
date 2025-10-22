@@ -80,18 +80,54 @@ def _bg(target, *args, **kwargs):
     t.start()
     return t
 
-def _start_diarization_thread(audio_file_id, audio_source, transcript_segments, transcript_words):
+def _start_diarization_thread(
+    audio_file_id,
+    audio_source,
+    transcript_segments,
+    transcript_words,
+    initiated_by_user_id=None,
+    source="UploadAndProcessView",
+):
     """Kick off background diarization work for the given audio file."""
+
+    AudioFile.objects.filter(id=audio_file_id).update(diarization_status='processing')
+    AuditLog.objects.create(
+        action='diarization_start',
+        user_id=initiated_by_user_id,
+        object_id=str(audio_file_id),
+        object_type='AudioFile',
+        details={'source': source},
+    )
 
     def _run_diarization():
         close_old_connections()
         try:
             segments = diarization_from_audio(audio_source, transcript_segments, transcript_words)
             payload = {"segments": segments, "speakers": build_speaker_summary(segments)}
-            AudioFile.objects.filter(id=audio_file_id).update(diarization=payload)
-        except Exception:
+            AudioFile.objects.filter(id=audio_file_id).update(
+                diarization=payload,
+                diarization_status='completed',
+            )
+            AuditLog.objects.create(
+                action='diarization_complete',
+                user_id=initiated_by_user_id,
+                object_id=str(audio_file_id),
+                object_type='AudioFile',
+                details={'source': source, 'segments': len(segments)},
+            )
+        except Exception as exc:
             logger.exception("Failed to complete diarization for audio %s", audio_file_id)
-            AudioFile.objects.filter(id=audio_file_id).update(diarization=None)
+            AudioFile.objects.filter(id=audio_file_id).update(
+                diarization=None,
+                diarization_status='failed',
+            )
+            AuditLog.objects.create(
+                action='diarization_failed',
+                user_id=initiated_by_user_id,
+                object_id=str(audio_file_id),
+                object_type='AudioFile',
+                details={'source': source, 'error': str(exc)},
+            )
 
     thread = threading.Thread(target=_run_diarization, daemon=True)
     thread.start()
@@ -192,6 +228,18 @@ class UploadAndProcessView(CreateAPIView):
                 reference_doc.extracted_text = text_content
                 reference_doc.upload_status = 'processed'
                 reference_doc.save(update_fields=['extracted_text', 'upload_status'])
+                AuditLog.objects.create(
+                    action='document_upload',
+                    user=user_profile,
+                    object_id=str(reference_doc.id),
+                    object_type='ReferenceDocument',
+                    details={
+                        'document_type': reference_doc.document_type,
+                        'original_filename': reference_doc.original_filename,
+                        'file_size': reference_doc.file_size,
+                        'source': 'UploadAndProcessView',
+                    },
+                )
 
             elif existing_document_id:
                 try:
@@ -267,6 +315,17 @@ class UploadAndProcessView(CreateAPIView):
                 status='processing',
                 duration=audio_duration,
             )
+            AuditLog.objects.create(
+                action='audio_upload',
+                user=user_profile,
+                object_id=str(audio_obj.id),
+                object_type='AudioFile',
+                details={
+                    'original_filename': audio_obj.original_filename,
+                    'reference_document_id': str(reference_doc.id) if reference_doc else None,
+                    'source': 'UploadAndProcessView',
+                },
+            )
 
             # Transcribe audio
             try:
@@ -294,7 +353,15 @@ class UploadAndProcessView(CreateAPIView):
             # Speaker diarization
             audio_obj.diarization = None
             audio_obj.save(update_fields=['diarization'])
-            _start_diarization_thread(audio_obj.id, audio_s3_url, transcript_segments, transcript_words)
+            _start_diarization_thread(
+                audio_obj.id,
+                audio_s3_url,
+                transcript_segments,
+                transcript_words,
+                initiated_by_user_id=user_profile.id,
+                source='UploadAndProcessView',
+            )
+            audio_obj.diarization_status = 'processing'
             
             matched_html = ''
             missing_html = ''
@@ -312,6 +379,17 @@ class UploadAndProcessView(CreateAPIView):
 
             audio_obj.status = 'processed'
             audio_obj.save()
+            AuditLog.objects.create(
+                action='audio_process',
+                user=user_profile,
+                object_id=str(audio_obj.id),
+                object_type='AudioFile',
+                details={
+                    'status': audio_obj.status,
+                    'coverage': coverage,
+                    'reference_document_id': str(reference_doc.id) if reference_doc else None,
+                },
+            )
 
             # Kick off asynchronous document matching with RAGitify
             schedule_document_match(audio_obj)
@@ -343,16 +421,24 @@ class UploadAndProcessView(CreateAPIView):
                 'processing_time': round(processing_time, 2),
                 'diarization': None,
                 'diarization_error': None,
-                'diarization_status': 'processing',
+                'diarization_status': audio_obj.diarization_status,
             }, status=status.HTTP_200_OK)
-            
+
         except Exception as e:
             if reference_doc:
                 reference_doc.upload_status = 'failed'
                 reference_doc.save()
             if audio_obj:
                 audio_obj.status = 'failed'
-                audio_obj.save()
+                audio_obj.diarization_status = 'failed'
+                audio_obj.save(update_fields=['status', 'diarization_status'])
+                AuditLog.objects.create(
+                    action='diarization_failed',
+                    user=user_profile,
+                    object_id=str(audio_obj.id),
+                    object_type='AudioFile',
+                    details={'source': 'UploadAndProcessView', 'error': str(e)},
+                )
             logger.exception("UploadAndProcessView failed")
             return Response({'error': f'Processing failed: {str(e)}','timestamp': timezone.now().isoformat()}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
@@ -370,6 +456,8 @@ class RunDiarizationView(CreateAPIView):
                 'error': auth_result['error'],
                 'timestamp': timezone.now(),
             }, status=status.HTTP_401_UNAUTHORIZED)
+
+        user = auth_result['user']
 
         serializer = self.serializer_class(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -395,11 +483,16 @@ class RunDiarizationView(CreateAPIView):
             audio_file.file_path,
             transcript_segments,
             transcript_words,
+            initiated_by_user_id=user.id,
+            source='RunDiarizationView',
         )
+        audio_file.diarization_status = 'processing'
+        audio_file.save(update_fields=['diarization_status'])
 
         return Response({
             'audio_file_id': str(audio_file.id),
             'status': 'processing',
+            'diarization_status': audio_file.diarization_status,
         }, status=status.HTTP_202_ACCEPTED)
 
 
@@ -523,6 +616,17 @@ class SpeakerProfileMappingView(CreateAPIView):
         }
         audio_file.diarization = diarization_payload
         audio_file.save(update_fields=['diarization'])
+        AuditLog.objects.create(
+            action='speaker_profile_update',
+            user=user,
+            object_id=str(profile.id),
+            object_type='SpeakerProfile',
+            details={
+                'audio_file_id': str(audio_file.id),
+                'speaker_label': speaker_label,
+                'profile_name': profile.name,
+            },
+        )
 
         return Response({
             'audio_file_id': str(audio_file.id),
@@ -713,6 +817,19 @@ class DownloadProcessedDocumentView(GenericAPIView):
             # Save the S3 link to AudioFile.report_path
             audio_file.report_path = processed_s3_url
             audio_file.save()
+
+            AuditLog.objects.create(
+                action='document_download',
+                user=user,
+                object_id=str(reference_doc.id) if reference_doc else str(session.id),
+                object_type='ReferenceDocument' if reference_doc else 'ProcessingSession',
+                details={
+                    'session_id': str(session.id),
+                    'audio_file_id': str(audio_file.id),
+                    'with_diarization': False,
+                    'source': 'DownloadProcessedDocumentView',
+                },
+            )
 
             # Direct file download
             return Response({
@@ -919,6 +1036,19 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                 'filename': f"{reference_doc.original_filename.rsplit('.', 1)[0]}_processed_diarization.pdf",
                 'three_pc_entries': three_pc_entries,
             }
+
+            AuditLog.objects.create(
+                action='document_download',
+                user=user,
+                object_id=str(reference_doc.id) if reference_doc else str(session.id),
+                object_type='ReferenceDocument' if reference_doc else 'ProcessingSession',
+                details={
+                    'session_id': str(session.id),
+                    'audio_file_id': str(audio_file.id),
+                    'with_diarization': True,
+                    'source': 'DownloadProcessedDocumentWithDiarizationView',
+                },
+            )
 
             return Response(response_payload, status=status.HTTP_200_OK)
 
@@ -1145,6 +1275,18 @@ class UploadReferenceDocumentView(CreateAPIView):
         ref.extracted_text = text_content
         ref.upload_status = 'processed'
         ref.save()
+        AuditLog.objects.create(
+            action='document_upload',
+            user=user,
+            object_id=str(ref.id),
+            object_type='ReferenceDocument',
+            details={
+                'document_type': ref.document_type,
+                'original_filename': ref.original_filename,
+                'file_size': ref.file_size,
+                'source': 'UploadReferenceDocumentView',
+            },
+        )
 
         # ---- RAG ingestion (aligned to RAGitify payloads) ----
         if rag_feature_enabled():

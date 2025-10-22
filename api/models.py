@@ -87,6 +87,11 @@ class AudioFile(models.Model):
     original_filename = models.CharField(max_length=255, null=True, blank=True)
     transcription = models.JSONField(null=True, blank=True)
     status = models.CharField(max_length=50, default="pending")  # pending, processing, processed, failed
+    diarization_status = models.CharField(
+        max_length=32,
+        default="pending",
+        help_text="Tracks diarization lifecycle: pending, processing, completed, failed",
+    )
     keywords_detected = models.TextField(null=True, blank=True)
     duration = models.FloatField(null=True, blank=True)  # Duration in seconds
     sop = models.ForeignKey(SOP, on_delete=models.SET_NULL, null=True, blank=True, related_name='audio_files')
@@ -197,23 +202,32 @@ class SystemSettings(models.Model):
 class AuditLog(models.Model):
     ACTION_CHOICES = (
         ('audio_upload', 'Audio Upload'),
+        ('audio_process', 'Audio Process'),
+        ('audio_download', 'Audio Download'),
         ('feedback_submit', 'Feedback Submit'),
         ('sop_create', 'SOP Create'),
         ('sop_update', 'SOP Update'),
-        ('sop_delete', 'SOP Delete'), 
+        ('sop_delete', 'SOP Delete'),
         ('audiofile_delete', 'AudioFile Delete'),
         ('feedback_update', 'Feedback Update'),
         ('feedback_delete', 'Feedback Delete'),
         ('review_submit', 'Review Submit'),
-        ('feedbackreview_update', 'FeedbackReview Update'), 
-        ('feedbackreview_delete', 'FeedbackReview Delete'), 
+        ('feedbackreview_update', 'FeedbackReview Update'),
+        ('feedbackreview_delete', 'FeedbackReview Delete'),
         ('userprofile_update', 'UserProfile Update'),
         ('userprofile_delete', 'UserProfile Delete'),
+        ('document_upload', 'Document Upload'),
+        ('document_download', 'Document Download'),
+        ('document_update', 'Document Update'),
+        ('diarization_start', 'Diarization Start'),
+        ('diarization_complete', 'Diarization Complete'),
+        ('diarization_failed', 'Diarization Failed'),
+        ('speaker_profile_update', 'Speaker Profile Update'),
     )
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
     user = models.ForeignKey(UserProfile, on_delete=models.SET_NULL, null=True, related_name='audit_logs')
     timestamp = models.DateTimeField(auto_now_add=True)
-    object_id = models.IntegerField()
+    object_id = models.CharField(max_length=255)
     object_type = models.CharField(max_length=50)
     details = models.JSONField(default=dict)
 

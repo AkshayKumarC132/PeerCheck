@@ -82,6 +82,7 @@ class ProcessingResultSerializer(serializers.Serializer):
     missing_content = serializers.CharField(read_only=True)
     entire_document = serializers.CharField(read_only=True)
     processing_time = serializers.FloatField(read_only=True, required=False)
+    diarization_status = serializers.CharField(read_only=True, required=False)
 
 class DownloadRequestSerializer(serializers.Serializer):
     session_id = serializers.CharField(help_text="Processing session ID received from upload response")
@@ -100,7 +101,7 @@ class AudioFileDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = AudioFile
         fields = [
-            'id', 'original_filename', 'status', 'duration',
+            'id', 'original_filename', 'status', 'diarization_status', 'duration',
             'coverage', 'created_at', 'updated_at'
         ]
 
