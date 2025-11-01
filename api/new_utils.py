@@ -25,7 +25,7 @@ from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from sentence_transformers import SentenceTransformer, util
 # Add at top (after existing ML imports like whisper/pyannote)
 from sentence_transformers import SentenceTransformer
@@ -1208,29 +1208,235 @@ def build_three_part_communication_summary(
             logging.warning(f"Embedding pre-encode failed: {e}; fallback to fuzzy")
             ref_embeddings = None  # Triggers fuzzy fallback below
 
-    used_reference_indices: Set[int] = set()
-    summary_entries: List[Dict[str, Any]] = []
+    partial_threshold = 0.3
+    match_threshold = 0.5
+    short_word_threshold = 4
 
-    for segment in segments:
+    def _speaker_identifier(segment: Dict[str, Any]) -> str:
+        return (
+            segment.get("speaker_name")
+            or segment.get("speaker_label")
+            or segment.get("speaker")
+            or "Unknown"
+        )
+
+    def _infer_role(name: Optional[str]) -> str:
+        if not name:
+            return "other"
+        lower = name.lower()
+        if "sender" in lower:
+            return "sender"
+        if "receiver" in lower:
+            return "receiver"
+        if "document" in lower:
+            return "document"
+        return "other"
+
+    def _combine_consecutive_segments(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        def _safe_float(value: Any) -> Optional[float]:
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return None
+
+        sorted_items = sorted(
+            items,
+            key=lambda seg: (
+                seg.get("sequence_index", float("inf")),
+                0 if _safe_float(seg.get("start")) is not None else 1,
+                _safe_float(seg.get("start")) or 0.0,
+            ),
+        )
+
+        combined: List[Dict[str, Any]] = []
+        for seg in sorted_items:
+            speaker_id = seg.get("speaker_id")
+            seg_sequence = seg.get("sequence_index")
+            if (
+                combined
+                and speaker_id
+                and speaker_id == combined[-1].get("speaker_id")
+                and seg_sequence is not None
+                and combined[-1].get("last_sequence_index") is not None
+                and seg_sequence == combined[-1].get("last_sequence_index") + 1
+            ):
+                existing_end = combined[-1].get("end")
+                new_end = seg.get("end")
+                existing_end_val = _safe_float(existing_end)
+                new_end_val = _safe_float(new_end)
+                if new_end_val is not None and (
+                    existing_end_val is None or new_end_val > existing_end_val
+                ):
+                    combined[-1]["end"] = new_end
+                combined[-1]["text"] = (
+                    f"{combined[-1]['text']} {seg['text']}".strip()
+                    if seg.get("text")
+                    else combined[-1]["text"]
+                )
+                combined[-1]["normalized_text"] = normalize_line(
+                    combined[-1]["text"]
+                )
+                combined[-1]["best_score"] = max(
+                    combined[-1].get("best_score", 0.0), seg.get("best_score", 0.0)
+                )
+                combined[-1].setdefault("segments", []).append(seg)
+                combined[-1]["last_sequence_index"] = seg_sequence
+                continue
+
+            new_seg = dict(seg)
+            new_seg["text"] = seg.get("text") or ""
+            new_seg["segments"] = [seg]
+            new_seg["normalized_text"] = normalize_line(seg.get("text") or "")
+            new_seg["last_sequence_index"] = seg_sequence
+            combined.append(new_seg)
+
+        return combined
+
+    def _cosine_similarity(vec_a: Optional[np.ndarray], vec_b: Optional[np.ndarray]) -> float:
+        if vec_a is None or vec_b is None:
+            return 0.0
+        denom = float(np.linalg.norm(vec_a) * np.linalg.norm(vec_b))
+        if denom == 0.0:
+            return 0.0
+        return float(np.dot(vec_a, vec_b) / denom)
+
+    embedding_cache: Dict[str, Optional[np.ndarray]] = {}
+
+    def _embedding_for_text(text: Optional[str]) -> Optional[np.ndarray]:
+        if not text or model is None:
+            return None
+        cached = embedding_cache.get(text)
+        if cached is not None:
+            return cached
+        try:
+            embedding = model.encode([text])[0]
+        except Exception as exc:  # pragma: no cover - encoding fallback
+            logging.warning("Embedding compute failed for '%s': %s", text[:40], exc)
+            embedding = None
+        embedding_cache[text] = embedding
+        return embedding
+
+    def _similarity_to_reference(text: str, ref_idx: int, normalized_text: Optional[str] = None) -> float:
+        if not text or ref_idx is None or ref_idx < 0 or ref_idx >= len(reference_lines):
+            return 0.0
+        if ref_embeddings is not None:
+            embedding = _embedding_for_text(text)
+            if embedding is not None:
+                ref_vec = ref_embeddings[ref_idx]
+                return _cosine_similarity(embedding, ref_vec)
+        ref_norm = normalized_reference[ref_idx] if ref_idx < len(normalized_reference) else ""
+        norm_text = normalized_text or normalize_line(text)
+        if ref_norm and norm_text:
+            return fuzz.token_set_ratio(norm_text, ref_norm) / 100.0
+        return 0.0
+
+    def _similarity_between_texts(text_a: str, text_b: str) -> float:
+        if not text_a or not text_b:
+            return 0.0
+        emb_a = _embedding_for_text(text_a)
+        emb_b = _embedding_for_text(text_b)
+        if emb_a is not None and emb_b is not None:
+            return _cosine_similarity(emb_a, emb_b)
+        norm_a = normalize_line(text_a)
+        norm_b = normalize_line(text_b)
+        if norm_a and norm_b:
+            return fuzz.token_set_ratio(norm_a, norm_b) / 100.0
+        return 0.0
+
+    def _determine_status(
+        role: str,
+        text: str,
+        doc_similarity: float,
+        sender_similarity: float,
+    ) -> str:
+        if not text:
+            return "unspoken"
+
+        word_count = len(text.split())
+        is_short = word_count < short_word_threshold
+        best_similarity = max(doc_similarity, sender_similarity)
+
+        if role == "sender":
+            if doc_similarity >= match_threshold:
+                return "match"
+            if doc_similarity >= partial_threshold:
+                return "partial match"
+            return "general conversation" if is_short else "mismatch"
+
+        if role == "receiver":
+            if best_similarity >= match_threshold:
+                return "match"
+            if best_similarity >= partial_threshold:
+                return "partial match"
+            return "general conversation" if is_short else "mismatch"
+
+        if doc_similarity >= match_threshold:
+            return "match"
+        if doc_similarity >= partial_threshold:
+            return "partial match"
+        return "general conversation" if is_short else "mismatch"
+
+    if not normalized_reference:
+        summary_entries: List[Dict[str, Any]] = []
+        for segment in segments:
+            spoken_text = (segment.get("text") or "").strip()
+            speaker_name = _speaker_identifier(segment)
+            word_count = len(spoken_text.split()) if spoken_text else 0
+            is_short = word_count < short_word_threshold
+            if spoken_text:
+                status = "general conversation" if is_short else "match"
+            else:
+                status = "unspoken"
+            summary_entries.append(
+                {
+                    "speaker": speaker_name,
+                    "start": segment.get("start"),
+                    "end": segment.get("end"),
+                    "content": spoken_text,
+                    "status": status,
+                    "reference": None,
+                    "similarity": 1.0 if status == "match" else 0.0,
+                }
+            )
+
+        def _sort_key_no_ref(entry: Dict[str, Any]):
+            start = entry.get("start")
+            try:
+                start_val = float(start) if start is not None else None
+            except (TypeError, ValueError):
+                start_val = None
+            return (0 if start_val is not None else 1, start_val or 0.0, entry.get("speaker") or "")
+
+        summary_entries.sort(key=_sort_key_no_ref)
+        if len(summary_entries) > max_entries:
+            summary_entries = summary_entries[:max_entries]
+        return summary_entries
+
+    bucket_segments: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+    general_segments: List[Dict[str, Any]] = []
+
+    for sequence_index, segment in enumerate(segments):
         spoken_text = (segment.get("text") or "").strip()
         normalized_spoken = normalize_line(spoken_text) if spoken_text else ""
         best_idx: Optional[int] = None
         best_score = 0.0
 
-        # Semantic similarity computation (replaces fuzzy loop)
-        best_score = 0.0
-        best_idx = None
         if normalized_spoken and normalized_reference:
             if ref_embeddings is not None:
                 try:
-                    spoken_embedding = model.encode([spoken_text])  # Full spoken_text for intent
-                    similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]  # (num_refs,)
-                    best_idx = int(similarities.argmax())
+                    spoken_embedding = model.encode([spoken_text])
+                    similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]
+                    if hasattr(similarities, "cpu"):
+                        similarities = similarities.cpu().numpy()
+                    best_idx = int(np.argmax(similarities))
                     best_score = float(similarities[best_idx])
-                    logging.debug(f"Semantic score: {best_score:.2f} for '{spoken_text[:50]}...'")  # Optional debug
-                except Exception as e:
-                    logging.warning(f"Semantic compute failed: {e}; fallback to fuzzy")
-                    # Fallback fuzzy loop
+                    logging.debug(
+                        "Semantic score: %.2f for '%s'",
+                        best_score,
+                        spoken_text[:50],
+                    )
+                except Exception as e:  # pragma: no cover - fallback path
+                    logging.warning("Semantic compute failed: %s", e)
                     for idx, ref_norm in enumerate(normalized_reference):
                         if not ref_norm:
                             continue
@@ -1239,7 +1445,6 @@ def build_three_part_communication_summary(
                             best_score = score
                             best_idx = idx
             else:
-                # No embeds: full fuzzy fallback
                 for idx, ref_norm in enumerate(normalized_reference):
                     if not ref_norm:
                         continue
@@ -1248,62 +1453,99 @@ def build_three_part_communication_summary(
                         best_score = score
                         best_idx = idx
 
-        # ANCHOR: Status computation start
-        matched_reference = None
-        partial_threshold = 0.3
-        short_word_threshold = 4
-        word_count = len(spoken_text.split()) if spoken_text else 0
-        is_short = word_count < short_word_threshold
+        segment_record = {
+            "speaker": segment.get("speaker"),
+            "speaker_label": segment.get("speaker_label"),
+            "speaker_name": segment.get("speaker_name"),
+            "speaker_id": _speaker_identifier(segment),
+            "role": _infer_role(
+                segment.get("speaker_name") or segment.get("speaker") or segment.get("speaker_label")
+            ),
+            "start": segment.get("start"),
+            "end": segment.get("end"),
+            "text": spoken_text,
+            "normalized_text": normalized_spoken,
+            "best_idx": best_idx,
+            "best_score": best_score,
+            "sequence_index": sequence_index,
+        }
 
-        if not normalized_reference:  # No reference text
-            if spoken_text:
-                status = "general conversation" if is_short else "match"
-            else:
-                status = "unspoken"
-        else:  # Has reference text
-            if spoken_text:
-                if best_idx is not None and best_score >= 0.5:  # Tighter semantic threshold (cosine 0-1)
-                    status = "match"
-                    matched_reference = reference_lines[best_idx]
-                    used_reference_indices.add(best_idx)
-                elif is_short:  # Prioritize shortness for chit-chat after ruling out full match
-                    status = "general conversation"
-                elif best_score >= partial_threshold:
-                    status = "partial match"
-                    matched_reference = reference_lines[best_idx] if best_idx else None
-                else:
-                    status = "mismatch"
-            else:
-                status = "unspoken"
+        if best_idx is not None and best_score >= partial_threshold:
+            bucket_segments[best_idx].append(segment_record)
+        else:
+            general_segments.append(segment_record)
 
-        summary_entries.append(
-            {
-                "speaker": segment.get("speaker_name")
-                or segment.get("speaker_label")
-                or segment.get("speaker")
-                or "Unknown",
-                "start": segment.get("start"),
-                "end": segment.get("end"),
-                "content": spoken_text or matched_reference or "",
-                "status": status,
-                "reference": matched_reference,
-                "similarity": round(best_score, 2),
-            }
-        )
+    summary_entries: List[Dict[str, Any]] = []
 
-    if normalized_reference and not segments:
-        for idx, line in enumerate(reference_lines):
-            if idx in used_reference_indices:
-                continue
+    for idx, doc_text in enumerate(reference_lines):
+        bucket_items = bucket_segments.get(idx, [])
+        if not bucket_items:
             summary_entries.append(
                 {
                     "speaker": "Not Spoken",
                     "start": None,
                     "end": None,
-                    "content": line,
+                    "content": doc_text,
                     "status": "unspoken",
-                    "reference": line,
+                    "reference": doc_text,
                     "similarity": 0.0,
+                    "bucket_index": idx,
+                    "bucket_document_segment": doc_text,
+                }
+            )
+            continue
+
+        combined_items = _combine_consecutive_segments(bucket_items)
+        sender_text = " ".join(
+            item.get("text") or "" for item in combined_items if item.get("role") == "sender"
+        ).strip()
+
+        for item in combined_items:
+            text = item.get("text") or ""
+            normalized_text = item.get("normalized_text") or normalize_line(text)
+            doc_similarity = _similarity_to_reference(text, idx, normalized_text)
+            sender_similarity = 0.0
+            if item.get("role") == "receiver" and sender_text:
+                sender_similarity = _similarity_between_texts(text, sender_text)
+
+            status = _determine_status(item.get("role", "other"), text, doc_similarity, sender_similarity)
+            summary_entries.append(
+                {
+                    "speaker": item.get("speaker_id") or "Unknown",
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "content": text,
+                    "status": status,
+                    "reference": doc_text,
+                    "similarity": round(max(doc_similarity, sender_similarity), 2),
+                    "similarity_to_reference": round(doc_similarity, 2),
+                    "similarity_to_sender": round(sender_similarity, 2),
+                    "bucket_index": idx,
+                    "bucket_document_segment": doc_text,
+                }
+            )
+
+    if general_segments:
+        combined_general = _combine_consecutive_segments(general_segments)
+        for item in combined_general:
+            text = item.get("text") or ""
+            reference = None
+            if (
+                item.get("best_idx") is not None
+                and 0 <= item["best_idx"] < len(reference_lines)
+            ):
+                reference = reference_lines[item["best_idx"]]
+            summary_entries.append(
+                {
+                    "speaker": item.get("speaker_id") or "Unknown",
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "content": text,
+                    "status": "general conversation",
+                    "reference": reference,
+                    "similarity": round(item.get("best_score", 0.0), 2),
+                    "bucket_index": None,
+                    "bucket_document_segment": reference,
                 }
             )
 
@@ -1313,7 +1555,16 @@ def build_three_part_communication_summary(
             start_val = float(start) if start is not None else None
         except (TypeError, ValueError):
             start_val = None
-        return (0 if start_val is not None else 1, start_val or 0.0, entry.get("speaker") or "")
+        bucket_index = entry.get("bucket_index")
+        bucket_index_value = (
+            bucket_index if isinstance(bucket_index, (int, float)) else float("inf")
+        )
+        return (
+            0 if start_val is not None else 1,
+            start_val if start_val is not None else 0.0,
+            bucket_index_value,
+            entry.get("speaker") or "",
+        )
 
     summary_entries.sort(key=_sort_key)
 
