@@ -1290,6 +1290,20 @@ def build_three_part_communication_summary(
                 existing_end_val is None or new_end_val > existing_end_val
             ):
                 target["end"] = new_end
+            existing_start_val = _safe_float(target.get("start"))
+            new_start_val = _safe_float(source.get("start"))
+            if new_start_val is not None and (
+                existing_start_val is None or new_start_val < existing_start_val
+            ):
+                target["start"] = source.get("start")
+                if target.get("speaker_box"):
+                    target["speaker_box"]["start"] = target.get("start")
+                    seq_start = target["speaker_box"].get("sequence_start")
+                    new_seq = source.get("sequence_index")
+                    if new_seq is not None and (
+                        seq_start is None or new_seq < seq_start
+                    ):
+                        target["speaker_box"]["sequence_start"] = new_seq
             if source.get("text"):
                 target["text"] = f"{target['text']} {source['text']}".strip()
             target["normalized_text"] = normalize_line(target.get("text") or "")
@@ -1298,6 +1312,27 @@ def build_three_part_communication_summary(
             )
             target.setdefault("segments", []).append(source)
             target["last_sequence_index"] = source.get("sequence_index")
+            if target.get("speaker_box"):
+                target["speaker_box"]["end"] = target.get("end")
+                target["speaker_box"]["segment_count"] = (
+                    target["speaker_box"].get("segment_count", 1) + 1
+                )
+                target["speaker_box"]["sequence_end"] = source.get("sequence_index")
+
+        def _snapshot_box(entry: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            box = entry.get("speaker_box")
+            if not box:
+                return None
+            return {
+                "id": box.get("id"),
+                "speaker": box.get("speaker"),
+                "speaker_id": box.get("speaker_id"),
+                "start": box.get("start"),
+                "end": box.get("end"),
+                "segment_count": box.get("segment_count"),
+                "sequence_start": box.get("sequence_start"),
+                "sequence_end": box.get("sequence_end"),
+            }
 
         sorted_items = sorted(
             items,
@@ -1309,32 +1344,26 @@ def build_three_part_communication_summary(
         )
 
         combined: List[Dict[str, Any]] = []
-        last_entry_by_speaker: Dict[str, int] = {}
+        last_non_verification_entry: Dict[str, int] = {}
+        speaker_box_counter = 0
         for seg in sorted_items:
             speaker_id = seg.get("speaker_id")
             seg_sequence = seg.get("sequence_index")
             speaker_key = speaker_id or seg.get("speaker") or seg.get("speaker_label")
+            is_verification = _is_verification_statement(seg.get("text"))
             if (
                 combined
                 and speaker_id
                 and speaker_id == combined[-1].get("speaker_id")
+                and not is_verification
+                and not combined[-1].get("is_verification")
                 and seg_sequence is not None
                 and combined[-1].get("last_sequence_index") is not None
                 and seg_sequence == combined[-1].get("last_sequence_index") + 1
             ):
                 _merge_into(combined[-1], seg)
-                if speaker_key:
-                    last_entry_by_speaker[speaker_key] = len(combined) - 1
-                continue
-
-            if (
-                speaker_key
-                and speaker_key in last_entry_by_speaker
-                and _is_verification_statement(seg.get("text"))
-            ):
-                target_index = last_entry_by_speaker[speaker_key]
-                _merge_into(combined[target_index], seg)
-                last_entry_by_speaker[speaker_key] = target_index
+                if speaker_key and not combined[-1].get("is_verification"):
+                    last_non_verification_entry[speaker_key] = len(combined) - 1
                 continue
 
             new_seg = dict(seg)
@@ -1342,9 +1371,33 @@ def build_three_part_communication_summary(
             new_seg["segments"] = [seg]
             new_seg["normalized_text"] = normalize_line(seg.get("text") or "")
             new_seg["last_sequence_index"] = seg_sequence
+            new_seg["is_verification"] = is_verification
+            speaker_box_counter += 1
+            new_seg["speaker_box"] = {
+                "id": speaker_box_counter,
+                "speaker": speaker_key,
+                "speaker_id": speaker_id,
+                "start": seg.get("start"),
+                "end": seg.get("end"),
+                "segment_count": 1,
+                "sequence_start": seg_sequence,
+                "sequence_end": seg_sequence,
+            }
+            if (
+                is_verification
+                and speaker_key
+                and speaker_key in last_non_verification_entry
+            ):
+                target_index = last_non_verification_entry[speaker_key]
+                target_box = _snapshot_box(combined[target_index])
+                new_seg["acknowledges_box_id"] = target_box.get("id") if target_box else None
+                new_seg["acknowledges_box"] = target_box
+            else:
+                new_seg["acknowledges_box_id"] = None
+                new_seg["acknowledges_box"] = None
             combined.append(new_seg)
-            if speaker_key:
-                last_entry_by_speaker[speaker_key] = len(combined) - 1
+            if speaker_key and not is_verification:
+                last_non_verification_entry[speaker_key] = len(combined) - 1
 
         return combined
 
@@ -1404,9 +1457,13 @@ def build_three_part_communication_summary(
         text: str,
         doc_similarity: float,
         sender_similarity: float,
+        is_verification: bool = False,
     ) -> str:
         if not text:
             return "unspoken"
+
+        if is_verification:
+            return "acknowledged"
 
         word_count = len(text.split())
         is_short = word_count < short_word_threshold
@@ -1434,23 +1491,60 @@ def build_three_part_communication_summary(
 
     if not normalized_reference:
         summary_entries: List[Dict[str, Any]] = []
-        for segment in segments:
+        prepared_segments: List[Dict[str, Any]] = []
+        for sequence_index, segment in enumerate(segments):
             spoken_text = (segment.get("text") or "").strip()
-            speaker_name = _speaker_identifier(segment)
-            word_count = len(spoken_text.split()) if spoken_text else 0
-            is_short = word_count < short_word_threshold
             if not spoken_text:
                 continue
-            status = "general conversation" if is_short else "match"
-            summary_entries.append(
+            speaker_name = _speaker_identifier(segment)
+            prepared_segments.append(
                 {
-                    "speaker": speaker_name,
+                    "speaker": segment.get("speaker"),
+                    "speaker_label": segment.get("speaker_label"),
+                    "speaker_name": segment.get("speaker_name"),
+                    "speaker_id": speaker_name,
+                    "role": _infer_role(
+                        segment.get("speaker_name")
+                        or segment.get("speaker")
+                        or segment.get("speaker_label")
+                    ),
                     "start": segment.get("start"),
                     "end": segment.get("end"),
-                    "content": spoken_text,
+                    "text": spoken_text,
+                    "normalized_text": normalize_line(spoken_text),
+                    "best_idx": None,
+                    "best_score": 1.0,
+                    "sequence_index": sequence_index,
+                }
+            )
+
+        combined_items = _combine_consecutive_segments(prepared_segments)
+        for item in combined_items:
+            text = item.get("text") or ""
+            if not text:
+                continue
+            role = item.get("role", "other")
+            doc_similarity = 1.0 if len(text.split()) >= short_word_threshold else 0.0
+            status = _determine_status(
+                role,
+                text,
+                doc_similarity,
+                0.0,
+                item.get("is_verification", False),
+            )
+            summary_entries.append(
+                {
+                    "speaker": item.get("speaker_id") or "Unknown",
+                    "start": item.get("start"),
+                    "end": item.get("end"),
+                    "content": text,
                     "status": status,
                     "reference": None,
-                    "similarity": 1.0 if status == "match" else 0.0,
+                    "similarity": 1.0 if doc_similarity >= match_threshold else 0.0,
+                    "speaker_box": item.get("speaker_box"),
+                    "acknowledges_box": item.get("acknowledges_box"),
+                    "acknowledges_box_id": item.get("acknowledges_box_id"),
+                    "is_verification": item.get("is_verification", False),
                 }
             )
 
@@ -1552,7 +1646,13 @@ def build_three_part_communication_summary(
             if item.get("role") == "receiver" and sender_text:
                 sender_similarity = _similarity_between_texts(text, sender_text)
 
-            status = _determine_status(item.get("role", "other"), text, doc_similarity, sender_similarity)
+            status = _determine_status(
+                item.get("role", "other"),
+                text,
+                doc_similarity,
+                sender_similarity,
+                item.get("is_verification", False),
+            )
             summary_entries.append(
                 {
                     "speaker": item.get("speaker_id") or "Unknown",
@@ -1566,6 +1666,10 @@ def build_three_part_communication_summary(
                     "similarity_to_sender": round(sender_similarity, 2),
                     "bucket_index": idx,
                     "bucket_document_segment": doc_text,
+                    "speaker_box": item.get("speaker_box"),
+                    "acknowledges_box": item.get("acknowledges_box"),
+                    "acknowledges_box_id": item.get("acknowledges_box_id"),
+                    "is_verification": item.get("is_verification", False),
                 }
             )
 
@@ -1592,6 +1696,10 @@ def build_three_part_communication_summary(
                     "similarity": round(item.get("best_score", 0.0), 2),
                     "bucket_index": None,
                     "bucket_document_segment": reference,
+                    "speaker_box": item.get("speaker_box"),
+                    "acknowledges_box": item.get("acknowledges_box"),
+                    "acknowledges_box_id": item.get("acknowledges_box_id"),
+                    "is_verification": item.get("is_verification", False),
                 }
             )
 
@@ -1644,6 +1752,7 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         "partial match": RGBColor(255, 165, 0),  # Orange
         "general conversation": RGBColor(0, 0, 255),  # Blue
         "mismatch": RGBColor(192, 0, 0),  # Red (retained for substantive off-topic)
+        "acknowledged": RGBColor(64, 128, 255),  # Distinct blue accent
         "unspoken": RGBColor(128, 128, 128),  # Gray
     }
 
@@ -1689,6 +1798,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             "partial match": (1, 0.65, 0),  # Orange
             "general conversation": (0, 0, 0.8),  # Blue
             "mismatch": (0.75, 0, 0),  # Red (retained)
+            "acknowledged": (0.25, 0.5, 1.0),  # Distinct blue accent
             "unspoken": (0.3, 0.3, 0.3),  # Gray
         }
 
