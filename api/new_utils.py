@@ -1239,6 +1239,66 @@ def build_three_part_communication_summary(
             except (TypeError, ValueError):
                 return None
 
+        def _normalize_for_verification(text: str) -> str:
+            normalized = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+            return re.sub(r"\s+", " ", normalized).strip()
+
+        verification_phrases: Set[str] = {
+            "thats correct",
+            "thats right",
+            "thats true",
+            "that is correct",
+            "that is right",
+            "that is true",
+            "correct",
+            "right",
+            "exactly",
+            "absolutely",
+            "indeed",
+            "affirmative",
+            "precisely",
+            "yes thats correct",
+            "yes that is correct",
+            "yes thats right",
+            "yes that is right",
+            "yep thats correct",
+            "yep thats right",
+            "yup thats correct",
+            "yup thats right",
+        }
+
+        def _is_verification_statement(text: Optional[str]) -> bool:
+            if not text:
+                return False
+            normalized = _normalize_for_verification(text)
+            if not normalized:
+                return False
+            word_count = len(normalized.split())
+            if word_count > 8:
+                return False
+            for phrase in verification_phrases:
+                if normalized == phrase or normalized.startswith(f"{phrase} "):
+                    return True
+            return False
+
+        def _merge_into(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+            existing_end = target.get("end")
+            new_end = source.get("end")
+            existing_end_val = _safe_float(existing_end)
+            new_end_val = _safe_float(new_end)
+            if new_end_val is not None and (
+                existing_end_val is None or new_end_val > existing_end_val
+            ):
+                target["end"] = new_end
+            if source.get("text"):
+                target["text"] = f"{target['text']} {source['text']}".strip()
+            target["normalized_text"] = normalize_line(target.get("text") or "")
+            target["best_score"] = max(
+                target.get("best_score", 0.0), source.get("best_score", 0.0)
+            )
+            target.setdefault("segments", []).append(source)
+            target["last_sequence_index"] = source.get("sequence_index")
+
         sorted_items = sorted(
             items,
             key=lambda seg: (
@@ -1249,9 +1309,11 @@ def build_three_part_communication_summary(
         )
 
         combined: List[Dict[str, Any]] = []
+        last_entry_by_speaker: Dict[str, int] = {}
         for seg in sorted_items:
             speaker_id = seg.get("speaker_id")
             seg_sequence = seg.get("sequence_index")
+            speaker_key = speaker_id or seg.get("speaker") or seg.get("speaker_label")
             if (
                 combined
                 and speaker_id
@@ -1260,27 +1322,19 @@ def build_three_part_communication_summary(
                 and combined[-1].get("last_sequence_index") is not None
                 and seg_sequence == combined[-1].get("last_sequence_index") + 1
             ):
-                existing_end = combined[-1].get("end")
-                new_end = seg.get("end")
-                existing_end_val = _safe_float(existing_end)
-                new_end_val = _safe_float(new_end)
-                if new_end_val is not None and (
-                    existing_end_val is None or new_end_val > existing_end_val
-                ):
-                    combined[-1]["end"] = new_end
-                combined[-1]["text"] = (
-                    f"{combined[-1]['text']} {seg['text']}".strip()
-                    if seg.get("text")
-                    else combined[-1]["text"]
-                )
-                combined[-1]["normalized_text"] = normalize_line(
-                    combined[-1]["text"]
-                )
-                combined[-1]["best_score"] = max(
-                    combined[-1].get("best_score", 0.0), seg.get("best_score", 0.0)
-                )
-                combined[-1].setdefault("segments", []).append(seg)
-                combined[-1]["last_sequence_index"] = seg_sequence
+                _merge_into(combined[-1], seg)
+                if speaker_key:
+                    last_entry_by_speaker[speaker_key] = len(combined) - 1
+                continue
+
+            if (
+                speaker_key
+                and speaker_key in last_entry_by_speaker
+                and _is_verification_statement(seg.get("text"))
+            ):
+                target_index = last_entry_by_speaker[speaker_key]
+                _merge_into(combined[target_index], seg)
+                last_entry_by_speaker[speaker_key] = target_index
                 continue
 
             new_seg = dict(seg)
@@ -1289,6 +1343,8 @@ def build_three_part_communication_summary(
             new_seg["normalized_text"] = normalize_line(seg.get("text") or "")
             new_seg["last_sequence_index"] = seg_sequence
             combined.append(new_seg)
+            if speaker_key:
+                last_entry_by_speaker[speaker_key] = len(combined) - 1
 
         return combined
 
@@ -1383,10 +1439,9 @@ def build_three_part_communication_summary(
             speaker_name = _speaker_identifier(segment)
             word_count = len(spoken_text.split()) if spoken_text else 0
             is_short = word_count < short_word_threshold
-            if spoken_text:
-                status = "general conversation" if is_short else "match"
-            else:
-                status = "unspoken"
+            if not spoken_text:
+                continue
+            status = "general conversation" if is_short else "match"
             summary_entries.append(
                 {
                     "speaker": speaker_name,
@@ -1480,19 +1535,6 @@ def build_three_part_communication_summary(
     for idx, doc_text in enumerate(reference_lines):
         bucket_items = bucket_segments.get(idx, [])
         if not bucket_items:
-            summary_entries.append(
-                {
-                    "speaker": "Not Spoken",
-                    "start": None,
-                    "end": None,
-                    "content": doc_text,
-                    "status": "unspoken",
-                    "reference": doc_text,
-                    "similarity": 0.0,
-                    "bucket_index": idx,
-                    "bucket_document_segment": doc_text,
-                }
-            )
             continue
 
         combined_items = _combine_consecutive_segments(bucket_items)
@@ -1502,6 +1544,8 @@ def build_three_part_communication_summary(
 
         for item in combined_items:
             text = item.get("text") or ""
+            if not text:
+                continue
             normalized_text = item.get("normalized_text") or normalize_line(text)
             doc_similarity = _similarity_to_reference(text, idx, normalized_text)
             sender_similarity = 0.0
@@ -1529,6 +1573,8 @@ def build_three_part_communication_summary(
         combined_general = _combine_consecutive_segments(general_segments)
         for item in combined_general:
             text = item.get("text") or ""
+            if not text:
+                continue
             reference = None
             if (
                 item.get("best_idx") is not None
