@@ -2,7 +2,7 @@ from django.urls import path
 from .views import (
     ProcessAudioView, FeedbackView, FeedbackListView, FeedbackDetailView,
     FeedbackReviewListView, FeedbackReviewDetailView,
-    GetAudioRecordsView, AudioFileDetailView, ReAnalyzeAudioView,
+    GetAudioRecordsView, ReAnalyzeAudioView,
     SOPCreateView, SOPListView, SOPDetailView,
     SessionCreateView, SessionListView, SessionDetailView,
     SessionReviewView, SessionStatusUpdateView,
@@ -22,11 +22,13 @@ urlpatterns = [
 
     # -------------- Document Management ----------------
     path('documents/upload/<str:token>/', new_enhnaced.UploadReferenceDocumentView.as_view(), name='document-upload'),
+    path('documents/<str:token>/<uuid:document_id>/', new_enhnaced.ReferenceDocumentDetailView.as_view(), name='document-detail'),
     path('documents/<str:token>/', new_enhnaced.GetUserDocumentsView.as_view(), name='user_documents'),
 
     # ---------------- Audio Upload & Processing ----------------
     path('audio-records/<str:token>/', GetAudioRecordsView.as_view(), name='audio-records'),
     path('upload/<str:token>/', new_enhnaced.UploadAndProcessView.as_view(), name='upload_and_process'),
+    path('audio/<str:token>/<uuid:audio_id>/', new_enhnaced.AudioFileDetailView.as_view(), name='audio-detail'),
 
     # ----------------- Download processed DOCX with highlighted text -----------------
     path('download/<str:token>/<str:session_id>/', new_enhnaced.DownloadProcessedDocumentView.as_view(), name='download_processed'),
@@ -37,6 +39,8 @@ urlpatterns = [
 
     # ---------------- Speaker Profile Management ----------------
     path('audio/<str:token>/diarization/map/', new_enhnaced.SpeakerProfileMappingView.as_view(), name='speaker-profile-map'),
+    path('speaker-profiles/<str:token>/', new_enhnaced.SpeakerProfileListCreateView.as_view(), name='speaker-profile-list'),
+    path('speaker-profiles/<str:token>/<int:profile_id>/', new_enhnaced.SpeakerProfileDetailView.as_view(), name='speaker-profile-detail'),
 
     # ---------------- Settings, audit, profiles ----------------
     path('settings/user/<str:token>/', UserSettingsView.as_view(), name='user-settings'),

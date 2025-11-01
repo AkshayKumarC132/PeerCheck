@@ -259,7 +259,8 @@ class ProcessAudioView(CreateAPIView):
             status="processed",
             duration=len(transcription_text.split()),
             sop=None,
-            user=user_data['user']  # Set the user
+            user=user_data['user'],  # Set the user
+            diarization_status='completed',
         )
         logger.info(f"Created AudioFile instance: {audio_instance.id}")
 
@@ -283,7 +284,7 @@ class ProcessAudioView(CreateAPIView):
             user=user_data['user'],
             # user = user_data['user'],
             session_id=session_id,
-            object_id=audio_instance.id,
+            object_id=str(audio_instance.id),
             object_type='AudioFile',
             details={
                     'file_name': audio_file.name,
