@@ -1184,143 +1184,260 @@ def _format_timestamp(seconds: Optional[float]) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
+
 def build_three_part_communication_summary(
     reference_text: Optional[str],
     diarization_segments: Optional[List[Dict]],
     match_threshold: float = 0.6,
     max_entries: int = 1000,
 ) -> List[Dict[str, Any]]:
-    segments = diarization_segments or []
+    """Build a Three-Part Communication (3PC) summary with smarter merging and status logic."""
+
+    segments = sorted(diarization_segments or [], key=lambda seg: seg.get("start") or 0.0)
+    if not segments:
+        return []
+
     reference_lines: List[str] = []
     normalized_reference: List[str] = []
+    reference_index_map: Dict[str, int] = {}
 
     if reference_text:
         reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
         normalized_reference = [normalize_line(ln) for ln in reference_lines]
-        
-    # Pre-encode references for semantic similarity (once per call)
+        reference_index_map = {line: idx for idx, line in enumerate(reference_lines)}
+
     model = _get_sentence_model()
     ref_embeddings = None
-    if reference_lines and len(reference_lines) > 0:
+    if reference_lines:
         try:
-            ref_embeddings = model.encode(reference_lines)  # Full text for semantics; (num_refs, 384)
-        except Exception as e:
-            logging.warning(f"Embedding pre-encode failed: {e}; fallback to fuzzy")
-            ref_embeddings = None  # Triggers fuzzy fallback below
+            ref_embeddings = model.encode(reference_lines)
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning("Embedding pre-encode failed: %s; falling back to fuzzy", exc)
+            ref_embeddings = None
 
-    used_reference_indices: Set[int] = set()
-    summary_entries: List[Dict[str, Any]] = []
+    MERGE_GAP_SECONDS = 3.0
+    VERIFICATION_PHRASES = [
+        "that's correct",
+        "that is correct",
+        "that's right",
+        "that is right",
+        "correct",
+        "exactly",
+        "absolutely",
+        "affirmative",
+        "you got it",
+        "sounds good",
+        "understood",
+        "got it",
+        "makes sense",
+        "roger",
+        "copy that",
+        "all good",
+        "confirmed",
+    ]
+    SHORT_ACK_WORDS = {
+        "yes",
+        "yeah",
+        "yep",
+        "yup",
+        "ok",
+        "okay",
+        "sure",
+        "right",
+        "correct",
+        "exactly",
+        "affirmative",
+        "indeed",
+    }
 
+    def _speaker_name(segment: Dict[str, Any]) -> str:
+        return (
+            segment.get("speaker_name")
+            or segment.get("speaker_label")
+            or segment.get("speaker")
+            or "Unknown"
+        )
+
+    def _clean_text(value: Optional[str]) -> str:
+        if not value:
+            return ""
+        return " ".join(value.strip().split())
+
+    def _is_verification_phrase(text: str) -> bool:
+        lowered = text.lower()
+        return any(phrase in lowered for phrase in VERIFICATION_PHRASES)
+
+    def _should_merge(prev: Dict[str, Any], current: Dict[str, Any]) -> bool:
+        if _speaker_name(prev) != _speaker_name(current):
+            return False
+
+        prev_end = prev.get("end") if prev.get("end") is not None else prev.get("start")
+        current_start = current.get("start")
+
+        gap = None
+        if prev_end is not None and current_start is not None:
+            gap = max(0.0, float(current_start) - float(prev_end))
+
+        current_text = _clean_text(current.get("text") or "")
+        if gap is None:
+            return True
+        if gap <= MERGE_GAP_SECONDS:
+            return True
+        return bool(current_text and _is_verification_phrase(current_text))
+
+    merged_segments: List[Dict[str, Any]] = []
+    current_segment: Optional[Dict[str, Any]] = None
     for segment in segments:
-        spoken_text = (segment.get("text") or "").strip()
-        normalized_spoken = normalize_line(spoken_text) if spoken_text else ""
+        segment_text = _clean_text(segment.get("text") or "")
+        if current_segment is None:
+            current_segment = dict(segment)
+            current_segment["text"] = segment_text
+            current_segment.setdefault("speaker", _speaker_name(segment))
+            continue
+
+        if _should_merge(current_segment, segment):
+            current_segment["end"] = (
+                segment.get("end")
+                if segment.get("end") is not None
+                else current_segment.get("end")
+            )
+            if segment_text:
+                combined = f"{current_segment.get('text', '')} {segment_text}".strip()
+                current_segment["text"] = _clean_text(combined)
+        else:
+            merged_segments.append(current_segment)
+            current_segment = dict(segment)
+            current_segment["text"] = segment_text
+            current_segment.setdefault("speaker", _speaker_name(segment))
+
+    if current_segment:
+        merged_segments.append(current_segment)
+
+    summary_entries: List[Dict[str, Any]] = []
+    used_reference_indices: Set[int] = set()
+    partial_threshold = max(match_threshold - 0.2, 0.3)
+    short_word_threshold = 4
+
+    def _compute_similarity(text: str) -> Tuple[Optional[int], float]:
+        if not text or not normalized_reference:
+            return None, 0.0
+
+        normalized_spoken = normalize_line(text)
         best_idx: Optional[int] = None
         best_score = 0.0
 
-        # Semantic similarity computation (replaces fuzzy loop)
-        best_score = 0.0
-        best_idx = None
-        if normalized_spoken and normalized_reference:
-            if ref_embeddings is not None:
-                try:
-                    spoken_embedding = model.encode([spoken_text])  # Full spoken_text for intent
-                    similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]  # (num_refs,)
-                    best_idx = int(similarities.argmax())
-                    best_score = float(similarities[best_idx])
-                    logging.debug(f"Semantic score: {best_score:.2f} for '{spoken_text[:50]}...'")  # Optional debug
-                except Exception as e:
-                    logging.warning(f"Semantic compute failed: {e}; fallback to fuzzy")
-                    # Fallback fuzzy loop
-                    for idx, ref_norm in enumerate(normalized_reference):
-                        if not ref_norm:
-                            continue
-                        score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
-                        if score > best_score:
-                            best_score = score
-                            best_idx = idx
-            else:
-                # No embeds: full fuzzy fallback
-                for idx, ref_norm in enumerate(normalized_reference):
-                    if not ref_norm:
-                        continue
-                    score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
-                    if score > best_score:
-                        best_score = score
-                        best_idx = idx
+        if ref_embeddings is not None:
+            try:
+                spoken_embedding = model.encode([text])
+                similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]
+                best_idx = int(similarities.argmax())
+                best_score = float(similarities[best_idx])
+            except Exception as exc:  # pragma: no cover - defensive
+                logging.warning("Semantic compute failed: %s; falling back to fuzzy", exc)
+                best_idx = None
+                best_score = 0.0
 
-        # ANCHOR: Status computation start
-        matched_reference = None
-        partial_threshold = 0.3
-        short_word_threshold = 4
-        word_count = len(spoken_text.split()) if spoken_text else 0
-        is_short = word_count < short_word_threshold
-
-        if not normalized_reference:  # No reference text
-            if spoken_text:
-                status = "general conversation" if is_short else "match"
-            else:
-                status = "unspoken"
-        else:  # Has reference text
-            if spoken_text:
-                if best_idx is not None and best_score >= 0.5:  # Tighter semantic threshold (cosine 0-1)
-                    status = "match"
-                    matched_reference = reference_lines[best_idx]
-                    used_reference_indices.add(best_idx)
-                elif is_short:  # Prioritize shortness for chit-chat after ruling out full match
-                    status = "general conversation"
-                elif best_score >= partial_threshold:
-                    status = "partial match"
-                    matched_reference = reference_lines[best_idx] if best_idx else None
-                else:
-                    status = "mismatch"
-            else:
-                status = "unspoken"
-
-        summary_entries.append(
-            {
-                "speaker": segment.get("speaker_name")
-                or segment.get("speaker_label")
-                or segment.get("speaker")
-                or "Unknown",
-                "start": segment.get("start"),
-                "end": segment.get("end"),
-                "content": spoken_text or matched_reference or "",
-                "status": status,
-                "reference": matched_reference,
-                "similarity": round(best_score, 2),
-            }
-        )
-
-    if normalized_reference and not segments:
-        for idx, line in enumerate(reference_lines):
-            if idx in used_reference_indices:
+        for idx, ref_norm in enumerate(normalized_reference):
+            if not ref_norm:
                 continue
-            summary_entries.append(
-                {
-                    "speaker": "Not Spoken",
-                    "start": None,
-                    "end": None,
-                    "content": line,
-                    "status": "unspoken",
-                    "reference": line,
-                    "similarity": 0.0,
-                }
-            )
+            fuzzy_score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
+            if fuzzy_score > best_score:
+                best_score = fuzzy_score
+                best_idx = idx
+
+        return best_idx, best_score
+
+    def _is_acknowledgment(
+        text: str, speaker: str, previous_entry: Optional[Dict[str, Any]]
+    ) -> bool:
+        if not text or not previous_entry:
+            return False
+        previous_speaker = previous_entry.get("speaker")
+        previous_status = (previous_entry.get("status") or "").lower()
+        if not previous_speaker or previous_speaker == speaker:
+            return False
+        if previous_status not in {"match", "partial match"}:
+            return False
+
+        lowered = text.lower()
+        tokens = [tok.strip(string.punctuation) for tok in lowered.split()]
+        if _is_verification_phrase(lowered):
+            return True
+        if len(tokens) <= 5 and any(tok in SHORT_ACK_WORDS for tok in tokens):
+            return True
+        return False
+
+    for segment in merged_segments:
+        speaker = _speaker_name(segment)
+        start = segment.get("start")
+        end = segment.get("end")
+        spoken_text = _clean_text(segment.get("text") or "")
+        if not spoken_text:
+            continue
+
+        best_idx, best_score = _compute_similarity(spoken_text)
+        matched_reference = reference_lines[best_idx] if best_idx is not None else None
+        previous_entry = summary_entries[-1] if summary_entries else None
+
+        status = "general conversation"
+        similarity_for_entry = best_score
+
+        if _is_acknowledgment(spoken_text, speaker, previous_entry):
+            status = "acknowledged"
+            if previous_entry:
+                matched_reference = previous_entry.get("reference") or matched_reference
+                if matched_reference and matched_reference in reference_index_map:
+                    used_reference_indices.add(reference_index_map[matched_reference])
+                similarity_for_entry = max(
+                    similarity_for_entry, previous_entry.get("similarity") or 0.0
+                )
+        elif normalized_reference:
+            word_count = len(spoken_text.split())
+            is_short = word_count < short_word_threshold
+            if best_idx is not None and best_score >= match_threshold:
+                status = "match"
+                if matched_reference is not None:
+                    used_reference_indices.add(best_idx)
+            elif best_idx is not None and best_score >= partial_threshold:
+                status = "partial match"
+                if matched_reference is not None:
+                    used_reference_indices.add(best_idx)
+            elif is_short:
+                status = "general conversation"
+            else:
+                status = "mismatch"
+        else:
+            word_count = len(spoken_text.split())
+            status = "general conversation" if word_count < short_word_threshold else "match"
+
+        entry = {
+            "speaker": speaker,
+            "start": start,
+            "end": end,
+            "content": spoken_text,
+            "status": status,
+            "reference": matched_reference,
+            "similarity": round(float(similarity_for_entry), 2),
+        }
+
+        summary_entries.append(entry)
+        if len(summary_entries) >= max_entries:
+            break
 
     def _sort_key(entry: Dict[str, Any]):
-        start = entry.get("start")
+        start_val = entry.get("start")
         try:
-            start_val = float(start) if start is not None else None
+            start_float = float(start_val) if start_val is not None else None
         except (TypeError, ValueError):
-            start_val = None
-        return (0 if start_val is not None else 1, start_val or 0.0, entry.get("speaker") or "")
+            start_float = None
+        return (
+            0 if start_float is not None else 1,
+            start_float or 0.0,
+            entry.get("speaker") or "",
+        )
 
     summary_entries.sort(key=_sort_key)
-
-    if len(summary_entries) > max_entries:
-        summary_entries = summary_entries[:max_entries]
-
-    return summary_entries
+    return summary_entries[:max_entries]
 
 
 def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]]) -> None:
