@@ -1881,6 +1881,7 @@ class DashboardSummaryView(APIView):
         total_audio_files = AudioFile.objects.filter(user=user_data['user'].id).count()
         processed_audio = AudioFile.objects.filter(status='processed',diarization__isnull= False, user=user_data['user'].id).count()
         pending_diarization  = AudioFile.objects.filter(status='processed',diarization__isnull= True, user=user_data['user'].id).count()
+        recent_activity = AuditLog.objects.filter(user=user_data['user']).order_by('-timestamp')[:5]
         # Coverage: average coverage from all ProcessingSessions where coverage is not null
         # coverage_queryset = ProcessingSession.objects.exclude(coverage__isnull=True)
         # if coverage_queryset.exists():
@@ -1894,7 +1895,8 @@ class DashboardSummaryView(APIView):
             "total_documents": total_documents,
             "total_audio_files": total_audio_files,
             "processed_audio": processed_audio,
-            "pending_diarization": pending_diarization
+            "pending_diarization": pending_diarization,
+            "recent_activity": AuditLogSerializer(recent_activity, many=True).data,
         }
         return Response(data)
 
