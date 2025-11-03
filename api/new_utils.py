@@ -1169,274 +1169,414 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
     return list(summary.values())
 
 
+
+VERIFICATION_PHRASES: Set[str] = {
+    "that's correct",
+    "that is correct",
+    "that's right",
+    "that is right",
+    "correct",
+    "exactly",
+    "absolutely",
+    "affirmative",
+    "confirmed",
+    "you got it",
+    "sounds good",
+    "understood",
+    "got it",
+    "makes sense",
+    "roger",
+    "copy that",
+    "all good",
+    "indeed",
+    "right on",
+}
+
+READBACK_PHRASES: Set[str] = {
+    "read back",
+    "reading back",
+    "let me repeat",
+    "to confirm",
+    "confirming",
+    "confirm that",
+    "let me make sure",
+    "just to clarify",
+    "double checking",
+    "recapping",
+    "summarizing",
+}
+
+
+def _segment_speaker(segment: Dict[str, Any]) -> str:
+    return (
+        segment.get("speaker_name")
+        or segment.get("speaker_label")
+        or segment.get("speaker")
+        or "Unknown"
+    )
+
+
+def _segment_text(segment: Dict[str, Any]) -> str:
+    text = segment.get("text") or segment.get("content") or ""
+    return " ".join(text.strip().split())
+
+
+def _is_verification_phrase(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in VERIFICATION_PHRASES)
+
+
+def _is_readback_phrase(text: Optional[str]) -> bool:
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(phrase in lowered for phrase in READBACK_PHRASES)
+
+
+def _merge_incomplete_segments(
+    segments: List[Dict[str, Any]],
+    gap_seconds: float = 3.0,
+) -> List[Dict[str, Any]]:
+    """Conservatively merge consecutive segments from the same speaker."""
+
+    if not segments:
+        return []
+
+    merged: List[Dict[str, Any]] = []
+    for segment in sorted(segments, key=lambda seg: seg.get("start") or 0.0):
+        text = _segment_text(segment)
+        if not text and segment.get("is_unspoken"):
+            # Respect the user's request to omit unspoken entries entirely.
+            continue
+
+        if not merged:
+            new_segment = dict(segment)
+            new_segment["text"] = text
+            merged.append(new_segment)
+            continue
+
+        previous = merged[-1]
+        same_speaker = _segment_speaker(previous) == _segment_speaker(segment)
+        prev_end = previous.get("end")
+        curr_start = segment.get("start")
+        try:
+            prev_end_f = float(prev_end) if prev_end is not None else None
+            curr_start_f = float(curr_start) if curr_start is not None else None
+        except (TypeError, ValueError):
+            prev_end_f = curr_start_f = None
+
+        gap = None
+        if prev_end_f is not None and curr_start_f is not None:
+            gap = max(0.0, curr_start_f - prev_end_f)
+
+        should_chain = same_speaker and (
+            (gap is not None and gap <= gap_seconds)
+            or _is_verification_phrase(text)
+            or (not text and not segment.get("is_unspoken"))
+        )
+
+        if should_chain:
+            previous_text = previous.get("text") or ""
+            combined = " ".join(part for part in [previous_text, text] if part).strip()
+            previous["text"] = combined
+            previous["end"] = segment.get("end", previous.get("end"))
+            if segment.get("duration"):
+                previous["duration"] = (
+                    previous.get("duration", 0.0) + float(segment.get("duration"))
+                )
+            continue
+
+        new_segment = dict(segment)
+        new_segment["text"] = text
+        merged.append(new_segment)
+
+    return merged
+
+
+def _detect_3pc_patterns(
+    segments: List[Dict[str, Any]],
+    gap_tolerance: float = 5.0,
+) -> List[Dict[str, int]]:
+    """Identify sender/receiver/sender confirmation patterns."""
+
+    patterns: List[Dict[str, int]] = []
+    for idx in range(len(segments) - 2):
+        first, second, third = segments[idx : idx + 3]
+        speaker_a = _segment_speaker(first)
+        speaker_b = _segment_speaker(second)
+        speaker_c = _segment_speaker(third)
+        if speaker_a == speaker_b or speaker_a != speaker_c:
+            continue
+
+        def _gap(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+            try:
+                return max(
+                    0.0,
+                    float(right.get("start") or 0.0) - float(left.get("end") or 0.0),
+                )
+            except (TypeError, ValueError):
+                return gap_tolerance
+
+        if _gap(first, second) > gap_tolerance or _gap(second, third) > gap_tolerance:
+            continue
+
+        readback_text = _segment_text(second)
+        confirmation_text = _segment_text(third)
+        readback_detected = _is_readback_phrase(readback_text)
+        confirmation_detected = _is_verification_phrase(confirmation_text)
+        if not confirmation_detected:
+            # Allow confirmations that mirror the receiver's readback closely.
+            similarity_to_readback = (
+                fuzz.partial_ratio(readback_text.lower(), confirmation_text.lower()) / 100.0
+                if readback_text and confirmation_text
+                else 0.0
+            )
+            confirmation_detected = similarity_to_readback >= 0.8
+
+        if not (readback_detected or confirmation_detected):
+            # Require at least one specialised cue to avoid over-classifying.
+            continue
+
+        similarity_to_sender = (
+            fuzz.partial_ratio(_segment_text(first).lower(), readback_text.lower()) / 100.0
+            if readback_text
+            else 0.0
+        )
+
+        patterns.append(
+            {
+                "sender_index": idx,
+                "receiver_index": idx + 1,
+                "confirmation_index": idx + 2,
+                "receiver_similarity": similarity_to_sender,
+            }
+        )
+
+    return patterns
+
+
+def _create_document_buckets(
+    reference_text: Optional[str],
+    model: SentenceTransformer,
+) -> List[Dict[str, Any]]:
+    """Group reference text into semantic buckets for comparison."""
+
+    if not reference_text:
+        return []
+
+    paragraphs: List[List[str]] = []
+    current: List[str] = []
+    for line in reference_text.splitlines():
+        stripped = line.strip()
+        if stripped:
+            current.append(stripped)
+        elif current:
+            paragraphs.append(current)
+            current = []
+    if current:
+        paragraphs.append(current)
+
+    buckets: List[Dict[str, Any]] = []
+    for idx, lines in enumerate(paragraphs):
+        text_block = " ".join(lines)
+        if not text_block:
+            continue
+        try:
+            embedding = model.encode([text_block], convert_to_tensor=True)[0]
+        except Exception as exc:  # pragma: no cover - defensive
+            logging.warning("Failed to embed reference bucket %s: %s", idx, exc)
+            embedding = None
+        buckets.append(
+            {
+                "id": idx,
+                "text": text_block,
+                "lines": lines,
+                "normalized": normalize_line(text_block),
+                "embedding": embedding,
+            }
+        )
+    return buckets
+
+
+def _find_best_bucket_match(
+    content: str,
+    buckets: List[Dict[str, Any]],
+    model: SentenceTransformer,
+) -> Tuple[Optional[Dict[str, Any]], float, float, float]:
+    """Return the strongest bucket match using semantic + fuzzy scoring."""
+
+    if not content or not buckets:
+        return None, 0.0, 0.0, 0.0
+
+    try:
+        query_embedding = model.encode([content], convert_to_tensor=True)[0]
+    except Exception as exc:  # pragma: no cover - defensive
+        logging.warning("Failed to embed segment content: %s", exc)
+        query_embedding = None
+
+    best_bucket: Optional[Dict[str, Any]] = None
+    best_score = 0.0
+    best_semantic = 0.0
+    best_fuzzy = 0.0
+    for bucket in buckets:
+        semantic_score = 0.0
+        if query_embedding is not None and bucket.get("embedding") is not None:
+            semantic_score = float(util.cos_sim(query_embedding, bucket["embedding"]).item())
+        fuzzy_score = fuzz.token_set_ratio(content.lower(), bucket["normalized"]) / 100.0
+        combined = (semantic_score * 0.7) + (fuzzy_score * 0.3)
+        if combined > best_score:
+            best_score = combined
+            best_bucket = bucket
+            best_semantic = semantic_score
+            best_fuzzy = fuzzy_score
+
+    return best_bucket, best_score, best_semantic, best_fuzzy
+
+
 def _format_timestamp(seconds: Optional[float]) -> str:
     if seconds is None:
         return "-"
     try:
-        total_seconds = max(0, int(round(float(seconds))))
+        total_seconds = max(0.0, float(seconds))
     except (TypeError, ValueError):
         return "-"
 
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
+    minutes, secs = divmod(total_seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    remainder = secs % 1
+    secs = int(secs)
     if hours:
-        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-    return f"{minutes:02d}:{secs:02d}"
-
+        return f"{int(hours):02d}:{int(minutes):02d}:{secs:02d}"
+    if remainder:
+        return f"{int(minutes):02d}:{secs:02d}.{int(remainder * 10):01d}"
+    return f"{int(minutes):02d}:{secs:02d}"
 
 
 def build_three_part_communication_summary(
     reference_text: Optional[str],
     diarization_segments: Optional[List[Dict]],
-    match_threshold: float = 0.6,
+    match_threshold: float = 0.65,
     max_entries: int = 1000,
 ) -> List[Dict[str, Any]]:
-    """Build a Three-Part Communication (3PC) summary with smarter merging and status logic."""
+    """Build a Three-Part Communication (3PC) summary with layered comparison logic."""
 
-    segments = sorted(diarization_segments or [], key=lambda seg: seg.get("start") or 0.0)
-    if not segments:
+    merged_segments = _merge_incomplete_segments(diarization_segments or [])
+    if not merged_segments:
         return []
 
-    reference_lines: List[str] = []
-    normalized_reference: List[str] = []
-    reference_index_map: Dict[str, int] = {}
-
-    if reference_text:
-        reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
-        normalized_reference = [normalize_line(ln) for ln in reference_lines]
-        reference_index_map = {line: idx for idx, line in enumerate(reference_lines)}
-
     model = _get_sentence_model()
-    ref_embeddings = None
-    if reference_lines:
-        try:
-            ref_embeddings = model.encode(reference_lines)
-        except Exception as exc:  # pragma: no cover - defensive
-            logging.warning("Embedding pre-encode failed: %s; falling back to fuzzy", exc)
-            ref_embeddings = None
+    buckets = _create_document_buckets(reference_text, model)
+    partial_threshold = max(match_threshold * 0.8, 0.45)
 
-    MERGE_GAP_SECONDS = 3.0
-    VERIFICATION_PHRASES = [
-        "that's correct",
-        "that is correct",
-        "that's right",
-        "that is right",
-        "correct",
-        "exactly",
-        "absolutely",
-        "affirmative",
-        "you got it",
-        "sounds good",
-        "understood",
-        "got it",
-        "makes sense",
-        "roger",
-        "copy that",
-        "all good",
-        "confirmed",
-    ]
-    SHORT_ACK_WORDS = {
-        "yes",
-        "yeah",
-        "yep",
-        "yup",
-        "ok",
-        "okay",
-        "sure",
-        "right",
-        "correct",
-        "exactly",
-        "affirmative",
-        "indeed",
-    }
-
-    def _speaker_name(segment: Dict[str, Any]) -> str:
-        return (
-            segment.get("speaker_name")
-            or segment.get("speaker_label")
-            or segment.get("speaker")
-            or "Unknown"
-        )
-
-    def _clean_text(value: Optional[str]) -> str:
-        if not value:
-            return ""
-        return " ".join(value.strip().split())
-
-    def _is_verification_phrase(text: str) -> bool:
-        lowered = text.lower()
-        return any(phrase in lowered for phrase in VERIFICATION_PHRASES)
-
-    def _should_merge(prev: Dict[str, Any], current: Dict[str, Any]) -> bool:
-        if _speaker_name(prev) != _speaker_name(current):
-            return False
-
-        prev_end = prev.get("end") if prev.get("end") is not None else prev.get("start")
-        current_start = current.get("start")
-
-        gap = None
-        if prev_end is not None and current_start is not None:
-            gap = max(0.0, float(current_start) - float(prev_end))
-
-        current_text = _clean_text(current.get("text") or "")
-        if gap is None:
-            return True
-        if gap <= MERGE_GAP_SECONDS:
-            return True
-        return bool(current_text and _is_verification_phrase(current_text))
-
-    merged_segments: List[Dict[str, Any]] = []
-    current_segment: Optional[Dict[str, Any]] = None
-    for segment in segments:
-        segment_text = _clean_text(segment.get("text") or "")
-        if current_segment is None:
-            current_segment = dict(segment)
-            current_segment["text"] = segment_text
-            current_segment.setdefault("speaker", _speaker_name(segment))
-            continue
-
-        if _should_merge(current_segment, segment):
-            current_segment["end"] = (
-                segment.get("end")
-                if segment.get("end") is not None
-                else current_segment.get("end")
-            )
-            if segment_text:
-                combined = f"{current_segment.get('text', '')} {segment_text}".strip()
-                current_segment["text"] = _clean_text(combined)
-        else:
-            merged_segments.append(current_segment)
-            current_segment = dict(segment)
-            current_segment["text"] = segment_text
-            current_segment.setdefault("speaker", _speaker_name(segment))
-
-    if current_segment:
-        merged_segments.append(current_segment)
+    patterns = _detect_3pc_patterns(merged_segments)
+    sender_lookup = {p["sender_index"]: p for p in patterns}
+    receiver_lookup = {p["receiver_index"]: p for p in patterns}
+    confirmation_lookup = {p["confirmation_index"]: p for p in patterns}
 
     summary_entries: List[Dict[str, Any]] = []
-    used_reference_indices: Set[int] = set()
-    partial_threshold = max(match_threshold - 0.2, 0.3)
-    short_word_threshold = 4
+    index_to_entry: Dict[int, Dict[str, Any]] = {}
 
-    def _compute_similarity(text: str) -> Tuple[Optional[int], float]:
-        if not text or not normalized_reference:
-            return None, 0.0
-
-        normalized_spoken = normalize_line(text)
-        best_idx: Optional[int] = None
-        best_score = 0.0
-
-        if ref_embeddings is not None:
-            try:
-                spoken_embedding = model.encode([text])
-                similarities = util.cos_sim(spoken_embedding, ref_embeddings)[0]
-                best_idx = int(similarities.argmax())
-                best_score = float(similarities[best_idx])
-            except Exception as exc:  # pragma: no cover - defensive
-                logging.warning("Semantic compute failed: %s; falling back to fuzzy", exc)
-                best_idx = None
-                best_score = 0.0
-
-        for idx, ref_norm in enumerate(normalized_reference):
-            if not ref_norm:
-                continue
-            fuzzy_score = fuzz.token_set_ratio(normalized_spoken, ref_norm) / 100.0
-            if fuzzy_score > best_score:
-                best_score = fuzzy_score
-                best_idx = idx
-
-        return best_idx, best_score
-
-    def _is_acknowledgment(
-        text: str, speaker: str, previous_entry: Optional[Dict[str, Any]]
-    ) -> bool:
-        if not text or not previous_entry:
-            return False
-        previous_speaker = previous_entry.get("speaker")
-        previous_status = (previous_entry.get("status") or "").lower()
-        if not previous_speaker or previous_speaker == speaker:
-            return False
-        if previous_status not in {"match", "partial match"}:
-            return False
-
-        lowered = text.lower()
-        tokens = [tok.strip(string.punctuation) for tok in lowered.split()]
-        if _is_verification_phrase(lowered):
-            return True
-        if len(tokens) <= 5 and any(tok in SHORT_ACK_WORDS for tok in tokens):
-            return True
-        return False
-
-    for segment in merged_segments:
-        speaker = _speaker_name(segment)
-        start = segment.get("start")
-        end = segment.get("end")
-        spoken_text = _clean_text(segment.get("text") or "")
-        if not spoken_text:
+    for idx, segment in enumerate(merged_segments):
+        speaker = _segment_speaker(segment)
+        text = _segment_text(segment)
+        if not text:
             continue
 
-        best_idx, best_score = _compute_similarity(spoken_text)
-        matched_reference = reference_lines[best_idx] if best_idx is not None else None
+        start = segment.get("start")
+        end = segment.get("end")
+
         previous_entry = summary_entries[-1] if summary_entries else None
 
-        status = "general conversation"
-        similarity_for_entry = best_score
+        bucket, combined_score, semantic_score, fuzzy_score = _find_best_bucket_match(
+            text, buckets, model
+        )
+        matched_reference = bucket["text"] if bucket else None
 
-        if _is_acknowledgment(spoken_text, speaker, previous_entry):
+        status = "general conversation"
+        similarity = combined_score
+        context_links: Dict[str, Any] = {}
+
+        if idx in confirmation_lookup or _is_verification_phrase(text):
             status = "acknowledged"
-            if previous_entry:
+            if idx in confirmation_lookup:
+                pattern = confirmation_lookup[idx]
+                sender_entry = index_to_entry.get(pattern["sender_index"])
+                receiver_entry = index_to_entry.get(pattern["receiver_index"])
+                if sender_entry:
+                    matched_reference = sender_entry.get("reference") or matched_reference
+                    similarity = max(similarity, sender_entry.get("similarity") or 0.0)
+                    context_links["sender"] = sender_entry.get("speaker")
+                if receiver_entry:
+                    context_links["receiver"] = receiver_entry.get("speaker")
+                    if not matched_reference:
+                        matched_reference = receiver_entry.get("reference")
+                        similarity = max(similarity, receiver_entry.get("similarity") or 0.0)
+            elif previous_entry and previous_entry.get("status") in {"match", "partial match"}:
                 matched_reference = previous_entry.get("reference") or matched_reference
-                if matched_reference and matched_reference in reference_index_map:
-                    used_reference_indices.add(reference_index_map[matched_reference])
-                similarity_for_entry = max(
-                    similarity_for_entry, previous_entry.get("similarity") or 0.0
-                )
-        elif normalized_reference:
-            word_count = len(spoken_text.split())
-            is_short = word_count < short_word_threshold
-            if best_idx is not None and best_score >= match_threshold:
-                status = "match"
-                if matched_reference is not None:
-                    used_reference_indices.add(best_idx)
-            elif best_idx is not None and best_score >= partial_threshold:
-                status = "partial match"
-                if matched_reference is not None:
-                    used_reference_indices.add(best_idx)
-            elif is_short:
-                status = "general conversation"
-            else:
-                status = "mismatch"
+                similarity = max(similarity, previous_entry.get("similarity") or 0.0)
         else:
-            word_count = len(spoken_text.split())
-            status = "general conversation" if word_count < short_word_threshold else "match"
+            long_enough = len(text.split()) >= 4
+            if bucket:
+                if combined_score >= match_threshold:
+                    status = "match"
+                elif combined_score >= partial_threshold:
+                    status = "partial match"
+                elif long_enough:
+                    status = "mismatch"
+            else:
+                if long_enough:
+                    status = "mismatch"
+
+            if idx in receiver_lookup:
+                pattern = receiver_lookup[idx]
+                context_links["role"] = "receiver"
+                if status == "general conversation":
+                    status = "partial match" if combined_score >= 0.4 else "general conversation"
+                context_links["receiver_similarity"] = round(pattern["receiver_similarity"], 2)
+            elif idx in sender_lookup:
+                context_links["role"] = "sender"
+                if status == "general conversation" and combined_score >= partial_threshold:
+                    status = "partial match"
+
+            if _is_readback_phrase(text) and status != "acknowledged":
+                status = "partial match" if bucket else "general conversation"
 
         entry = {
             "speaker": speaker,
             "start": start,
             "end": end,
-            "content": spoken_text,
+            "content": text,
             "status": status,
             "reference": matched_reference,
-            "similarity": round(float(similarity_for_entry), 2),
+            "similarity": round(float(similarity), 2),
+            "semantic_score": round(float(semantic_score), 2),
+            "fuzzy_score": round(float(fuzzy_score), 2),
         }
+        if bucket:
+            entry["bucket_id"] = bucket["id"]
+        if context_links:
+            entry["context"] = context_links
+        if idx in sender_lookup and status != "acknowledged":
+            entry.setdefault("context", {}).update({"role": "sender"})
+        if idx in confirmation_lookup:
+            entry.setdefault("context", {}).update({"role": "confirmation"})
+        elif idx in receiver_lookup:
+            entry.setdefault("context", {}).update({"role": "receiver"})
 
         summary_entries.append(entry)
+        index_to_entry[idx] = entry
         if len(summary_entries) >= max_entries:
             break
 
-    def _sort_key(entry: Dict[str, Any]):
-        start_val = entry.get("start")
-        try:
-            start_float = float(start_val) if start_val is not None else None
-        except (TypeError, ValueError):
-            start_float = None
-        return (
-            0 if start_float is not None else 1,
-            start_float or 0.0,
+    summary_entries.sort(
+        key=lambda entry: (
+            0 if entry.get("start") is not None else 1,
+            float(entry.get("start") or 0.0),
             entry.get("speaker") or "",
         )
-
-    summary_entries.sort(key=_sort_key)
+    )
     return summary_entries[:max_entries]
 
 
@@ -1445,48 +1585,67 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
     document.add_page_break()
     document.add_heading("Three-Part Communication (3PC) Summary", level=1)
 
-    if not entries:
-        document.add_paragraph("No speaker diarization data was available to summarise.")
-        document.save(docx_path)
-        return
-
-    headers = ["Speaker", "Start", "End", "Content", "Status"]
+    headers = ["Speaker", "Start", "End", "Status", "Reference", "Content"]
     table = document.add_table(rows=1, cols=len(headers))
     try:
         table.style = "Light Grid Accent 1"
     except KeyError:
         table.style = "Light Grid"
+
     for cell, title in zip(table.rows[0].cells, headers):
         cell.text = title
 
-    status_colors = {
-        "match": RGBColor(0, 128, 0),  # Green
-        "partial match": RGBColor(255, 165, 0),  # Orange
-        "general conversation": RGBColor(0, 0, 255),  # Blue
-        "mismatch": RGBColor(192, 0, 0),  # Red (retained for substantive off-topic)
-        "unspoken": RGBColor(128, 128, 128),  # Gray
+    status_shading = {
+        "match": "c6efce",
+        "acknowledged": "d9ead3",
+        "partial match": "fff2cc",
+        "general conversation": "dae8fc",
+        "mismatch": "f4cccc",
     }
 
-    for entry in entries:
-        row = table.add_row()
-        cells = row.cells
-        values = [
-            entry.get("speaker") or "Unknown",
-            _format_timestamp(entry.get("start")),
-            _format_timestamp(entry.get("end")),
-            entry.get("content") or "",
-        ]
+    def _apply_shading(cell, hex_color: str) -> None:
+        if not hex_color:
+            return
+        tc_pr = cell._tc.get_or_add_tcPr()
+        shd = docx.oxml.OxmlElement('w:shd')
+        shd.set(qn('w:val'), 'clear')
+        shd.set(qn('w:color'), 'auto')
+        shd.set(qn('w:fill'), hex_color)
+        tc_pr.append(shd)
 
-        for idx, value in enumerate(values):
-            cells[idx].text = value
+    def _hex_to_rgb(hex_color: str) -> RGBColor:
+        hex_color = hex_color.lstrip('#')
+        return RGBColor(
+            int(hex_color[0:2], 16),
+            int(hex_color[2:4], 16),
+            int(hex_color[4:6], 16),
+        )
 
-        status = (entry.get("status") or "").lower()
-        status_cell = cells[len(headers) - 1]
-        status_cell.text = status.capitalize() if status else "-"
-        if status in status_colors:
-            for paragraph in status_cell.paragraphs:
-                for run in paragraph.runs:
-                    run.font.color.rgb = status_colors[status]
+    if not entries:
+        document.add_paragraph("No speaker diarization data was available to summarise.")
+    else:
+        for entry in entries:
+            row = table.add_row()
+            values = [
+                entry.get("speaker") or "Unknown",
+                _format_timestamp(entry.get("start")),
+                _format_timestamp(entry.get("end")),
+                (entry.get("status") or "").capitalize() or "-",
+                entry.get("reference") or "-",
+                entry.get("content") or "",
+            ]
+            for cell, value in zip(row.cells, values):
+                cell.text = value
+
+            status_key = (entry.get("status") or "").lower()
+            shading = status_shading.get(status_key)
+            if shading:
+                status_cell = row.cells[3]
+                _apply_shading(status_cell, shading)
+                rgb = _hex_to_rgb(shading)
+                for paragraph in status_cell.paragraphs:
+                    for run in paragraph.runs:
+                        run.font.color.rgb = rgb
 
     document.save(docx_path)
 
@@ -1502,20 +1661,28 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         title_font_size = 16
         body_font_size = 10
         row_padding = 4
-        content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
-        headers = ["Speaker", "Start", "End", "Content", "Status"]
-        status_colors = {
-            "match": (0, 0.5, 0),  # Green
-            "partial match": (1, 0.65, 0),  # Orange
-            "general conversation": (0, 0, 0.8),  # Blue
-            "mismatch": (0.75, 0, 0),  # Red (retained)
-            "unspoken": (0.3, 0.3, 0.3),  # Gray
+        content_width_ratio = [0.12, 0.1, 0.1, 0.13, 0.55]
+        headers = ["Speaker", "Start", "End", "Status", "Content"]
+
+        status_shading = {
+            "match": (0.78, 0.94, 0.79),
+            "acknowledged": (0.85, 0.92, 0.83),
+            "partial match": (1.0, 0.95, 0.8),
+            "general conversation": (0.85, 0.9, 0.97),
+            "mismatch": (0.96, 0.8, 0.8),
+        }
+
+        status_font = {
+            "match": (0, 0.4, 0),
+            "acknowledged": (0.1, 0.4, 0.1),
+            "partial match": (0.6, 0.4, 0),
+            "general conversation": (0.1, 0.2, 0.6),
+            "mismatch": (0.6, 0, 0),
         }
 
         def _new_page(include_header: bool = True):
             page = doc.new_page()
             width = page.rect.width
-            height = page.rect.height
             y_pos = margin
             if include_header:
                 page.insert_text(
@@ -1531,7 +1698,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 for header, ratio in zip(headers, content_width_ratio):
                     col_width = content_width * ratio
                     rect = fitz.Rect(x, y_pos, x + col_width, y_pos + body_font_size + 8)
-                    page.draw_rect(rect, color=(0, 0, 0))
+                    page.draw_rect(rect, color=(0.6, 0.6, 0.6), width=0.5)
                     page.insert_textbox(
                         rect,
                         header,
@@ -1541,7 +1708,6 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     )
                     x += col_width
                 y_pos += body_font_size + 8
-
             return page, y_pos
 
         def _wrap_cell(text: str, max_width: float) -> List[str]:
@@ -1550,15 +1716,12 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             approx_char_width = max(int(max_width / (body_font_size * 0.6)), 1)
             return textwrap.wrap(text, width=approx_char_width) or [""]
 
-        def _draw_row(page, y_pos, values: List[str]):
-            """Render a single summary row, creating a new page if required."""
-
+        def _draw_row(page, y_pos, values: List[str], status_key: str):
             if page is None:
                 page, y_pos = _new_page()
 
-            current_page = page
-            width = current_page.rect.width
-            height = current_page.rect.height
+            width = page.rect.width
+            height = page.rect.height
             available_height = height - margin
             content_width = width - 2 * margin
 
@@ -1571,72 +1734,60 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 max_lines = max(max_lines, len(lines))
 
             row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
-
             if y_pos + row_height > available_height:
-                current_page, y_pos = _new_page()
-                width = current_page.rect.width
-                height = current_page.rect.height
-                available_height = height - margin
-                content_width = width - 2 * margin
-                columns.clear()
-                max_lines = 1
-                for value, ratio in zip(values, content_width_ratio):
-                    col_width = content_width * ratio
-                    lines = _wrap_cell(value, col_width - (2 * row_padding))
-                    columns.append((col_width, lines))
-                    max_lines = max(max_lines, len(lines))
-                row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+                page, y_pos = _new_page()
+                return _draw_row(page, y_pos, values, status_key)
+
+            shading = status_shading.get(status_key, (0.95, 0.95, 0.95))
+            font_color = status_font.get(status_key, (0, 0, 0))
 
             x = margin
             for idx, (col_width, lines) in enumerate(columns):
                 rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
-                current_page.draw_rect(rect, color=(0.7, 0.7, 0.7))
+                page.draw_rect(rect, color=(0.7, 0.7, 0.7), width=0.2, fill=shading)
 
                 text_y = y_pos + row_padding + body_font_size
-                color = (0, 0, 0)
-                if headers[idx] == "Status":
-                    status_key = values[idx].strip().lower()
-                    color = status_colors.get(status_key, color)
-
                 for line in lines:
-                    current_page.insert_text(
+                    page.insert_text(
                         (x + row_padding, text_y),
                         line,
                         fontsize=body_font_size,
                         fontname="helv",
-                        fill=color,
+                        fill=font_color if headers[idx] == "Status" else (0, 0, 0),
                     )
                     text_y += body_font_size + 2
-
                 x += col_width
 
-            return current_page, y_pos + row_height
+            return page, y_pos + row_height
 
-        page, y_cursor = _new_page()
+        page, cursor = _new_page()
 
         if not entries:
             page.insert_text(
-                (margin, y_cursor),
+                (margin, cursor),
                 "No speaker diarization data was available to summarise.",
                 fontsize=body_font_size,
                 fontname="helv",
             )
         else:
             for entry in entries:
+                status_key = (entry.get("status") or "").lower()
+                content_text = entry.get("content") or ""
+                if entry.get("reference"):
+                    content_text = f"{content_text}\nReference: {entry['reference']}"
                 row_values = [
                     entry.get("speaker") or "Unknown",
                     _format_timestamp(entry.get("start")),
                     _format_timestamp(entry.get("end")),
-                    entry.get("content") or "",
                     (entry.get("status") or "").capitalize() or "-",
+                    content_text,
                 ]
-                page, y_cursor = _draw_row(page, y_cursor, row_values)
+                page, cursor = _draw_row(page, cursor, row_values, status_key)
 
         doc.save(temp_pdf_path, deflate=True)
         saved = True
     finally:
         doc.close()
-
         try:
             if saved:
                 os.replace(temp_pdf_path, pdf_path)
