@@ -1169,6 +1169,9 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
     return list(summary.values())
 
 
+# Minimum topical overlap required for acknowledgement success.
+ACK_CONSISTENCY_THRESHOLD = 0.75
+
 
 VERIFICATION_PHRASES: Set[str] = {
     "10-4",
@@ -1242,6 +1245,45 @@ READBACK_PHRASES: Set[str] = {
     "you're ready",
     "you've",
 }
+
+
+def _acknowledgement_is_consistent(
+    sender_entry: Optional[Dict[str, Any]],
+    receiver_entries: List[Optional[Dict[str, Any]]],
+    pattern: Optional[Dict[str, Any]] = None,
+) -> Tuple[bool, float, bool]:
+    """Evaluate whether an acknowledgement aligns with its bundle context."""
+
+    if not sender_entry:
+        return True, 0.0, False
+
+    sender_text = (sender_entry.get("content") or "").strip()
+    aggregated_receiver_text = " ".join(
+        (entry.get("content") or "").strip()
+        for entry in receiver_entries
+        if entry and entry.get("content")
+    ).strip()
+
+    similarity = float(pattern.get("receiver_similarity", 0.0)) if pattern else 0.0
+    if sender_text and aggregated_receiver_text:
+        similarity = max(
+            similarity,
+            fuzz.partial_ratio(sender_text.lower(), aggregated_receiver_text.lower()) / 100.0,
+        )
+
+    bucket_ids = {
+        entry.get("bucket_id")
+        for entry in [sender_entry, *receiver_entries]
+        if entry and entry.get("bucket_id") is not None
+    }
+    bucket_conflict = len(bucket_ids) > 1
+    if bucket_conflict:
+        return False, similarity, True
+
+    if sender_text and aggregated_receiver_text:
+        return similarity >= ACK_CONSISTENCY_THRESHOLD, similarity, False
+
+    return True, similarity, False
 
 
 def _segment_speaker(segment: Dict[str, Any]) -> str:
@@ -1601,15 +1643,23 @@ def build_three_part_communication_summary(
 
         if role == "confirmation" or _is_verification_phrase(text):
             status = "acknowledged"
+            ack_consistent = True
+            ack_similarity = None
             if role == "confirmation" and pattern:
                 sender_entry = index_to_entry.get(pattern["sender_index"])
                 receiver_entries = [
                     index_to_entry.get(r_idx)
                     for r_idx in pattern.get("receiver_indices", [])
                 ]
+                ack_consistent, similarity_measure, bucket_conflict = (
+                    _acknowledgement_is_consistent(
+                        sender_entry,
+                        receiver_entries,
+                        pattern,
+                    )
+                )
+                ack_similarity = similarity_measure
                 if sender_entry:
-                    matched_reference = sender_entry.get("reference") or matched_reference
-                    similarity = max(similarity, sender_entry.get("similarity") or 0.0)
                     context_links["sender"] = sender_entry.get("speaker")
                 receiver_names = [
                     entry.get("speaker")
@@ -1618,17 +1668,39 @@ def build_three_part_communication_summary(
                 ]
                 if receiver_names:
                     context_links["receivers"] = receiver_names
-                for receiver_entry in receiver_entries:
-                    if not receiver_entry:
-                        continue
-                    if not matched_reference:
-                        matched_reference = receiver_entry.get("reference")
-                    similarity = max(
-                        similarity,
-                        receiver_entry.get("similarity") or 0.0,
-                    )
                 context_links["bundle_id"] = pattern["id"]
                 context_links["role"] = "confirmation"
+                context_links["acknowledgement_consistent"] = ack_consistent
+                if bucket_conflict:
+                    context_links["bucket_conflict"] = True
+                if ack_similarity is not None:
+                    context_links["consistency_score"] = round(float(ack_similarity), 2)
+                    context_links["consistency_threshold"] = ACK_CONSISTENCY_THRESHOLD
+
+                if ack_consistent:
+                    if sender_entry:
+                        matched_reference = sender_entry.get("reference") or matched_reference
+                        similarity = max(similarity, sender_entry.get("similarity") or 0.0)
+                    for receiver_entry in receiver_entries:
+                        if not receiver_entry:
+                            continue
+                        if not matched_reference:
+                            matched_reference = receiver_entry.get("reference")
+                        similarity = max(
+                            similarity,
+                            receiver_entry.get("similarity") or 0.0,
+                        )
+                else:
+                    status = "acknowledged failed"
+                    if sender_entry and sender_entry.get("reference"):
+                        context_links["sender_reference"] = sender_entry.get("reference")
+                    receiver_refs = {
+                        entry.get("reference")
+                        for entry in receiver_entries
+                        if entry and entry.get("reference")
+                    }
+                    if receiver_refs:
+                        context_links["receiver_references"] = sorted(receiver_refs)
             elif previous_entry and previous_entry.get("status") in {"match", "partial match"}:
                 matched_reference = previous_entry.get("reference") or matched_reference
                 similarity = max(similarity, previous_entry.get("similarity") or 0.0)
@@ -1724,6 +1796,7 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
     status_shading = {
         "match": "c6efce",
         "acknowledged": "d9ead3",
+        "acknowledged failed": "f4cccc",
         "partial match": "fff2cc",
         "general conversation": "dae8fc",
         "mismatch": "f4cccc",
@@ -1756,7 +1829,7 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
                 entry.get("speaker") or "Unknown",
                 _format_timestamp(entry.get("start")),
                 _format_timestamp(entry.get("end")),
-                (entry.get("status") or "").capitalize() or "-",
+                (entry.get("status") or "").title() or "-",
                 entry.get("content") or "",
             ]
             for cell, value in zip(row.cells, values):
@@ -1792,6 +1865,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         status_shading = {
             "match": (0.78, 0.94, 0.79),
             "acknowledged": (0.85, 0.92, 0.83),
+            "acknowledged failed": (0.96, 0.8, 0.8),
             "partial match": (1.0, 0.95, 0.8),
             "general conversation": (0.85, 0.9, 0.97),
             "mismatch": (0.96, 0.8, 0.8),
@@ -1800,6 +1874,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         status_font = {
             "match": (0, 0.4, 0),
             "acknowledged": (0.1, 0.4, 0.1),
+            "acknowledged failed": (0.6, 0, 0),
             "partial match": (0.6, 0.4, 0),
             "general conversation": (0.1, 0.2, 0.6),
             "mismatch": (0.6, 0, 0),
@@ -1939,7 +2014,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     entry.get("speaker") or "Unknown",
                     _format_timestamp(entry.get("start")),
                     _format_timestamp(entry.get("end")),
-                    (entry.get("status") or "").capitalize() or "-",
+                    (entry.get("status") or "").title() or "-",
                     content_text,
                 ]
                 page, cursor = _draw_row(page, cursor, row_values, status_key)
