@@ -1622,7 +1622,7 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
     document.add_page_break()
     document.add_heading("Three-Part Communication (3PC) Summary", level=1)
 
-    headers = ["Speaker", "Start", "End", "Status", "Reference", "Content"]
+    headers = ["Speaker", "Start", "End", "Status", "Content"]
     table = document.add_table(rows=1, cols=len(headers))
     try:
         table.style = "Light Grid Accent 1"
@@ -1668,7 +1668,6 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
                 _format_timestamp(entry.get("start")),
                 _format_timestamp(entry.get("end")),
                 (entry.get("status") or "").capitalize() or "-",
-                entry.get("reference") or "-",
                 entry.get("content") or "",
             ]
             for cell, value in zip(row.cells, values):
@@ -1847,8 +1846,6 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             for entry in entries:
                 status_key = (entry.get("status") or "").lower()
                 content_text = entry.get("content") or ""
-                if entry.get("reference"):
-                    content_text = f"{content_text}\nReference: {entry['reference']}"
                 row_values = [
                     entry.get("speaker") or "Unknown",
                     _format_timestamp(entry.get("start")),
