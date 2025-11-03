@@ -35,6 +35,7 @@ from .new_utils import (
     transcribe_audio_from_s3,
     diarization_from_audio,
     build_speaker_summary,
+    build_speaker_contexts,
     find_missing,
     upload_file_to_s3,
     get_s3_key_from_url,
@@ -110,7 +111,11 @@ def _start_diarization_thread(
         close_old_connections()
         try:
             segments = diarization_from_audio(audio_source, transcript_segments, transcript_words)
-            payload = {"segments": segments, "speakers": build_speaker_summary(segments)}
+            payload = {
+                "segments": segments,
+                "speakers": build_speaker_summary(segments),
+                "contexts": build_speaker_contexts(segments),
+            }
             AudioFile.objects.filter(id=audio_file_id).update(
                 diarization=payload,
                 diarization_status='completed',
@@ -623,6 +628,7 @@ class SpeakerProfileMappingView(CreateAPIView):
         diarization_payload = {
             'segments': updated_segments,
             'speakers': build_speaker_summary(updated_segments),
+            'contexts': build_speaker_contexts(updated_segments),
         }
         audio_file.diarization = diarization_payload
         audio_file.save(update_fields=['diarization'])
