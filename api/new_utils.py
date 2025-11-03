@@ -8,7 +8,7 @@ import threading
 import textwrap
 import importlib.util
 from contextlib import contextmanager, suppress
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import boto3
 import numpy as np
@@ -27,7 +27,6 @@ import docx.oxml
 import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
-# Add at top (after existing ML imports like whisper/pyannote)
 from sentence_transformers import SentenceTransformer
 import torch  # If not present, add to requirements
 
@@ -54,12 +53,195 @@ from pyannote.core import Segment
 from .models import SpeakerProfile
 from .speaker_utils import match_speaker_embedding
 
-# Load Whisper model once
-model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
+# Configure Whisper for faster inference without sacrificing accuracy
+_WHISPER_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+_WHISPER_FP16 = _WHISPER_DEVICE == "cuda"
+_WHISPER_OPTIONS: Dict[str, Any] = {
+    "word_timestamps": True,
+    "condition_on_previous_text": False,
+    "fp16": _WHISPER_FP16,
+}
+
+_WHISPER_BEAM_SIZE = getattr(settings, "WHISPER_BEAM_SIZE", None)
+if _WHISPER_BEAM_SIZE:
+    _WHISPER_OPTIONS["beam_size"] = int(_WHISPER_BEAM_SIZE)
+
+_WHISPER_BEST_OF = getattr(settings, "WHISPER_BEST_OF", None)
+if _WHISPER_BEST_OF:
+    _WHISPER_OPTIONS["best_of"] = int(_WHISPER_BEST_OF)
+
+_WHISPER_TEMPERATURE = getattr(settings, "WHISPER_TEMPERATURE", 0.0)
+if _WHISPER_TEMPERATURE is not None:
+    _WHISPER_OPTIONS["temperature"] = float(_WHISPER_TEMPERATURE)
+
+_WHISPER_LANGUAGE = getattr(settings, "WHISPER_LANGUAGE", None)
+if _WHISPER_LANGUAGE:
+    _WHISPER_OPTIONS["language"] = _WHISPER_LANGUAGE
+
+try:
+    if getattr(settings, "WHISPER_THREADS", None):
+        torch.set_num_threads(int(settings.WHISPER_THREADS))
+except Exception:
+    logging.getLogger(__name__).debug("Unable to honour WHISPER_THREADS setting", exc_info=True)
+
+# Load Whisper model once on the most optimal device
+model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'), device=_WHISPER_DEVICE)
 
 _DIARIZATION_PIPELINE: Optional[Pipeline] = None
 _EMBEDDING_INFERENCE: Optional[Inference] = None
 _MODEL_LOCK = threading.Lock()
+
+
+def _normalize_vector(vector: Iterable[float]) -> Optional[np.ndarray]:
+    try:
+        arr = np.asarray(list(vector), dtype=float)
+    except Exception:
+        return None
+
+    if arr.size == 0 or np.isnan(arr).any() or np.isinf(arr).any():
+        return None
+
+    norm = np.linalg.norm(arr)
+    if norm == 0 or not np.isfinite(norm):
+        return None
+
+    return arr / norm
+
+
+def _cosine_similarity(vec_a: Iterable[float], vec_b: Iterable[float]) -> Optional[float]:
+    norm_a = _normalize_vector(vec_a)
+    norm_b = _normalize_vector(vec_b)
+    if norm_a is None or norm_b is None:
+        return None
+    similarity = float(np.dot(norm_a, norm_b))
+    if not np.isfinite(similarity):
+        return None
+    return similarity
+
+
+def _resolve_speaker_collisions(
+    segments: List[Dict[str, Any]],
+    *,
+    min_duration: float = 0.15,
+) -> List[Dict[str, Any]]:
+    """Trim or drop overlapping segments that would mix speaker contexts."""
+    if not segments:
+        return []
+
+    ordered = sorted(segments, key=lambda seg: (seg.get("start", 0.0), seg.get("end", 0.0)))
+    resolved: List[Dict[str, Any]] = []
+
+    for seg in ordered:
+        start = float(seg.get("start", 0.0))
+        end = float(seg.get("end", 0.0))
+        if start >= end:
+            continue
+
+        seg_copy = seg.copy()
+        merged_into_existing = False
+
+        for prev in reversed(resolved):
+            prev_end = float(prev.get("end", 0.0))
+            if prev_end <= start:
+                break
+            if (prev.get("speaker") or prev.get("speaker_label")) == (
+                seg_copy.get("speaker") or seg_copy.get("speaker_label")
+            ):
+                # Collapse overlapping content for the same speaker.
+                prev["end"] = max(prev_end, end)
+                prev["duration"] = round(max(prev["end"] - prev.get("start", 0.0), 0.0), 2)
+                merged_into_existing = True
+                break
+
+            # Different speakers: trim the new segment to avoid overlap.
+            start = max(start, prev_end)
+            seg_copy["start"] = start
+
+        if merged_into_existing:
+            continue
+
+        if seg_copy.get("end", end) - seg_copy.get("start", start) < min_duration:
+            continue
+
+        seg_copy["start"] = float(seg_copy["start"])
+        seg_copy["end"] = float(seg_copy.get("end", end))
+        resolved.append(seg_copy)
+
+    return sorted(resolved, key=lambda seg: (seg.get("start", 0.0), seg.get("end", 0.0)))
+
+
+def _gather_label_statistics(segments: List[Dict[str, Any]]):
+    label_vectors: Dict[str, List[List[float]]] = {}
+    for segment in segments:
+        label = segment.get("speaker_label") or segment.get("speaker")
+        vec = segment.get("speaker_vector")
+        if label and vec:
+            label_vectors.setdefault(label, []).append(vec)
+
+    label_means: Dict[str, List[float]] = {}
+    for label, vectors in label_vectors.items():
+        try:
+            arr = np.array(vectors, dtype=float)
+        except Exception:
+            continue
+        if arr.size == 0:
+            continue
+        if np.isnan(arr).any() or np.isinf(arr).any():
+            continue
+        mean_vec = np.mean(arr, axis=0)
+        if mean_vec is None or np.isnan(mean_vec).any() or np.isinf(mean_vec).any():
+            continue
+        label_means[label] = mean_vec.tolist()
+
+    return label_vectors, label_means
+
+
+def _reassign_segments_by_similarity(
+    segments: List[Dict[str, Any]],
+    label_means: Dict[str, List[float]],
+    *,
+    margin: float = 0.05,
+) -> bool:
+    """Reassign segments whose embeddings align better with another speaker."""
+
+    if not segments or not label_means:
+        return False
+
+    normalized_means = {
+        label: _normalize_vector(vec)
+        for label, vec in label_means.items()
+    }
+
+    updated = False
+
+    for segment in segments:
+        vector = segment.get("speaker_vector")
+        if not vector:
+            continue
+
+        current_label = segment.get("speaker_label") or segment.get("speaker")
+        current_score = None
+        best_label = current_label
+        best_score = -float("inf")
+
+        for label, mean_vec in normalized_means.items():
+            if mean_vec is None:
+                continue
+            similarity = _cosine_similarity(vector, mean_vec)
+            if similarity is None:
+                continue
+            if label == current_label:
+                current_score = similarity
+            if similarity > best_score:
+                best_score = similarity
+                best_label = label
+
+        if best_label != current_label and best_score - (current_score or -float("inf")) >= margin:
+            segment["speaker_label"] = best_label
+            segment["speaker"] = best_label
+            updated = True
+
+    return updated
 
 
 def _get_hf_token() -> Optional[str]:
@@ -87,10 +269,23 @@ def _get_embedding_inference() -> Inference:
     if _EMBEDDING_INFERENCE is None:
         with _MODEL_LOCK:
             if _EMBEDDING_INFERENCE is None:
-                embedding_model = Model.from_pretrained(
-                    "pyannote/embedding",
-                    use_auth_token=_get_hf_token(),
-                )
+                embedding_model = None
+                try:
+                    embedding_model = Model.from_pretrained(
+                        "pyannote/embedding",
+                        use_auth_token=_get_hf_token(),
+                        revision="reboost",
+                    )
+                    logging.getLogger(__name__).info("Loaded pyannote/embedding reboost revision")
+                except Exception as exc:
+                    logging.getLogger(__name__).warning(
+                        "Falling back to default pyannote embedding model: %s", exc
+                    )
+                    embedding_model = Model.from_pretrained(
+                        "pyannote/embedding",
+                        use_auth_token=_get_hf_token(),
+                    )
+
                 _EMBEDDING_INFERENCE = Inference(embedding_model, window="whole")
     return _EMBEDDING_INFERENCE
 
@@ -186,8 +381,8 @@ def transcribe_audio_from_s3(s3_url):
     s3_key = get_s3_key_from_url(s3_url)
     temp_path = download_file_from_s3(s3_key)
     try:
-        # Use word_timestamps=True to get word-level info
-        result = model.transcribe(temp_path, word_timestamps=True)
+        with torch.inference_mode():
+            result = model.transcribe(temp_path, **_WHISPER_OPTIONS)
         if not result or not result.get("text"):
             raise ValueError("Transcription result is empty or invalid.")
         return result  # Return the full result dict
@@ -1010,99 +1205,104 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
 
         return merged
     
-    # Process diarization results
-    diarization_segments = []
+    # Process diarization results with collision handling
+    diarization_segments: List[Dict[str, Any]] = []
     label_map: Dict[str, str] = {}
     label_index = 0
+    raw_segments: List[Dict[str, Any]] = []
 
     for turn, _, speaker in diarization.itertracks(yield_label=True):
         seg_start = float(turn.start)
         seg_end = float(turn.end)
 
-        # Extract text using the appropriate method
+        if seg_end - seg_start <= 0:
+            continue
+
+        if speaker not in label_map:
+            label_map[speaker] = f"SPEAKER_{label_index}"
+            label_index += 1
+
+        raw_segments.append({
+            "speaker": label_map[speaker],
+            "speaker_label": label_map[speaker],
+            "start": seg_start,
+            "end": seg_end,
+        })
+
+    min_seg_duration = getattr(settings, "DIARIZATION_MIN_SEGMENT_DURATION", 0.15)
+    sanitized_segments = _resolve_speaker_collisions(raw_segments, min_duration=min_seg_duration)
+
+    for base_segment in sanitized_segments:
+        seg_start = float(base_segment.get("start", 0.0))
+        seg_end = float(base_segment.get("end", 0.0))
+
         if transcript_words:
             segment_text = get_segment_text_from_words(transcript_words, seg_start, seg_end)
         else:
             segment_text = get_segment_text_from_segments(transcript_segments, seg_start, seg_end)
 
-        # Only add segments with actual content or significant duration
-        if segment_text.strip() or (seg_end - seg_start) > 0.5:
-            if speaker not in label_map:
-                label_map[speaker] = f"SPEAKER_{label_index}"
-                label_index += 1
+        if not segment_text.strip() and (seg_end - seg_start) <= 0.5:
+            continue
 
-            requested_segment = Segment(seg_start, seg_end)
-            vector_list = None
+        requested_segment = Segment(seg_start, seg_end)
+        vector_list = None
 
-            try:
+        try:
+            if embedding_inference is not None:
                 duration = seg_end - seg_start
                 target_segment = requested_segment
 
-                if duration < min_embed_duration and audio_duration:
-                    center = seg_start + (duration / 2.0)
-                    padded_start = max(0.0, center - min_embed_duration / 2.0)
-                    padded_end = min(audio_duration, padded_start + min_embed_duration)
+                if duration < min_embed_duration:
+                    extension = (min_embed_duration - duration) / 2
+                    start = max(0, seg_start - extension)
+                    end = min(audio_duration or seg_end + extension, seg_end + extension)
+                    target_segment = Segment(start, end)
 
-                    if padded_end - padded_start >= min_embed_duration * 0.5:
-                        target_segment = Segment(padded_start, padded_end)
+                vector = embedding_inference.crop(wav_path, target_segment)
+                if vector is not None:
+                    vector_list = vector.tolist()
+        except Exception as exc:
+            logging.warning(
+                "Skipping embedding for segment %.3f-%.3f: %s",
+                seg_start,
+                seg_end,
+                exc,
+            )
 
-                if target_segment.duration > 0:
-                    vector = embedding_inference.crop(wav_path, target_segment)
-                    if vector is not None:
-                        vector_list = vector.tolist()
-            except Exception as exc:
-                logging.warning(
-                    "Skipping embedding for segment %.3f-%.3f: %s",
-                    seg_start,
-                    seg_end,
-                    exc,
-                )
+        diarization_segments.append({
+            "speaker": base_segment.get("speaker"),
+            "speaker_label": base_segment.get("speaker_label"),
+            "start": seg_start,
+            "end": seg_end,
+            "text": segment_text.strip(),
+            "duration": round(seg_end - seg_start, 2),
+            "speaker_vector": vector_list,
+            "speaker_profile_id": None,
+        })
 
-            diarization_segments.append({
-                "speaker": label_map[speaker],
-                "speaker_label": label_map[speaker],
-                "start": seg_start,
-                "end": seg_end,
-                "text": segment_text.strip(),
-                "duration": round(seg_end - seg_start, 2),
-                "speaker_vector": vector_list,
-                "speaker_profile_id": None,
-            })
+    diarization_segments.sort(key=lambda seg: seg.get("start", 0.0))
 
     # Merge consecutive segments from the same speaker
     diarization_segments = merge_consecutive_same_speaker_segments(diarization_segments)
 
     # Filter out very short segments with no text
     diarization_segments = [
-        seg for seg in diarization_segments 
+        seg for seg in diarization_segments
         if seg['text'].strip() or seg['duration'] > 1.0
     ]
-    
-    # Attempt to match diarized speakers with stored profiles
-    label_vectors: Dict[str, List[List[float]]] = {}
-    for segment in diarization_segments:
-        label = segment.get("speaker_label") or segment.get("speaker")
-        vec = segment.get("speaker_vector")
-        if label and vec:
-            label_vectors.setdefault(label, []).append(vec)
+
+    _, label_means = _gather_label_statistics(diarization_segments)
+    if _reassign_segments_by_similarity(diarization_segments, label_means):
+        diarization_segments = merge_consecutive_same_speaker_segments(diarization_segments)
+        diarization_segments = [
+            seg for seg in diarization_segments
+            if seg['text'].strip() or seg['duration'] > 1.0
+        ]
+        _, label_means = _gather_label_statistics(diarization_segments)
 
     matched_profiles: Dict[str, SpeakerProfile] = {}
-    label_means: Dict[str, List[float]] = {}
-    for label, vectors in label_vectors.items():
-        try:
-            arr = np.array(vectors, dtype=float)
-        except Exception:
-            continue
-        if arr.size == 0:
-            continue
-        if np.isnan(arr).any() or np.isinf(arr).any():
-            continue
-        mean_vec = np.mean(arr, axis=0)
-        if mean_vec is None or np.isnan(mean_vec).any() or np.isinf(mean_vec).any():
-            continue
-        mean_vec_list = mean_vec.tolist()
-        label_means[label] = mean_vec_list
 
+    for label, mean_vec_list in label_means.items():
         profile = match_speaker_embedding(mean_vec_list, threshold=threshold)
         if profile:
             matched_profiles[label] = profile
@@ -1167,6 +1367,27 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
         entry['total_duration'] = round(entry['total_duration'], 2)
 
     return list(summary.values())
+
+
+def build_speaker_contexts(segments: Optional[List[Dict]]) -> Dict[str, List[Dict[str, Any]]]:
+    contexts: Dict[str, List[Dict[str, Any]]] = {}
+    for seg in segments or []:
+        label = seg.get('speaker_label') or seg.get('speaker')
+        if not label:
+            continue
+        contexts.setdefault(label, []).append({
+            'start': seg.get('start'),
+            'end': seg.get('end'),
+            'duration': seg.get('duration'),
+            'text': seg.get('text', ''),
+            'speaker_name': seg.get('speaker_name'),
+            'speaker_profile_id': seg.get('speaker_profile_id'),
+        })
+
+    for entries in contexts.values():
+        entries.sort(key=lambda item: (item.get('start') or 0.0, item.get('end') or 0.0))
+
+    return contexts
 
 
 def _format_timestamp(seconds: Optional[float]) -> str:
