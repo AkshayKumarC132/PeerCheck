@@ -1171,39 +1171,76 @@ def build_speaker_summary(segments: Optional[List[Dict]]) -> List[Dict]:
 
 
 VERIFICATION_PHRASES: Set[str] = {
-    "that's correct",
-    "that is correct",
-    "that's right",
-    "that is right",
+    "10-4",
+    "absolutely",
+    "acknowledged",
+    "affirm",
+    "affirmative",
+    "agreed",
+    "all good",
+    "aye",
+    "check",
+    "confirmed",
+    "concur",
+    "copy that",
     "correct",
     "exactly",
-    "absolutely",
-    "affirmative",
-    "confirmed",
-    "you got it",
-    "sounds good",
-    "understood",
     "got it",
-    "makes sense",
-    "roger",
-    "copy that",
-    "all good",
     "indeed",
+    "i agree",
+    "i confirm",
+    "makes sense",
+    "precisely",
     "right on",
+    "roger",
+    "roger that",
+    "sounds good",
+    "that's accurate",
+    "that's correct",
+    "that's right",
+    "that is correct",
+    "that is right",
+    "understand",
+    "understood",
+    "verified",
+    "will do",
+    "wilco",
+    "yes correct",
+    "yes ma'am",
+    "yes sir",
+    "yes that's right",
+    "yep",
+    "yup",
+    "you got it",
 }
 
 READBACK_PHRASES: Set[str] = {
-    "read back",
-    "reading back",
-    "let me repeat",
-    "to confirm",
-    "confirming",
+    "and you",
+    "and you're",
     "confirm that",
-    "let me make sure",
+    "confirming",
     "just to clarify",
     "double checking",
+    "i understand",
+    "let me make sure",
+    "let me repeat",
+    "moving to",
+    "next step",
+    "proceed to",
+    "read back",
+    "reading back",
+    "so you",
+    "so you're",
     "recapping",
     "summarizing",
+    "to confirm",
+    "understand you",
+    "you are",
+    "you completed",
+    "you have",
+    "you're done",
+    "you're ready",
+    "you've",
 }
 
 
@@ -1726,39 +1763,76 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             content_width = width - 2 * margin
 
             columns = []
-            max_lines = 1
             for value, ratio in zip(values, content_width_ratio):
                 col_width = content_width * ratio
                 lines = _wrap_cell(value, col_width - (2 * row_padding))
                 columns.append((col_width, lines))
-                max_lines = max(max_lines, len(lines))
-
-            row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
-            if y_pos + row_height > available_height:
-                page, y_pos = _new_page()
-                return _draw_row(page, y_pos, values, status_key)
 
             shading = status_shading.get(status_key, (0.95, 0.95, 0.95))
             font_color = status_font.get(status_key, (0, 0, 0))
+            line_height = body_font_size + 2
 
-            x = margin
-            for idx, (col_width, lines) in enumerate(columns):
-                rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
-                page.draw_rect(rect, color=(0.7, 0.7, 0.7), width=0.2, fill=shading)
+            remaining_lines = [list(lines) for _, lines in columns]
+            column_widths = [col_width for col_width, _ in columns]
 
-                text_y = y_pos + row_padding + body_font_size
-                for line in lines:
-                    page.insert_text(
-                        (x + row_padding, text_y),
-                        line,
-                        fontsize=body_font_size,
-                        fontname="helv",
-                        fill=font_color if headers[idx] == "Status" else (0, 0, 0),
-                    )
-                    text_y += body_font_size + 2
-                x += col_width
+            while True:
+                if all(not lines for lines in remaining_lines):
+                    break
 
-            return page, y_pos + row_height
+                if y_pos + (2 * row_padding) + line_height > available_height:
+                    page, y_pos = _new_page()
+                    continue
+
+                usable_height = available_height - y_pos - (2 * row_padding)
+                max_lines_fit = max(int(usable_height / line_height), 0)
+
+                if max_lines_fit <= 0:
+                    page, y_pos = _new_page()
+                    continue
+
+                chunk_lines: List[List[str]] = []
+                max_lines = 0
+                more_remaining = False
+                for lines in remaining_lines:
+                    chunk = lines[:max_lines_fit] if lines else []
+                    chunk_lines.append(chunk)
+                    max_lines = max(max_lines, len(chunk))
+                    if len(lines) > len(chunk):
+                        more_remaining = True
+
+                if max_lines == 0:
+                    # No content to draw on this page section; move to next page.
+                    page, y_pos = _new_page()
+                    continue
+
+                row_height = max_lines * line_height + (2 * row_padding)
+                x = margin
+                for idx, (col_width, lines_chunk) in enumerate(zip(column_widths, chunk_lines)):
+                    rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
+                    page.draw_rect(rect, color=(0.7, 0.7, 0.7), width=0.2, fill=shading)
+
+                    text_y = y_pos + row_padding + body_font_size
+                    for line in lines_chunk:
+                        page.insert_text(
+                            (x + row_padding, text_y),
+                            line,
+                            fontsize=body_font_size,
+                            fontname="helv",
+                            fill=font_color if headers[idx] == "Status" else (0, 0, 0),
+                        )
+                        text_y += line_height
+                    x += col_width
+
+                for idx, chunk in enumerate(chunk_lines):
+                    if chunk:
+                        remaining_lines[idx] = remaining_lines[idx][len(chunk) :]
+
+                y_pos += row_height
+
+                if not more_remaining:
+                    break
+
+            return page, y_pos
 
         page, cursor = _new_page()
 
