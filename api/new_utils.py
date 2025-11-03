@@ -1335,61 +1335,117 @@ def _merge_incomplete_segments(
 def _detect_3pc_patterns(
     segments: List[Dict[str, Any]],
     gap_tolerance: float = 5.0,
-) -> List[Dict[str, int]]:
-    """Identify sender/receiver/sender confirmation patterns."""
+) -> List[Dict[str, Any]]:
+    """Identify sender/receiver/confirmation patterns across flexible spans."""
 
-    patterns: List[Dict[str, int]] = []
-    for idx in range(len(segments) - 2):
-        first, second, third = segments[idx : idx + 3]
-        speaker_a = _segment_speaker(first)
-        speaker_b = _segment_speaker(second)
-        speaker_c = _segment_speaker(third)
-        if speaker_a == speaker_b or speaker_a != speaker_c:
-            continue
+    patterns: List[Dict[str, Any]] = []
+    if not segments:
+        return patterns
 
-        def _gap(left: Dict[str, Any], right: Dict[str, Any]) -> float:
-            try:
-                return max(
-                    0.0,
-                    float(right.get("start") or 0.0) - float(left.get("end") or 0.0),
-                )
-            except (TypeError, ValueError):
-                return gap_tolerance
+    pattern_counter = 1
+    idx = 0
+    total_segments = len(segments)
 
-        if _gap(first, second) > gap_tolerance or _gap(second, third) > gap_tolerance:
-            continue
-
-        readback_text = _segment_text(second)
-        confirmation_text = _segment_text(third)
-        readback_detected = _is_readback_phrase(readback_text)
-        confirmation_detected = _is_verification_phrase(confirmation_text)
-        if not confirmation_detected:
-            # Allow confirmations that mirror the receiver's readback closely.
-            similarity_to_readback = (
-                fuzz.partial_ratio(readback_text.lower(), confirmation_text.lower()) / 100.0
-                if readback_text and confirmation_text
-                else 0.0
+    def _gap(left: Dict[str, Any], right: Dict[str, Any]) -> float:
+        try:
+            return max(
+                0.0,
+                float(right.get("start") or 0.0) - float(left.get("end") or 0.0),
             )
-            confirmation_detected = similarity_to_readback >= 0.8
+        except (TypeError, ValueError):
+            return gap_tolerance
 
-        if not (readback_detected or confirmation_detected):
-            # Require at least one specialised cue to avoid over-classifying.
+    while idx < total_segments - 1:
+        first = segments[idx]
+        sender_speaker = _segment_speaker(first)
+        if not sender_speaker:
+            idx += 1
             continue
 
-        similarity_to_sender = (
-            fuzz.partial_ratio(_segment_text(first).lower(), readback_text.lower()) / 100.0
-            if readback_text
-            else 0.0
-        )
+        sender_text = _segment_text(first)
+        receiver_indices: List[int] = []
+        sender_followups: List[int] = []
+        intermediate_indices: List[int] = []
+        receiver_fragments: List[str] = []
+        confirmation_index: Optional[int] = None
 
-        patterns.append(
-            {
-                "sender_index": idx,
-                "receiver_index": idx + 1,
-                "confirmation_index": idx + 2,
-                "receiver_similarity": similarity_to_sender,
+        previous = first
+        j = idx + 1
+        while j < total_segments:
+            current = segments[j]
+            if _gap(previous, current) > gap_tolerance:
+                break
+
+            current_speaker = _segment_speaker(current)
+            current_text = _segment_text(current)
+
+            if not current_text:
+                intermediate_indices.append(j)
+                previous = current
+                j += 1
+                continue
+
+            if current_speaker == sender_speaker:
+                is_confirmation = _is_verification_phrase(current_text)
+                if not is_confirmation and receiver_fragments:
+                    aggregated_receiver = " ".join(receiver_fragments)
+                    if aggregated_receiver:
+                        similarity_score = (
+                            fuzz.partial_ratio(aggregated_receiver.lower(), current_text.lower())
+                            / 100.0
+                        )
+                        is_confirmation = similarity_score >= 0.8
+
+                if is_confirmation:
+                    confirmation_index = j
+                    break
+
+                sender_followups.append(j)
+            else:
+                receiver_indices.append(j)
+                receiver_fragments.append(current_text)
+
+            intermediate_indices.append(j)
+            previous = current
+            j += 1
+
+        if confirmation_index is not None and receiver_indices:
+            aggregated_receiver_text = " ".join(receiver_fragments)
+            receiver_similarity = 0.0
+            if sender_text and aggregated_receiver_text:
+                receiver_similarity = (
+                    fuzz.partial_ratio(sender_text.lower(), aggregated_receiver_text.lower())
+                    / 100.0
+                )
+
+            roles: Dict[int, str] = {
+                idx: "sender",
+                confirmation_index: "confirmation",
             }
-        )
+            for offset, receiver_idx in enumerate(receiver_indices):
+                roles[receiver_idx] = "receiver" if offset == 0 else "receiver_followup"
+            for sender_idx in sender_followups:
+                roles.setdefault(sender_idx, "sender_followup")
+
+            pattern_id = f"3pc-{pattern_counter}"
+            pattern_counter += 1
+
+            patterns.append(
+                {
+                    "id": pattern_id,
+                    "sender_index": idx,
+                    "receiver_indices": receiver_indices,
+                    "sender_followup_indices": sender_followups,
+                    "confirmation_index": confirmation_index,
+                    "intermediate_indices": intermediate_indices,
+                    "receiver_similarity": receiver_similarity,
+                    "roles": roles,
+                }
+            )
+
+            idx = confirmation_index + 1
+        else:
+            idx += 1
 
     return patterns
 
@@ -1508,9 +1564,14 @@ def build_three_part_communication_summary(
     partial_threshold = max(match_threshold * 0.8, 0.45)
 
     patterns = _detect_3pc_patterns(merged_segments)
-    sender_lookup = {p["sender_index"]: p for p in patterns}
-    receiver_lookup = {p["receiver_index"]: p for p in patterns}
-    confirmation_lookup = {p["confirmation_index"]: p for p in patterns}
+    pattern_lookup: Dict[int, Dict[str, Any]] = {}
+    role_lookup: Dict[int, str] = {}
+    for order, pattern in enumerate(patterns):
+        bundle_id = pattern.get("id") or f"3pc-{order + 1}"
+        pattern["id"] = bundle_id
+        for index, role in pattern.get("roles", {}).items():
+            pattern_lookup[index] = pattern
+            role_lookup[index] = role
 
     summary_entries: List[Dict[str, Any]] = []
     index_to_entry: Dict[int, Dict[str, Any]] = {}
@@ -1535,24 +1596,44 @@ def build_three_part_communication_summary(
         similarity = combined_score
         context_links: Dict[str, Any] = {}
 
-        if idx in confirmation_lookup or _is_verification_phrase(text):
+        pattern = pattern_lookup.get(idx)
+        role = role_lookup.get(idx)
+
+        if role == "confirmation" or _is_verification_phrase(text):
             status = "acknowledged"
-            if idx in confirmation_lookup:
-                pattern = confirmation_lookup[idx]
+            if role == "confirmation" and pattern:
                 sender_entry = index_to_entry.get(pattern["sender_index"])
-                receiver_entry = index_to_entry.get(pattern["receiver_index"])
+                receiver_entries = [
+                    index_to_entry.get(r_idx)
+                    for r_idx in pattern.get("receiver_indices", [])
+                ]
                 if sender_entry:
                     matched_reference = sender_entry.get("reference") or matched_reference
                     similarity = max(similarity, sender_entry.get("similarity") or 0.0)
                     context_links["sender"] = sender_entry.get("speaker")
-                if receiver_entry:
-                    context_links["receiver"] = receiver_entry.get("speaker")
+                receiver_names = [
+                    entry.get("speaker")
+                    for entry in receiver_entries
+                    if entry and entry.get("speaker")
+                ]
+                if receiver_names:
+                    context_links["receivers"] = receiver_names
+                for receiver_entry in receiver_entries:
+                    if not receiver_entry:
+                        continue
                     if not matched_reference:
                         matched_reference = receiver_entry.get("reference")
-                        similarity = max(similarity, receiver_entry.get("similarity") or 0.0)
+                    similarity = max(
+                        similarity,
+                        receiver_entry.get("similarity") or 0.0,
+                    )
+                context_links["bundle_id"] = pattern["id"]
+                context_links["role"] = "confirmation"
             elif previous_entry and previous_entry.get("status") in {"match", "partial match"}:
                 matched_reference = previous_entry.get("reference") or matched_reference
                 similarity = max(similarity, previous_entry.get("similarity") or 0.0)
+            else:
+                context_links.setdefault("role", "confirmation")
         else:
             long_enough = len(text.split()) >= 4
             if bucket:
@@ -1566,14 +1647,17 @@ def build_three_part_communication_summary(
                 if long_enough:
                     status = "mismatch"
 
-            if idx in receiver_lookup:
-                pattern = receiver_lookup[idx]
-                context_links["role"] = "receiver"
+            if pattern and role in {"receiver", "receiver_followup"}:
                 if status == "general conversation":
                     status = "partial match" if combined_score >= 0.4 else "general conversation"
-                context_links["receiver_similarity"] = round(pattern["receiver_similarity"], 2)
-            elif idx in sender_lookup:
-                context_links["role"] = "sender"
+                context_links["role"] = role
+                context_links["bundle_id"] = pattern["id"]
+                context_links.setdefault(
+                    "receiver_similarity", round(pattern.get("receiver_similarity", 0.0), 2)
+                )
+            elif pattern and role in {"sender", "sender_followup"}:
+                context_links["role"] = role
+                context_links["bundle_id"] = pattern["id"]
                 if status == "general conversation" and combined_score >= partial_threshold:
                     status = "partial match"
 
@@ -1593,14 +1677,19 @@ def build_three_part_communication_summary(
         }
         if bucket:
             entry["bucket_id"] = bucket["id"]
+        if pattern:
+            entry["bundle_id"] = pattern["id"]
         if context_links:
             entry["context"] = context_links
-        if idx in sender_lookup and status != "acknowledged":
-            entry.setdefault("context", {}).update({"role": "sender"})
-        if idx in confirmation_lookup:
-            entry.setdefault("context", {}).update({"role": "confirmation"})
-        elif idx in receiver_lookup:
-            entry.setdefault("context", {}).update({"role": "receiver"})
+        if pattern:
+            entry.setdefault("context", {})
+            entry["context"].setdefault("bundle_id", pattern["id"])
+            if role:
+                entry["context"].setdefault("role", role)
+            if role in {"receiver", "receiver_followup"} and "receiver_similarity" not in entry["context"]:
+                entry["context"]["receiver_similarity"] = round(
+                    pattern.get("receiver_similarity", 0.0), 2
+                )
 
         summary_entries.append(entry)
         index_to_entry[idx] = entry
