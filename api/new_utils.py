@@ -1290,6 +1290,96 @@ def _merge_incomplete_segments(segments: List[Dict], max_gap: float = 1.5) -> Li
     logging.info(f"Segment merging: {len(segments)} → {len(merged)}")
     return merged
 
+
+def _split_segments_on_verification_phrases(segments: List[Dict]) -> List[Dict]:
+    """Split segments that contain embedded verification phrases."""
+
+    if not segments:
+        return []
+
+    split_segments: List[Dict] = []
+
+    for segment in segments:
+        original_text = (segment.get("text") or "").strip()
+        if not original_text:
+            split_segments.append(segment)
+            continue
+
+        # Split on sentence boundaries first.
+        sentences = [
+            sentence.strip()
+            for sentence in re.split(r"(?<=[.!?])\s+", original_text)
+            if sentence.strip()
+        ]
+
+        contains_verification_sentence = any(
+            _is_verification_phrase(sentence) for sentence in sentences
+        )
+
+        # Fallback: detect verification phrase embedded without punctuation.
+        if not contains_verification_sentence:
+            match = None
+            for phrase in sorted(VERIFICATION_PHRASES, key=len, reverse=True):
+                pattern = re.compile(re.escape(phrase), flags=re.IGNORECASE)
+                match = pattern.search(original_text)
+                if match:
+                    before = original_text[: match.start()].strip()
+                    after = original_text[match.end() :].strip()
+                    if before or after:
+                        sentences = []
+                        if before:
+                            sentences.append(before)
+                        sentences.append(original_text[match.start() : match.end()])
+                        if after:
+                            sentences.append(after)
+                        contains_verification_sentence = True
+                    break
+
+        if not contains_verification_sentence or len(sentences) == 1:
+            split_segments.append(segment)
+            continue
+
+        # Allocate timestamps proportionally across the new segments.
+        start = segment.get("start")
+        end = segment.get("end")
+        total_duration = None
+        if start is not None and end is not None:
+            try:
+                total_duration = max(float(end) - float(start), 0.0)
+            except (TypeError, ValueError):
+                total_duration = None
+
+        weights = [max(len(sentence), 1) for sentence in sentences]
+        weight_sum = sum(weights) or 1
+        current_start = float(start) if total_duration is not None else start
+
+        for idx, sentence in enumerate(sentences):
+            new_segment = segment.copy()
+            new_segment["text"] = sentence
+
+            if total_duration is not None and start is not None and end is not None:
+                portion = total_duration * (weights[idx] / weight_sum)
+                new_start = current_start if current_start is not None else float(start)
+                new_end = new_start + portion if idx < len(sentences) - 1 else float(end)
+                new_segment["start"] = round(new_start, 2)
+                new_segment["end"] = round(new_end, 2)
+                new_segment["duration"] = round(new_segment["end"] - new_segment["start"], 2)
+                current_start = new_end
+            else:
+                # Preserve available timestamps without attempting to split further.
+                new_segment["start"] = segment.get("start")
+                new_segment["end"] = segment.get("end")
+                if "duration" in new_segment and isinstance(new_segment.get("duration"), (int, float)):
+                    new_segment["duration"] = segment.get("duration")
+
+            split_segments.append(new_segment)
+
+    logging.info(
+        "Segment verification split: %d → %d", len(segments), len(split_segments)
+    )
+    return split_segments
+
+
 def _detect_3pc_patterns(segments: List[Dict]) -> List[Dict]:
     """
     Detect 3PC patterns: Statement → Readback → Confirmation
@@ -1335,6 +1425,54 @@ def _detect_3pc_patterns(segments: List[Dict]) -> List[Dict]:
                 prev['_3pc_role'] = 'statement'
     
     return segments
+
+
+def _assign_communication_groups(segments: List[Dict]) -> None:
+    """Label segments as part of two-part or three-part communications."""
+
+    group_id = 0
+    processed_indices: Set[int] = set()
+
+    for idx, segment in enumerate(segments):
+        if segment.get("_3pc_role") != "confirmation" or idx in processed_indices:
+            continue
+
+        group_members: Set[int] = {idx}
+        roles_present: Set[str] = {"confirmation"}
+
+        readback_idx = segment.get("_3pc_confirms")
+        statement_idx = None
+
+        if isinstance(readback_idx, int) and 0 <= readback_idx < len(segments):
+            readback_segment = segments[readback_idx]
+            if readback_segment.get("_3pc_role") == "readback":
+                group_members.add(readback_idx)
+                roles_present.add("readback")
+                statement_idx = readback_segment.get("_3pc_confirms")
+
+        if isinstance(statement_idx, int) and 0 <= statement_idx < len(segments):
+            statement_segment = segments[statement_idx]
+            if statement_segment.get("_3pc_role") == "statement":
+                group_members.add(statement_idx)
+                roles_present.add("statement")
+
+        # Fallback: confirmations may directly point to statements without readbacks.
+        if ("readback" not in roles_present) and isinstance(readback_idx, int):
+            statement_candidate = segments[readback_idx]
+            if statement_candidate.get("_3pc_role") == "statement":
+                group_members.add(readback_idx)
+                roles_present.add("statement")
+
+        if len(group_members) <= 1:
+            continue
+
+        group_id += 1
+        communication_type = "3pc" if {"statement", "readback", "confirmation"} <= roles_present else "2pc"
+
+        for member_idx in group_members:
+            segments[member_idx]["_communication_group"] = group_id
+            segments[member_idx]["_communication_type"] = communication_type
+            processed_indices.add(member_idx)
 
 
 def _create_document_buckets(
@@ -1433,10 +1571,14 @@ def build_three_part_communication_summary(
     
     # STEP 1: Conservative merging
     segments = _merge_incomplete_segments(segments, max_gap=1.5)
-    
-    # STEP 2: Detect 3PC patterns
+
+    # STEP 2: Split verification phrases that are bundled with other speech
+    segments = _split_segments_on_verification_phrases(segments)
+
+    # STEP 3: Detect 3PC patterns
     segments = _detect_3pc_patterns(segments)
-    
+    _assign_communication_groups(segments)
+
     # Parse reference document
     reference_lines: List[str] = []
     if reference_text:
@@ -1486,6 +1628,7 @@ def build_three_part_communication_summary(
                 "reference": reference_content,
                 "similarity": 1.0,
                 "three_pc_role": "confirmation",
+                "communication_type": segment.get("_communication_type"),
             })
             logging.info(f"✓ Added 3PC Confirmation: {speaker} - '{spoken_text}'")
             continue
@@ -1513,6 +1656,7 @@ def build_three_part_communication_summary(
                 "reference": matched_reference,
                 "similarity": round(best_score, 2),
                 "three_pc_role": "readback",
+                "communication_type": segment.get("_communication_type"),
             })
             continue
         
@@ -1565,10 +1709,11 @@ def build_three_part_communication_summary(
             "reference": matched_reference,
             "similarity": round(best_score, 2),
         }
-        
+
         if three_pc_role == 'statement':
             entry["three_pc_role"] = "statement"
-        
+            entry["communication_type"] = segment.get("_communication_type")
+
         summary_entries.append(entry)
     
     # Sort by timestamp
