@@ -229,6 +229,97 @@ class ThreePartCommunicationSummaryTests(TestCase):
         self.assertGreater(trailing_entry["start"], confirmation_entry["end"])
 
     @patch("api.new_utils._get_sentence_model")
+    def test_only_verification_phrase_is_isolated(self, mock_model):
+        dummy_model = MagicMock()
+        dummy_model.encode.return_value = []
+        mock_model.return_value = dummy_model
+
+        segments = [
+            {
+                "speaker": "Nathan",
+                "start": 50.0,
+                "end": 93.0,
+                "text": (
+                    "That's correct. All right, so 8.2. I have Alpha Lima HK6 Alpha open. "
+                    "And I have checked my indications. I got a green light not lit on Alpha "
+                    "Lima HK6, a red light indicated as lit. And my SFAS panel is lit and NIPIS "
+                    "is showing indications are open. I am ready for you to perform 8.2.3 to "
+                    "locally close KA Charlie 1477."
+                ),
+            }
+        ]
+
+        entries = build_three_part_communication_summary(
+            reference_text=None,
+            diarization_segments=segments,
+            match_threshold=0.0,
+            partial_threshold=0.0,
+        )
+
+        self.assertEqual(len(entries), 2)
+
+        confirmation_entry = next(
+            entry for entry in entries if entry["content"] == "That's correct."
+        )
+
+        narrative_entry = next(
+            entry for entry in entries if entry is not confirmation_entry
+        )
+        self.assertTrue(
+            narrative_entry["content"].startswith("All right, so 8.2."),
+            narrative_entry["content"],
+        )
+        self.assertTrue(
+            narrative_entry["content"].endswith("locally close KA Charlie 1477."),
+            narrative_entry["content"],
+        )
+        self.assertGreater(narrative_entry["end"], confirmation_entry["end"])
+
+    @patch("api.new_utils._get_sentence_model")
+    def test_non_verification_speech_is_recombined(self, mock_model):
+        dummy_model = MagicMock()
+        dummy_model.encode.return_value = []
+        mock_model.return_value = dummy_model
+
+        segments = [
+            {
+                "speaker": "Nathan",
+                "start": 0.0,
+                "end": 4.0,
+                "text": "That's correct. Additional statement one.",
+            },
+            {
+                "speaker": "Nathan",
+                "start": 4.0,
+                "end": 10.0,
+                "text": "Continuing the instructions with more detail.",
+            },
+        ]
+
+        entries = build_three_part_communication_summary(
+            reference_text=None,
+            diarization_segments=segments,
+            match_threshold=0.0,
+            partial_threshold=0.0,
+        )
+
+        self.assertEqual(len(entries), 2)
+
+        confirmation_entry = next(
+            entry for entry in entries if entry["content"] == "That's correct."
+        )
+
+        narrative_entry = next(
+            entry for entry in entries if entry is not confirmation_entry
+        )
+        self.assertIn("Additional statement one.", narrative_entry["content"])
+        self.assertIn("Continuing the instructions", narrative_entry["content"])
+        self.assertAlmostEqual(
+            float(narrative_entry["start"]), float(confirmation_entry["end"]), places=2
+        )
+        self.assertAlmostEqual(narrative_entry["end"], 10.0)
+
+    @patch("api.new_utils._get_sentence_model")
     def test_three_part_communication_is_tagged(self, mock_model):
         dummy_model = MagicMock()
         dummy_model.encode.return_value = []

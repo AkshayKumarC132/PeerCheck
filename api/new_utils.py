@@ -1292,10 +1292,17 @@ def _merge_incomplete_segments(segments: List[Dict], max_gap: float = 1.5) -> Li
 
 
 def _split_segments_on_verification_phrases(segments: List[Dict]) -> List[Dict]:
-    """Split segments that contain embedded verification phrases."""
+    """Split segments so that verification phrases are isolated."""
 
     if not segments:
         return []
+
+    # Build a single regex so that longer phrases are matched first and we can
+    # capture every occurrence, even if multiple appear within the same
+    # diarization segment.
+    phrases = sorted(VERIFICATION_PHRASES, key=len, reverse=True)
+    pattern = re.compile(r"(?i)\b(" + "|".join(re.escape(p) for p in phrases) + r")\b")
+    trailing_punctuation = ",.;:!?)}]\"'”’"
 
     split_segments: List[Dict] = []
 
@@ -1305,39 +1312,37 @@ def _split_segments_on_verification_phrases(segments: List[Dict]) -> List[Dict]:
             split_segments.append(segment)
             continue
 
-        # Split on sentence boundaries first.
-        sentences = [
-            sentence.strip()
-            for sentence in re.split(r"(?<=[.!?])\s+", original_text)
-            if sentence.strip()
-        ]
-
-        contains_verification_sentence = any(
-            _is_verification_phrase(sentence) for sentence in sentences
-        )
-
-        # Fallback: detect verification phrase embedded without punctuation.
-        if not contains_verification_sentence:
-            match = None
-            for phrase in sorted(VERIFICATION_PHRASES, key=len, reverse=True):
-                pattern = re.compile(re.escape(phrase), flags=re.IGNORECASE)
-                match = pattern.search(original_text)
-                if match:
-                    before = original_text[: match.start()].strip()
-                    after = original_text[match.end() :].strip()
-                    if before or after:
-                        sentences = []
-                        if before:
-                            sentences.append(before)
-                        sentences.append(original_text[match.start() : match.end()])
-                        if after:
-                            sentences.append(after)
-                        contains_verification_sentence = True
-                    break
-
-        if not contains_verification_sentence or len(sentences) == 1:
+        matches = list(pattern.finditer(original_text))
+        if not matches:
             split_segments.append(segment)
             continue
+
+        parts: List[str] = []
+        cursor = 0
+        for match in matches:
+            start_idx, end_idx = match.span()
+
+            # Leading speech before the verification phrase.
+            leading = original_text[cursor:start_idx].strip()
+            if leading:
+                parts.append(leading)
+
+            trailing_end = end_idx
+            # Include trailing punctuation directly attached to the phrase.
+            while (
+                trailing_end < len(original_text)
+                and original_text[trailing_end] in trailing_punctuation
+            ):
+                trailing_end += 1
+
+            verification_text = original_text[start_idx:trailing_end].strip()
+            parts.append(verification_text)
+            cursor = trailing_end
+
+        # Remainder after the last match.
+        trailing_text = original_text[cursor:].strip()
+        if trailing_text:
+            parts.append(trailing_text)
 
         # Allocate timestamps proportionally across the new segments.
         start = segment.get("start")
@@ -1349,24 +1354,23 @@ def _split_segments_on_verification_phrases(segments: List[Dict]) -> List[Dict]:
             except (TypeError, ValueError):
                 total_duration = None
 
-        weights = [max(len(sentence), 1) for sentence in sentences]
+        weights = [max(len(text), 1) for text in parts]
         weight_sum = sum(weights) or 1
         current_start = float(start) if total_duration is not None else start
 
-        for idx, sentence in enumerate(sentences):
+        for idx, text in enumerate(parts):
             new_segment = segment.copy()
-            new_segment["text"] = sentence
+            new_segment["text"] = text
 
             if total_duration is not None and start is not None and end is not None:
                 portion = total_duration * (weights[idx] / weight_sum)
                 new_start = current_start if current_start is not None else float(start)
-                new_end = new_start + portion if idx < len(sentences) - 1 else float(end)
+                new_end = new_start + portion if idx < len(parts) - 1 else float(end)
                 new_segment["start"] = round(new_start, 2)
                 new_segment["end"] = round(new_end, 2)
                 new_segment["duration"] = round(new_segment["end"] - new_segment["start"], 2)
                 current_start = new_end
             else:
-                # Preserve available timestamps without attempting to split further.
                 new_segment["start"] = segment.get("start")
                 new_segment["end"] = segment.get("end")
                 if "duration" in new_segment and isinstance(new_segment.get("duration"), (int, float)):
@@ -1378,6 +1382,66 @@ def _split_segments_on_verification_phrases(segments: List[Dict]) -> List[Dict]:
         "Segment verification split: %d → %d", len(segments), len(split_segments)
     )
     return split_segments
+
+
+def _combine_non_verification_runs(segments: List[Dict]) -> List[Dict]:
+    """Combine adjacent non-verification segments spoken by the same speaker."""
+
+    if not segments:
+        return []
+
+    combined: List[Dict] = []
+
+    def _speaker_identity(segment: Dict) -> Optional[str]:
+        return (
+            segment.get("speaker")
+            or segment.get("speaker_name")
+            or segment.get("speaker_label")
+        )
+
+    for segment in segments:
+        text = (segment.get("text") or "").strip()
+        if not text:
+            combined.append(segment)
+            continue
+
+        speaker_id = _speaker_identity(segment)
+        if not combined:
+            combined.append(segment.copy())
+            continue
+
+        previous = combined[-1]
+        previous_text = (previous.get("text") or "").strip()
+        previous_speaker = _speaker_identity(previous)
+
+        if (
+            speaker_id
+            and speaker_id == previous_speaker
+            and not _is_verification_phrase(previous_text)
+            and not _is_verification_phrase(text)
+        ):
+            merged_text = " ".join(filter(None, [previous_text, text]))
+            previous["text"] = merged_text.strip()
+
+            # Update timing metadata when available.
+            if segment.get("end") is not None:
+                previous["end"] = segment.get("end")
+            if previous.get("start") is not None and previous.get("end") is not None:
+                try:
+                    previous["duration"] = round(
+                        float(previous["end"]) - float(previous["start"]), 2
+                    )
+                except (TypeError, ValueError):
+                    previous.pop("duration", None)
+
+            continue
+
+        combined.append(segment.copy())
+
+    logging.info(
+        "Combined non-verification runs: %d → %d", len(segments), len(combined)
+    )
+    return combined
 
 
 def _detect_3pc_patterns(segments: List[Dict]) -> List[Dict]:
@@ -1574,6 +1638,8 @@ def build_three_part_communication_summary(
 
     # STEP 2: Split verification phrases that are bundled with other speech
     segments = _split_segments_on_verification_phrases(segments)
+    # STEP 2a: Recombine the remaining speech for the same speaker
+    segments = _combine_non_verification_runs(segments)
 
     # STEP 3: Detect 3PC patterns
     segments = _detect_3pc_patterns(segments)
