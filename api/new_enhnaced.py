@@ -82,88 +82,10 @@ def rag_feature_enabled() -> bool:
 
 logger = logging.getLogger(__name__)
 
-
 def _bg(target, *args, **kwargs):
     t = threading.Thread(target=target, args=args, kwargs=kwargs, daemon=True)
     t.start()
     return t
-
-
-def _merge_consecutive_diarization_segments(segments, max_gap=3.0):
-    """Coalesce back-to-back segments from the same speaker."""
-    if not segments:
-        return []
-
-    filtered = [seg for seg in segments if seg]
-    if not filtered:
-        return []
-
-    ordered = sorted(filtered, key=lambda seg: seg.get("start") or 0.0)
-    merged = []
-
-    def _clone(segment):
-        cloned = dict(segment)
-        cloned["text"] = cloned.get("text", "").strip()
-        vectors = []
-        vector = cloned.get("speaker_vector")
-        if vector is not None:
-            vectors.append(vector)
-        cloned["_vectors"] = vectors
-        return cloned
-
-    current = _clone(ordered[0])
-
-    for seg in ordered[1:]:
-        candidate = _clone(seg)
-        same_speaker = (
-            current.get("speaker") and candidate.get("speaker") and current["speaker"] == candidate["speaker"]
-        ) or (
-            current.get("speaker_label")
-            and candidate.get("speaker_label")
-            and current["speaker_label"] == candidate["speaker_label"]
-        )
-
-        start_gap = (candidate.get("start") or 0.0) - (current.get("end") or 0.0)
-
-        if same_speaker and start_gap <= max_gap:
-            current["end"] = max(current.get("end", 0.0), candidate.get("end", current.get("end", 0.0)))
-
-            candidate_text = candidate.get("text", "").strip()
-            if candidate_text:
-                current_text = current.get("text", "").strip()
-                current["text"] = f"{current_text} {candidate_text}".strip() if current_text else candidate_text
-
-            current["_vectors"].extend(candidate.get("_vectors", []))
-
-            if not current.get("speaker_profile_id"):
-                current["speaker_profile_id"] = candidate.get("speaker_profile_id")
-
-            start_val = current.get("start", candidate.get("start"))
-            end_val = current.get("end", candidate.get("end"))
-            if start_val is not None and end_val is not None:
-                current["duration"] = round(end_val - start_val, 2)
-        else:
-            merged.append(current)
-            current = candidate
-
-    merged.append(current)
-
-    for seg in merged:
-        vectors = seg.pop("_vectors", [])
-        if vectors:
-            try:
-                seg["speaker_vector"] = np.mean(np.array(vectors, dtype=float), axis=0).tolist()
-            except Exception:
-                seg["speaker_vector"] = vectors[0]
-
-        start_val = seg.get("start")
-        end_val = seg.get("end")
-        if start_val is not None and end_val is not None:
-            seg["duration"] = round(end_val - start_val, 2)
-
-        seg["text"] = seg.get("text", "").strip()
-
-    return merged
 
 def _start_diarization_thread(
     audio_file_id,
@@ -188,7 +110,6 @@ def _start_diarization_thread(
         close_old_connections()
         try:
             segments = diarization_from_audio(audio_source, transcript_segments, transcript_words)
-            segments = _merge_consecutive_diarization_segments(segments)
             payload = {"segments": segments, "speakers": build_speaker_summary(segments)}
             AudioFile.objects.filter(id=audio_file_id).update(
                 diarization=payload,
@@ -1218,10 +1139,7 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                     else None
                 )
 
-                if reusable_url:
-                    print(f"Using existing diarization document: {reusable_url}")
-                    processed_s3_url = reusable_url
-                else:
+                if True:
                     processed_s3_url = create_highlighted_pdf_document(
                         reference_doc.file_path,
                         transcript,
