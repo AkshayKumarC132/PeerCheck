@@ -1139,10 +1139,7 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                     else None
                 )
 
-                if reusable_url:
-                    print(f"Using existing diarization document: {reusable_url}")
-                    processed_s3_url = reusable_url
-                else:
+                if True:
                     processed_s3_url = create_highlighted_pdf_document(
                         reference_doc.file_path,
                         transcript,
