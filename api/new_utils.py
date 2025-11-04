@@ -1300,6 +1300,241 @@ def _segment_text(segment: Dict[str, Any]) -> str:
     return " ".join(text.strip().split())
 
 
+def _segment_sort_key(segment: Dict[str, Any]) -> Tuple[int, float, float]:
+    """Sort diarization segments by their timing metadata."""
+
+    start = segment.get("start")
+    end = segment.get("end")
+
+    def _to_float(value: Any) -> Optional[float]:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    start_val = _to_float(start)
+    end_val = _to_float(end)
+    if end_val is None:
+        end_val = start_val
+
+    return (
+        0 if start_val is not None else 1,
+        start_val or 0.0,
+        end_val or (start_val or 0.0),
+    )
+
+
+def _component_from_segment(segment: Dict[str, Any], text: Optional[str] = None) -> Dict[str, Any]:
+    """Create a lightweight component record from a diarization segment."""
+
+    component_text = text if text is not None else _segment_text(segment)
+    component = {
+        "start": segment.get("start"),
+        "end": segment.get("end"),
+        "text": component_text.strip(),
+    }
+    if segment.get("speaker"):
+        component["speaker"] = segment.get("speaker")
+    if segment.get("speaker_label"):
+        component["speaker_label"] = segment.get("speaker_label")
+    return component
+
+
+def _clone_components(components: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Return a shallow copy of component metadata with normalised text."""
+
+    cloned: List[Dict[str, Any]] = []
+    for component in components:
+        if not component:
+            continue
+        cloned_component = dict(component)
+        cloned_component["text"] = (component.get("text") or "").strip()
+        cloned.append(cloned_component)
+    return cloned
+
+
+def _collect_verification_phrase_spans(text: str) -> List[Tuple[int, int]]:
+    """Return index spans for verification phrases appearing in *text*."""
+
+    if not text:
+        return []
+
+    lowered = text.lower()
+    spans: List[Tuple[int, int]] = []
+    for phrase in sorted(VERIFICATION_PHRASES, key=len, reverse=True):
+        phrase_lower = phrase.lower()
+        start = 0
+        while True:
+            idx = lowered.find(phrase_lower, start)
+            if idx == -1:
+                break
+            end = idx + len(phrase_lower)
+            # Extend over immediately trailing punctuation (but stop before spaces).
+            trailing = end
+            while trailing < len(text) and text[trailing] in ",.!?:;\"'":
+                trailing += 1
+            spans.append((idx, trailing))
+            start = end
+
+    if not spans:
+        return []
+
+    # Deduplicate and sort spans while preventing overlaps.
+    spans.sort()
+    deduped: List[Tuple[int, int]] = []
+    for start, end in spans:
+        if deduped and start < deduped[-1][1]:
+            continue
+        deduped.append((start, end))
+
+    return deduped
+
+
+def _split_component_on_verification(component: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Split a component into sub-components whenever verification phrases appear."""
+
+    text = (component.get("text") or "").strip()
+    if not text:
+        return []
+
+    spans = _collect_verification_phrase_spans(text)
+    if not spans:
+        cleaned = dict(component)
+        cleaned["text"] = text
+        cleaned["is_verification"] = _is_verification_phrase(text)
+        return [cleaned]
+
+    pieces: List[Tuple[str, bool]] = []
+    cursor = 0
+    for start, end in spans:
+        if start > cursor:
+            leading = text[cursor:start].strip()
+            if leading:
+                pieces.append((leading, False))
+        phrase_text = text[start:end].strip()
+        if phrase_text:
+            pieces.append((phrase_text, True))
+        cursor = end
+
+    if cursor < len(text):
+        trailing = text[cursor:].strip()
+        if trailing:
+            pieces.append((trailing, False))
+
+    if not pieces:
+        return []
+
+    try:
+        start_val = float(component.get("start")) if component.get("start") is not None else None
+        end_val = float(component.get("end")) if component.get("end") is not None else None
+    except (TypeError, ValueError):
+        start_val = end_val = None
+
+    duration = None
+    if start_val is not None and end_val is not None and end_val >= start_val:
+        duration = end_val - start_val
+
+    weights = [max(len(piece[0]), 1) for piece in pieces]
+    total_weight = sum(weights) or len(pieces)
+
+    sub_components: List[Dict[str, Any]] = []
+    current_start = start_val
+
+    for index, ((piece_text, is_verification), weight) in enumerate(zip(pieces, weights)):
+        sub_component: Dict[str, Any] = {
+            "text": piece_text,
+            "is_verification": is_verification,
+        }
+
+        if component.get("speaker") and "speaker" not in sub_component:
+            sub_component["speaker"] = component.get("speaker")
+        if component.get("speaker_label") and "speaker_label" not in sub_component:
+            sub_component["speaker_label"] = component.get("speaker_label")
+
+        if duration is None or current_start is None:
+            if index == 0:
+                sub_component["start"] = component.get("start")
+            if index == len(pieces) - 1:
+                sub_component["end"] = component.get("end")
+        else:
+            if index == len(pieces) - 1:
+                piece_end = start_val + duration
+            else:
+                piece_end = current_start + duration * (weight / total_weight)
+
+            sub_component["start"] = round(current_start, 3)
+            sub_component["end"] = round(piece_end, 3)
+            current_start = piece_end
+
+        sub_components.append(sub_component)
+
+    return sub_components
+
+
+def _split_segments_by_verification_phrases(
+    segments: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Ensure verification phrases are isolated into their own diarization segments."""
+
+    prepared: List[Dict[str, Any]] = []
+
+    for segment in segments:
+        base_components = segment.get("components")
+        if not base_components:
+            base_components = [_component_from_segment(segment)]
+
+        split_components: List[Dict[str, Any]] = []
+        for component in base_components:
+            split_components.extend(_split_component_on_verification(component))
+
+        split_components = [comp for comp in split_components if comp.get("text")]
+        if not split_components:
+            continue
+
+        if len(split_components) == 1:
+            component = split_components[0]
+            clone = dict(segment)
+            clone["text"] = component.get("text", "").strip()
+            clone["components"] = [component]
+            if component.get("start") is not None:
+                clone["start"] = component.get("start")
+            if component.get("end") is not None:
+                clone["end"] = component.get("end")
+            if clone.get("start") is not None and clone.get("end") is not None:
+                try:
+                    clone["duration"] = round(
+                        max(0.0, float(clone["end"]) - float(clone["start"])), 2
+                    )
+                except (TypeError, ValueError):
+                    clone.pop("duration", None)
+            else:
+                clone.pop("duration", None)
+            prepared.append(clone)
+            continue
+
+        for component in split_components:
+            new_segment = {k: v for k, v in segment.items() if k != "components"}
+            new_segment["text"] = component.get("text", "").strip()
+            new_segment["components"] = [component]
+            if component.get("start") is not None:
+                new_segment["start"] = component.get("start")
+            if component.get("end") is not None:
+                new_segment["end"] = component.get("end")
+            if new_segment.get("start") is not None and new_segment.get("end") is not None:
+                try:
+                    new_segment["duration"] = round(
+                        max(0.0, float(new_segment["end"]) - float(new_segment["start"])), 2
+                    )
+                except (TypeError, ValueError):
+                    new_segment.pop("duration", None)
+            else:
+                new_segment.pop("duration", None)
+            prepared.append(new_segment)
+
+    prepared.sort(key=_segment_sort_key)
+    return prepared
+
+
 def _is_verification_phrase(text: Optional[str]) -> bool:
     if not text:
         return False
@@ -1330,9 +1565,16 @@ def _merge_incomplete_segments(
             # Respect the user's request to omit unspoken entries entirely.
             continue
 
+        component_source = segment.get("components")
+        if component_source:
+            segment_components = _clone_components(component_source)
+        else:
+            segment_components = [_component_from_segment(segment, text)]
+
         if not merged:
             new_segment = dict(segment)
             new_segment["text"] = text
+            new_segment["components"] = _clone_components(segment_components)
             merged.append(new_segment)
             continue
 
@@ -1361,6 +1603,9 @@ def _merge_incomplete_segments(
             combined = " ".join(part for part in [previous_text, text] if part).strip()
             previous["text"] = combined
             previous["end"] = segment.get("end", previous.get("end"))
+            if segment_components:
+                previous.setdefault("components", [])
+                previous["components"].extend(_clone_components(segment_components))
             if segment.get("duration"):
                 previous["duration"] = (
                     previous.get("duration", 0.0) + float(segment.get("duration"))
@@ -1369,6 +1614,7 @@ def _merge_incomplete_segments(
 
         new_segment = dict(segment)
         new_segment["text"] = text
+        new_segment["components"] = _clone_components(segment_components)
         merged.append(new_segment)
 
     return merged
@@ -1451,7 +1697,7 @@ def _detect_3pc_patterns(
             previous = current
             j += 1
 
-        if confirmation_index is not None and receiver_indices:
+        if receiver_indices:
             aggregated_receiver_text = " ".join(receiver_fragments)
             receiver_similarity = 0.0
             if sender_text and aggregated_receiver_text:
@@ -1460,32 +1706,35 @@ def _detect_3pc_patterns(
                     / 100.0
                 )
 
-            roles: Dict[int, str] = {
-                idx: "sender",
-                confirmation_index: "confirmation",
-            }
+            roles: Dict[int, str] = {idx: "sender"}
             for offset, receiver_idx in enumerate(receiver_indices):
                 roles[receiver_idx] = "receiver" if offset == 0 else "receiver_followup"
             for sender_idx in sender_followups:
                 roles.setdefault(sender_idx, "sender_followup")
+            if confirmation_index is not None:
+                roles[confirmation_index] = "confirmation"
 
             pattern_id = f"3pc-{pattern_counter}"
             pattern_counter += 1
 
-            patterns.append(
-                {
-                    "id": pattern_id,
-                    "sender_index": idx,
-                    "receiver_indices": receiver_indices,
-                    "sender_followup_indices": sender_followups,
-                    "confirmation_index": confirmation_index,
-                    "intermediate_indices": intermediate_indices,
-                    "receiver_similarity": receiver_similarity,
-                    "roles": roles,
-                }
-            )
+            pattern = {
+                "id": pattern_id,
+                "sender_index": idx,
+                "receiver_indices": receiver_indices,
+                "sender_followup_indices": sender_followups,
+                "confirmation_index": confirmation_index,
+                "intermediate_indices": intermediate_indices,
+                "receiver_similarity": receiver_similarity,
+                "roles": roles,
+                "structure": "three_part" if confirmation_index is not None else "two_part",
+            }
 
-            idx = confirmation_index + 1
+            patterns.append(pattern)
+
+            if confirmation_index is not None:
+                idx = confirmation_index + 1
+            else:
+                idx = receiver_indices[-1] + 1
         else:
             idx += 1
 
@@ -1598,14 +1847,15 @@ def build_three_part_communication_summary(
     """Build a Three-Part Communication (3PC) summary with layered comparison logic."""
 
     merged_segments = _merge_incomplete_segments(diarization_segments or [])
-    if not merged_segments:
+    prepared_segments = _split_segments_by_verification_phrases(merged_segments)
+    if not prepared_segments:
         return []
 
     model = _get_sentence_model()
     buckets = _create_document_buckets(reference_text, model)
     partial_threshold = max(match_threshold * 0.8, 0.45)
 
-    patterns = _detect_3pc_patterns(merged_segments)
+    patterns = _detect_3pc_patterns(prepared_segments)
     pattern_lookup: Dict[int, Dict[str, Any]] = {}
     role_lookup: Dict[int, str] = {}
     for order, pattern in enumerate(patterns):
@@ -1618,7 +1868,7 @@ def build_three_part_communication_summary(
     summary_entries: List[Dict[str, Any]] = []
     index_to_entry: Dict[int, Dict[str, Any]] = {}
 
-    for idx, segment in enumerate(merged_segments):
+    for idx, segment in enumerate(prepared_segments):
         speaker = _segment_speaker(segment)
         text = _segment_text(segment)
         if not text:
@@ -1669,6 +1919,8 @@ def build_three_part_communication_summary(
                 if receiver_names:
                     context_links["receivers"] = receiver_names
                 context_links["bundle_id"] = pattern["id"]
+                if pattern.get("structure"):
+                    context_links["bundle_structure"] = pattern.get("structure")
                 context_links["role"] = "confirmation"
                 context_links["acknowledgement_consistent"] = ack_consistent
                 if bucket_conflict:
@@ -1724,12 +1976,16 @@ def build_three_part_communication_summary(
                     status = "partial match" if combined_score >= 0.4 else "general conversation"
                 context_links["role"] = role
                 context_links["bundle_id"] = pattern["id"]
+                if pattern.get("structure"):
+                    context_links.setdefault("bundle_structure", pattern.get("structure"))
                 context_links.setdefault(
                     "receiver_similarity", round(pattern.get("receiver_similarity", 0.0), 2)
                 )
             elif pattern and role in {"sender", "sender_followup"}:
                 context_links["role"] = role
                 context_links["bundle_id"] = pattern["id"]
+                if pattern.get("structure"):
+                    context_links.setdefault("bundle_structure", pattern.get("structure"))
                 if status == "general conversation" and combined_score >= partial_threshold:
                     status = "partial match"
 
@@ -1758,6 +2014,8 @@ def build_three_part_communication_summary(
             entry["context"].setdefault("bundle_id", pattern["id"])
             if role:
                 entry["context"].setdefault("role", role)
+            if pattern.get("structure"):
+                entry["context"].setdefault("bundle_structure", pattern.get("structure"))
             if role in {"receiver", "receiver_followup"} and "receiver_similarity" not in entry["context"]:
                 entry["context"]["receiver_similarity"] = round(
                     pattern.get("receiver_similarity", 0.0), 2
