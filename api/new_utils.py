@@ -2599,34 +2599,22 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         body_font_size = 10
         row_padding = 4
         content_width_ratio = [
-            0.11,
-            0.11,
-            0.09,
-            0.07,
-            0.07,
-            0.05,
-            0.05,
-            0.18,
-            0.07,
-            0.06,
-            0.05,
-            0.04,
-            0.05,
+            0.12,
+            0.16,
+            0.12,
+            0.12,
+            0.14,
+            0.12,
+            0.22,
         ]
         headers = [
             "Bucket",
             "Section/Step",
             "Speaker",
             "Role",
-            "Type",
-            "Start",
-            "End",
-            "Content",
+            "Timing",
             "Status",
-            "Pair",
-            "Evidence Pages",
-            "Confidence",
-            "Reasons",
+            "Details",
         ]
         
         status_colors = {
@@ -2673,8 +2661,15 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         def _wrap_cell(text: str, max_width: float) -> List[str]:
             if not text:
                 return [""]
+
             approx_char_width = max(int(max_width / (body_font_size * 0.6)), 1)
-            return textwrap.wrap(text, width=approx_char_width) or [""]
+            wrapped: List[str] = []
+            for block in text.splitlines() or [""]:
+                if not block:
+                    wrapped.append("")
+                    continue
+                wrapped.extend(textwrap.wrap(block, width=approx_char_width) or [""])
+            return wrapped or [""]
 
         def _draw_row(page, y_pos, page_height, values: List[str]):
             """Draw a row, creating new page if needed."""
@@ -2750,6 +2745,19 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         else:
             # Draw ALL entries (fixed pagination)
             for idx, entry in enumerate(entries):
+                start_ts = _format_timestamp(entry.get("start"))
+                end_ts = _format_timestamp(entry.get("end"))
+                has_start = start_ts and start_ts != "-"
+                has_end = end_ts and end_ts != "-"
+                if has_start and has_end:
+                    timing_display = f"{start_ts} → {end_ts}"
+                elif has_start:
+                    timing_display = start_ts
+                elif has_end:
+                    timing_display = end_ts
+                else:
+                    timing_display = "-"
+
                 status_text = (entry.get("status") or "").capitalize() or "-"
                 if entry.get("three_pc_role"):
                     role = entry["three_pc_role"]
@@ -2760,27 +2768,49 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     pair_display = f"{pair_display} ({entry.get('pair_role')})"
 
                 confidence_value = entry.get("confidence")
-                if isinstance(confidence_value, (int, float)):
-                    confidence_display = f"{confidence_value:.2f}"
-                else:
-                    confidence_display = "-"
+                confidence_display = (
+                    f"{confidence_value:.2f}"
+                    if isinstance(confidence_value, (int, float))
+                    else None
+                )
 
-                reasons_display = ", ".join(entry.get("reasons") or []) or "-"
+                reasons = entry.get("reasons") or []
+
+                detail_parts: List[str] = []
+                content_value = entry.get("content") or ""
+                if content_value:
+                    detail_parts.append(content_value)
+                if pair_display and pair_display != "-":
+                    detail_parts.append(f"Pair: {pair_display}")
+                evidence_value = entry.get("evidence_pages") or ""
+                if evidence_value and evidence_value != "-":
+                    detail_parts.append(f"Evidence: {evidence_value}")
+                if confidence_display:
+                    detail_parts.append(f"Confidence: {confidence_display}")
+                if reasons:
+                    detail_parts.append("Reasons: " + ", ".join(reasons))
+
+                details_text = "\n".join(detail_parts) if detail_parts else "-"
+
+                entry_role = entry.get("role")
+                entry_type = entry.get("type")
+                if entry_role and entry_type:
+                    role_display = f"{entry_role} ({entry_type})"
+                elif entry_role:
+                    role_display = entry_role
+                elif entry_type:
+                    role_display = entry_type
+                else:
+                    role_display = "-"
 
                 row_values = [
                     entry.get("bucket") or "-",
                     entry.get("section_step") or "-",
                     entry.get("speaker") or "Unknown",
-                    entry.get("role") or "-",
-                    entry.get("type") or "-",
-                    _format_timestamp(entry.get("start")),
-                    _format_timestamp(entry.get("end")),
-                    entry.get("content") or "",
+                    role_display,
+                    timing_display,
                     status_text,
-                    pair_display,
-                    entry.get("evidence_pages") or "-",
-                    confidence_display,
-                    reasons_display,
+                    details_text,
                 ]
 
                 page, y_cursor, page_height = _draw_row(page, y_cursor, page_height, row_values)
@@ -2823,15 +2853,9 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         "Section/Step",
         "Speaker",
         "Role",
-        "Type",
-        "Start",
-        "End",
-        "Content",
+        "Timing",
         "Status",
-        "Pair",
-        "Evidence Pages",
-        "Confidence",
-        "Reasons",
+        "Details",
     ]
     table = document.add_table(rows=1, cols=len(headers))
     try:
@@ -2859,31 +2883,79 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
             pair_display = f"{pair_display} ({entry.get('pair_role')})"
 
         confidence_value = entry.get("confidence")
-        if isinstance(confidence_value, (int, float)):
-            confidence_display = f"{confidence_value:.2f}"
-        else:
-            confidence_display = "-"
+        confidence_display = (
+            f"{confidence_value:.2f}" if isinstance(confidence_value, (int, float)) else None
+        )
 
-        reasons_display = ", ".join(entry.get("reasons") or []) or "-"
+        reasons = entry.get("reasons") or []
+
+        detail_parts: List[str] = []
+        content_value = entry.get("content") or ""
+        if content_value:
+            detail_parts.append(content_value)
+        if pair_display and pair_display != "-":
+            detail_parts.append(f"Pair: {pair_display}")
+        evidence_value = entry.get("evidence_pages") or ""
+        if evidence_value and evidence_value != "-":
+            detail_parts.append(f"Evidence: {evidence_value}")
+        if confidence_display:
+            detail_parts.append(f"Confidence: {confidence_display}")
+        if reasons:
+            detail_parts.append("Reasons: " + ", ".join(reasons))
+
+        details_text = "\n".join(detail_parts) if detail_parts else "-"
+
+        start_ts = _format_timestamp(entry.get("start"))
+        end_ts = _format_timestamp(entry.get("end"))
+        has_start = start_ts and start_ts != "-"
+        has_end = end_ts and end_ts != "-"
+        if has_start and has_end:
+            timing_text = f"{start_ts} → {end_ts}"
+        elif has_start:
+            timing_text = start_ts
+        elif has_end:
+            timing_text = end_ts
+        else:
+            timing_text = "-"
+
+        entry_role = entry.get("role")
+        entry_type = entry.get("type")
+        if entry_role and entry_type:
+            role_display = f"{entry_role} ({entry_type})"
+        elif entry_role:
+            role_display = entry_role
+        elif entry_type:
+            role_display = entry_type
+        else:
+            role_display = "-"
+
+        status_value = entry.get("status") or "-"
 
         values = [
             entry.get("bucket") or "-",
             entry.get("section_step") or "-",
             entry.get("speaker") or "Unknown",
-            entry.get("role") or "-",
-            entry.get("type") or "-",
-            _format_timestamp(entry.get("start")),
-            _format_timestamp(entry.get("end")),
-            entry.get("content") or "",
-            entry.get("status") or "-",
-            pair_display,
-            entry.get("evidence_pages") or "-",
-            confidence_display,
-            reasons_display,
+            role_display,
+            timing_text,
+            status_value,
+            details_text,
         ]
 
         for idx, value in enumerate(values):
-            cells[idx].text = value
+            cell = cells[idx]
+            text_value = value if isinstance(value, str) else str(value)
+
+            if headers[idx] == "Details" and "\n" in text_value:
+                cell.text = ""
+                lines = text_value.splitlines()
+                if not lines:
+                    cell.text = ""
+                else:
+                    cell.text = lines[0]
+                    for line in lines[1:]:
+                        cell.add_paragraph(line)
+            else:
+                cell.text = text_value
 
         status = (entry.get("status") or "").lower()
         status_idx = headers.index("Status")
