@@ -1742,6 +1742,258 @@ def _combine_non_verification_runs(segments: List[Dict]) -> List[Dict]:
     return combined
 
 
+_STEP_IDENTIFIER_RE = re.compile(
+    r"^\s*(?P<identifier>(?:\d+\.)*\d+(?:\([^)]+\))*)(?:\s*[-:]\s*|\s+)?(?P<title>.*)$"
+)
+_STEP_KEYWORD_RE = re.compile(
+    r"^\s*(?P<keyword>(?:NOTE|VERIFY|RECORD|IF|THEN|CAUTION|WARNING|OBSERVE)\b.*)",
+    re.IGNORECASE,
+)
+
+
+def _parse_step_header(line: str) -> Optional[Dict[str, Any]]:
+    """Extract structured metadata from a potential procedure heading."""
+
+    if not line:
+        return None
+
+    match = _STEP_IDENTIFIER_RE.match(line)
+    if match:
+        identifier = match.group("identifier")
+        title = match.group("title").strip()
+        parts = identifier.split(".") if identifier else []
+        section = parts[0] if parts else None
+        step = ".".join(parts[:2]) if len(parts) >= 2 else identifier
+        substep = identifier
+        return {
+            "identifier": identifier,
+            "section": section,
+            "step": step,
+            "substep": substep,
+            "title": title or line.strip(),
+        }
+
+    keyword_match = _STEP_KEYWORD_RE.match(line)
+    if keyword_match:
+        keyword = keyword_match.group("keyword").strip()
+        keyword_upper = keyword.split()[0].upper()
+        return {
+            "identifier": keyword_upper,
+            "section": None,
+            "step": keyword_upper,
+            "substep": None,
+            "title": line.strip(),
+        }
+
+    return None
+
+
+def _create_document_buckets(
+    reference_lines: List[str],
+    model: SentenceTransformer,
+) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
+    """Parse the reference document into structured buckets for alignment."""
+
+    if not reference_lines:
+        return [], None
+
+    buckets: List[Dict[str, Any]] = []
+    current: Optional[Dict[str, Any]] = None
+
+    def _finalize_bucket(bucket: Dict[str, Any]) -> None:
+        text = " ".join(bucket.get("lines") or []).strip()
+        if not text:
+            return
+
+        bucket["text"] = text
+        bucket["normalized"] = normalize_line(text)
+        bucket["entities"] = sorted(_extract_required_entities(text))
+        bucket["actions"] = sorted(_extract_required_actions(text))
+        display_lines = bucket.get("lines") or []
+        display_text = " ".join(display_lines[:2]).strip()
+        if not display_text:
+            display_text = text[:160]
+        bucket["display"] = display_text
+        bucket.setdefault("identifier", f"bucket-{len(buckets) + 1}")
+        buckets.append(bucket)
+
+    for line_index, line in enumerate(reference_lines):
+        stripped = line.strip()
+        if not stripped:
+            if current:
+                current.setdefault("lines", []).append("")
+            continue
+
+        header = _parse_step_header(stripped)
+        if header:
+            if current:
+                _finalize_bucket(current)
+            current = {
+                "identifier": header.get("identifier"),
+                "section": header.get("section"),
+                "step": header.get("step"),
+                "substep": header.get("substep"),
+                "title": header.get("title"),
+                "lines": [stripped],
+                "start_line": line_index,
+            }
+            continue
+
+        if current is None:
+            current = {
+                "identifier": None,
+                "section": None,
+                "step": None,
+                "substep": None,
+                "title": reference_lines[0].strip() if reference_lines else "",
+                "lines": [],
+                "start_line": line_index,
+            }
+
+        current.setdefault("lines", []).append(stripped)
+
+    if current:
+        _finalize_bucket(current)
+
+    if not buckets:
+        return [], None
+
+    try:
+        bucket_texts = [bucket["text"] for bucket in buckets]
+        embeddings = model.encode(bucket_texts)
+        return buckets, np.array(embeddings)
+    except Exception as exc:
+        logging.warning("Failed to encode document buckets: %s", exc)
+        return buckets, None
+
+
+def _score_bucket_alignment(
+    text: str,
+    segment_embedding: Optional[np.ndarray],
+    buckets: List[Dict[str, Any]],
+    bucket_embeddings: Optional[np.ndarray],
+) -> Tuple[Optional[int], float, float, float]:
+    """Return the best matching bucket index and similarity scores."""
+
+    if not text or not buckets:
+        return None, 0.0, 0.0, 0.0
+
+    normalized = normalize_line(text)
+    best_idx: Optional[int] = None
+    best_combined = 0.0
+    best_semantic = 0.0
+    best_lexical = 0.0
+
+    semantic_scores = None
+    if bucket_embeddings is not None and segment_embedding is not None:
+        try:
+            segment_array = np.array([segment_embedding])
+            semantic_scores = util.cos_sim(segment_array, bucket_embeddings)[0]
+        except Exception as exc:
+            logging.debug("Failed semantic bucket comparison: %s", exc)
+            semantic_scores = None
+
+    for idx, bucket in enumerate(buckets):
+        semantic_score = 0.0
+        if semantic_scores is not None:
+            try:
+                semantic_score = float(semantic_scores[idx])
+            except Exception:
+                semantic_score = 0.0
+
+        lexical_score = 0.0
+        try:
+            lexical_score = (
+                fuzz.token_set_ratio(normalized, bucket.get("normalized", "")) / 100.0
+            )
+        except Exception:
+            lexical_score = 0.0
+
+        combined = (0.7 * semantic_score) + (0.3 * lexical_score)
+        if combined > best_combined:
+            best_idx = idx
+            best_combined = combined
+            best_semantic = semantic_score
+            best_lexical = lexical_score
+
+    return best_idx, max(0.0, min(1.0, best_combined)), max(0.0, min(1.0, best_semantic)), max(0.0, min(1.0, best_lexical))
+
+
+def _assign_document_context(
+    segments: List[Dict[str, Any]],
+    buckets: List[Dict[str, Any]],
+    bucket_embeddings: Optional[np.ndarray],
+) -> None:
+    """Attach document alignment metadata to each segment."""
+
+    if not segments or not buckets:
+        for segment in segments:
+            segment["_doc_bucket_idx"] = None
+            segment["_doc_similarity"] = 0.0
+            segment["_doc_status"] = None
+        return
+
+    for segment in segments:
+        text = (segment.get("text") or "").strip()
+        embedding = segment.get("_embedding")
+        idx, combined, semantic_score, lexical_score = _score_bucket_alignment(
+            text,
+            embedding,
+            buckets,
+            bucket_embeddings,
+        )
+
+        if idx is None:
+            segment["_doc_bucket_idx"] = None
+            segment["_doc_similarity"] = 0.0
+            segment["_doc_semantic"] = 0.0
+            segment["_doc_lexical"] = 0.0
+            segment["_doc_reference"] = None
+            segment["_doc_identifier"] = None
+            segment["_doc_required_entities"] = []
+            segment["_doc_required_actions"] = []
+            segment["_doc_coverage"] = 0.0
+            segment["_doc_status"] = "general conversation"
+            continue
+
+        bucket = buckets[idx]
+        segment_entities = set(segment.get("_entities") or [])
+        segment_actions = set(segment.get("_actions") or [])
+        bucket_entities = set(bucket.get("entities") or [])
+        bucket_actions = set(bucket.get("actions") or [])
+
+        entity_coverage = (
+            len(segment_entities & bucket_entities) / len(bucket_entities)
+            if bucket_entities
+            else (1.0 if segment_entities else 0.0)
+        )
+        action_coverage = (
+            len(segment_actions & bucket_actions) / len(bucket_actions)
+            if bucket_actions
+            else (1.0 if segment_actions else 0.0)
+        )
+        coverage = 0.5 * entity_coverage + 0.5 * action_coverage
+
+        segment["_doc_bucket_idx"] = idx
+        segment["_doc_similarity"] = combined
+        segment["_doc_semantic"] = semantic_score
+        segment["_doc_lexical"] = lexical_score
+        segment["_doc_reference"] = bucket.get("display")
+        segment["_doc_identifier"] = bucket.get("identifier")
+        segment["_doc_required_entities"] = sorted(bucket_entities)
+        segment["_doc_required_actions"] = sorted(bucket_actions)
+        segment["_doc_coverage"] = max(0.0, min(1.0, coverage))
+
+        if combined >= 0.6 and coverage >= 0.6:
+            doc_status = "match"
+        elif combined >= 0.3 and coverage >= 0.3:
+            doc_status = "partial match"
+        else:
+            doc_status = "general conversation"
+
+        segment["_doc_status"] = doc_status
+
+
 def _detect_3pc_patterns(segments: List[Dict]) -> List[Dict]:
     """
     Detect 3PC patterns: Statement → Readback → Confirmation
@@ -1955,6 +2207,16 @@ def _evaluate_pair(
     sender_actions = set(sender.get("_actions") or [])
     receiver_actions = set(receiver.get("_actions") or []) if receiver else set()
 
+    doc_similarity = float(sender.get("_doc_similarity") or 0.0)
+    doc_similarity = max(0.0, min(1.0, doc_similarity))
+    doc_coverage = float(sender.get("_doc_coverage") or 0.0)
+    doc_coverage = max(0.0, min(1.0, doc_coverage))
+    doc_reference = sender.get("_doc_reference")
+    doc_identifier = sender.get("_doc_identifier")
+
+    strong_doc_alignment = doc_similarity >= match_threshold and doc_coverage >= 0.6
+    doc_alignment = doc_similarity >= partial_threshold and doc_coverage >= 0.3
+
     if sender_entities:
         entity_overlap = len(sender_entities & receiver_entities) / len(sender_entities)
     else:
@@ -2030,19 +2292,36 @@ def _evaluate_pair(
     ack_bonus = 0.05 if verifier else 0.0
     confidence = min(
         1.0,
-        max(0.0, (0.6 * similarity) + (0.25 * coverage) + (0.15 * timing_score) + ack_bonus),
+        max(
+            0.0,
+            (0.45 * doc_similarity)
+            + (0.35 * similarity)
+            + (0.1 * doc_coverage)
+            + (0.1 * timing_score)
+            + ack_bonus,
+        ),
     )
 
     reasons: List[str] = []
     status = "general conversation"
 
+    doc_status = "general conversation"
+    if strong_doc_alignment:
+        doc_status = "match"
+    elif doc_alignment:
+        doc_status = "partial match"
+
     if receiver:
-        if similarity >= match_threshold:
-            status = "acknowledged" if verifier else "match"
-        elif similarity >= partial_threshold:
-            status = "partial match"
-        else:
+        if not doc_alignment:
             status = "mismatch"
+            reasons.append("Instruction not aligned with reference document")
+        else:
+            if similarity >= match_threshold and strong_doc_alignment:
+                status = "match"
+            elif similarity >= partial_threshold:
+                status = "partial match"
+            else:
+                status = "mismatch"
 
         if similarity < match_threshold:
             reasons.append("Low similarity between sender and receiver")
@@ -2059,13 +2338,28 @@ def _evaluate_pair(
         if not verifier:
             reasons.append("No confirmation")
     elif verifier:
-        status = "acknowledged"
-        reasons.append("Verification without explicit readback")
+        status = "acknowledged" if strong_doc_alignment else "general conversation"
+        if not strong_doc_alignment:
+            reasons.append("Verification without clear document alignment")
     else:
+        status = doc_status
+        if not doc_alignment:
+            reasons.append("Instruction not aligned with reference document")
         reasons.append("No receiver acknowledgement")
 
-    a_score = round(similarity, 3)
-    b_score = round(coverage, 3)
+    if doc_status == "partial match" and status == "match":
+        status = "partial match"
+        reasons.append("Instruction partially aligned with reference document")
+
+    if doc_status == "general conversation" and status == "match":
+        status = "partial match"
+        reasons.append("Limited evidence from reference document")
+
+    if doc_alignment and doc_coverage < 0.5:
+        reasons.append("Partial coverage of required entities/actions")
+
+    a_score = round(doc_similarity, 3)
+    b_score = round(similarity, 3)
     confidence = round(confidence, 3)
     timing_score = round(timing_score, 3)
 
@@ -2075,6 +2369,9 @@ def _evaluate_pair(
     sender["_pair_confidence"] = confidence
     sender["_a_score"] = a_score
     sender["_b_score"] = b_score
+    sender["_pair_doc_status"] = doc_status
+    sender["_pair_doc_reference"] = doc_reference
+    sender["_pair_doc_identifier"] = doc_identifier
 
     if receiver:
         receiver["_pair_id"] = pair_id
@@ -2083,6 +2380,9 @@ def _evaluate_pair(
         receiver["_pair_confidence"] = confidence
         receiver["_a_score"] = a_score
         receiver["_b_score"] = b_score
+        receiver["_pair_doc_status"] = doc_status
+        receiver["_pair_doc_reference"] = doc_reference
+        receiver["_pair_doc_identifier"] = doc_identifier
 
     if verifier:
         verifier["_pair_id"] = pair_id
@@ -2091,6 +2391,9 @@ def _evaluate_pair(
         verifier["_pair_confidence"] = confidence
         verifier["_a_score"] = a_score
         verifier["_b_score"] = b_score
+        verifier["_pair_doc_status"] = doc_status
+        verifier["_pair_doc_reference"] = doc_reference
+        verifier["_pair_doc_identifier"] = doc_identifier
 
     pair_display = None
     if receiver:
@@ -2110,10 +2413,15 @@ def _evaluate_pair(
         "confidence": confidence,
         "status": status,
         "reasons": [reason for reason in reasons if reason],
-        "similarity": a_score,
-        "coverage": b_score,
+        "similarity": b_score,
+        "coverage": round(coverage, 3),
         "timing_score": timing_score,
         "pair_display": pair_display,
+        "doc_similarity": a_score,
+        "doc_coverage": round(doc_coverage, 3),
+        "doc_status": doc_status,
+        "doc_reference": doc_reference,
+        "doc_identifier": doc_identifier,
     }
 
 
@@ -2244,8 +2552,10 @@ def _build_pairs(
 def _build_summary_entries(
     segments: List[Dict[str, Any]],
     pairs: List[Dict[str, Any]],
+    document_buckets: List[Dict[str, Any]],
 ) -> List[Dict[str, Any]]:
     pair_lookup = {pair["id"]: pair for pair in pairs}
+    bucket_lookup = {idx: bucket for idx, bucket in enumerate(document_buckets or [])}
     entries: List[Dict[str, Any]] = []
 
     for segment in segments:
@@ -2256,13 +2566,14 @@ def _build_summary_entries(
         pair_id = segment.get("_pair_id")
         pair_info = pair_lookup.get(pair_id)
 
-        status = segment.get("_pair_status")
+        status = segment.get("_pair_status") or (pair_info.get("status") if pair_info else None)
         if not status:
             role = segment.get("_role")
             if role == "verifier":
                 status = "acknowledged"
             elif role == "receiver":
-                status = "partial match" if (segment.get("_entities") or segment.get("_actions")) else "general conversation"
+                has_content = bool(segment.get("_entities") or segment.get("_actions"))
+                status = "partial match" if has_content else "general conversation"
             else:
                 status = "general conversation"
 
@@ -2270,8 +2581,34 @@ def _build_summary_entries(
         a_score = pair_info.get("a_score") if pair_info else None
         b_score = pair_info.get("b_score") if pair_info else None
         reasons = pair_info.get("reasons") if pair_info else []
-
         pair_display = pair_info.get("pair_display") if pair_info else None
+
+        doc_similarity = segment.get("_doc_similarity")
+        if doc_similarity is None and pair_info:
+            doc_similarity = pair_info.get("doc_similarity")
+        doc_coverage = segment.get("_doc_coverage")
+        doc_status = (
+            segment.get("_pair_doc_status")
+            or (pair_info.get("doc_status") if pair_info else None)
+            or segment.get("_doc_status")
+        )
+        doc_reference = segment.get("_pair_doc_reference") or segment.get("_doc_reference")
+        doc_identifier = segment.get("_pair_doc_identifier") or segment.get("_doc_identifier")
+
+        bucket_index = segment.get("_doc_bucket_idx")
+        if doc_reference is None and bucket_index is not None:
+            bucket = bucket_lookup.get(bucket_index)
+            if bucket:
+                doc_reference = bucket.get("display")
+                doc_identifier = doc_identifier or bucket.get("identifier")
+
+        role = segment.get("_role")
+        if role == "verifier":
+            entry_type = "Verification"
+        elif role == "receiver":
+            entry_type = "Acknowledgement"
+        else:
+            entry_type = "Instruction"
 
         entry = {
             "id": segment.get("_segment_id"),
@@ -2280,8 +2617,8 @@ def _build_summary_entries(
             "end": segment.get("end"),
             "content": text,
             "status": status,
-            "role": segment.get("_role"),
-            "type": "Verification" if segment.get("_role") == "verifier" else "Instruction",
+            "role": role,
+            "type": entry_type,
             "pair": pair_id,
             "pair_display": pair_display,
             "pair_role": segment.get("_pair_role"),
@@ -2292,6 +2629,11 @@ def _build_summary_entries(
             "three_pc_role": segment.get("_3pc_role"),
             "pair_status": pair_info.get("status") if pair_info else None,
             "communication_type": segment.get("_communication_type"),
+            "reference": doc_reference,
+            "doc_similarity": round(doc_similarity, 3) if isinstance(doc_similarity, (int, float)) else None,
+            "doc_status": doc_status,
+            "doc_identifier": doc_identifier,
+            "doc_coverage": round(doc_coverage, 3) if isinstance(doc_coverage, (int, float)) else None,
         }
 
         entries.append(entry)
@@ -2341,11 +2683,18 @@ def build_three_part_communication_summary(
     for segment in segments:
         segment["_segment_id"] = segment.get("_segment_id") or str(uuid.uuid4())
 
+    reference_lines: List[str] = []
+    if reference_text:
+        reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
+
     _classify_segment_roles(segments)
     _prepare_segment_features(segments, model)
 
+    document_buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
+    _assign_document_context(segments, document_buckets, bucket_embeddings)
+
     pairs = _build_pairs(segments, match_threshold, partial_threshold)
-    summary_entries = _build_summary_entries(segments, pairs)
+    summary_entries = _build_summary_entries(segments, pairs, document_buckets)
 
     summary_entries.sort(
         key=lambda e: (
@@ -2382,20 +2731,18 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         body_font_size = 10
         row_padding = 4
         content_width_ratio = [
-            0.20,
-            0.16,
-            0.16,
-            0.16,
-            0.14,
             0.18,
+            0.12,
+            0.12,
+            0.43,
+            0.15,
         ]
         headers = [
             "Speaker",
-            "Role",
-            "Pair",
-            "Timing",
+            "Start",
+            "End",
+            "Content",
             "Status",
-            "Details",
         ]
         
         status_colors = {
@@ -2526,27 +2873,13 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         else:
             # Draw ALL entries (fixed pagination)
             for idx, entry in enumerate(entries):
-                start_ts = _format_timestamp(entry.get("start"))
-                end_ts = _format_timestamp(entry.get("end"))
-                has_start = start_ts and start_ts != "-"
-                has_end = end_ts and end_ts != "-"
-                if has_start and has_end:
-                    timing_display = f"{start_ts} → {end_ts}"
-                elif has_start:
-                    timing_display = start_ts
-                elif has_end:
-                    timing_display = end_ts
-                else:
-                    timing_display = "-"
+                start_ts = _format_timestamp(entry.get("start")) or "-"
+                end_ts = _format_timestamp(entry.get("end")) or "-"
 
                 status_text = (entry.get("status") or "").capitalize() or "-"
                 if entry.get("three_pc_role"):
                     role = entry["three_pc_role"]
                     status_text += f" (3PC: {role})"
-
-                pair_display = entry.get("pair_display") or entry.get("pair") or "-"
-                if entry.get("pair_role"):
-                    pair_display = f"{pair_display} ({entry.get('pair_role')})"
 
                 confidence_value = entry.get("confidence")
                 confidence_display = (
@@ -2557,43 +2890,61 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
 
                 reasons = entry.get("reasons") or []
 
-                detail_parts: List[str] = []
+                content_parts: List[str] = []
                 content_value = entry.get("content") or ""
                 if content_value:
-                    detail_parts.append(content_value)
-                if confidence_display:
-                    detail_parts.append(f"Confidence: {confidence_display}")
-                if entry.get("pair_status"):
-                    detail_parts.append(f"Pair status: {entry.get('pair_status')}")
-                comm_type = entry.get("communication_type")
-                if comm_type:
-                    detail_parts.append(f"Communication: {comm_type.upper()}")
+                    content_parts.append(content_value)
+
+                reference_text = entry.get("reference")
+                if reference_text:
+                    content_parts.append(f"Doc: {reference_text}")
+
+                entry_type = entry.get("type")
+                if entry_type and entry_type != "Instruction":
+                    content_parts.append(f"Type: {entry_type}")
+
+                pair_display = entry.get("pair_display") or entry.get("pair")
+                if pair_display:
+                    role_display = entry.get("pair_role")
+                    if role_display:
+                        content_parts.append(f"Pair: {pair_display} ({role_display})")
+                    else:
+                        content_parts.append(f"Pair: {pair_display}")
+
+                doc_status = entry.get("doc_status")
+                if doc_status:
+                    content_parts.append(f"Doc status: {doc_status}")
+
+                doc_similarity = entry.get("doc_similarity")
+                if isinstance(doc_similarity, (int, float)):
+                    content_parts.append(f"Doc similarity: {doc_similarity:.2f}")
+
+                doc_identifier = entry.get("doc_identifier")
+                if doc_identifier:
+                    content_parts.append(f"Step: {doc_identifier}")
+
                 three_pc_role = entry.get("three_pc_role")
                 if three_pc_role:
-                    detail_parts.append(f"3PC role: {three_pc_role}")
+                    content_parts.append(f"3PC role: {three_pc_role}")
+
+                if confidence_display:
+                    content_parts.append(f"Confidence: {confidence_display}")
+
                 if reasons:
-                    detail_parts.append("Reasons: " + ", ".join(reasons))
+                    content_parts.append("Reasons: " + ", ".join(reasons))
 
-                details_text = "\n".join(detail_parts) if detail_parts else "-"
+                comm_type = entry.get("communication_type")
+                if comm_type:
+                    content_parts.append(f"Communication: {comm_type.upper()}")
 
-                entry_role = entry.get("role")
-                entry_type = entry.get("type")
-                if entry_role and entry_type:
-                    role_display = f"{entry_role} ({entry_type})"
-                elif entry_role:
-                    role_display = entry_role
-                elif entry_type:
-                    role_display = entry_type
-                else:
-                    role_display = "-"
+                content_text = "\n".join(content_parts) if content_parts else "-"
 
                 row_values = [
                     entry.get("speaker") or "Unknown",
-                    role_display,
-                    pair_display or "-",
-                    timing_display,
+                    start_ts,
+                    end_ts,
+                    content_text,
                     status_text,
-                    details_text,
                 ]
 
                 page, y_cursor, page_height = _draw_row(page, y_cursor, page_height, row_values)
@@ -2633,11 +2984,10 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
 
     headers = [
         "Speaker",
-        "Role",
-        "Pair",
-        "Timing",
+        "Start",
+        "End",
+        "Content",
         "Status",
-        "Details",
     ]
     table = document.add_table(rows=1, cols=len(headers))
     try:
@@ -2660,10 +3010,6 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         row = table.add_row()
         cells = row.cells
         
-        pair_display = entry.get("pair_display") or entry.get("pair") or "-"
-        if entry.get("pair_role"):
-            pair_display = f"{pair_display} ({entry.get('pair_role')})"
-
         confidence_value = entry.get("confidence")
         confidence_display = (
             f"{confidence_value:.2f}" if isinstance(confidence_value, (int, float)) else None
@@ -2671,65 +3017,76 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
 
         reasons = entry.get("reasons") or []
 
-        detail_parts: List[str] = []
+        content_parts: List[str] = []
         content_value = entry.get("content") or ""
         if content_value:
-            detail_parts.append(content_value)
-        if confidence_display:
-            detail_parts.append(f"Confidence: {confidence_display}")
-        if entry.get("pair_status"):
-            detail_parts.append(f"Pair status: {entry.get('pair_status')}")
-        comm_type = entry.get("communication_type")
-        if comm_type:
-            detail_parts.append(f"Communication: {comm_type.upper()}")
+            content_parts.append(content_value)
+
+        reference_text = entry.get("reference")
+        if reference_text:
+            content_parts.append(f"Doc: {reference_text}")
+
+        entry_type = entry.get("type")
+        if entry_type and entry_type != "Instruction":
+            content_parts.append(f"Type: {entry_type}")
+
+        pair_display = entry.get("pair_display") or entry.get("pair")
+        if pair_display:
+            pair_role = entry.get("pair_role")
+            if pair_role:
+                content_parts.append(f"Pair: {pair_display} ({pair_role})")
+            else:
+                content_parts.append(f"Pair: {pair_display}")
+
+        doc_status = entry.get("doc_status")
+        if doc_status:
+            content_parts.append(f"Doc status: {doc_status}")
+
+        doc_similarity = entry.get("doc_similarity")
+        if isinstance(doc_similarity, (int, float)):
+            content_parts.append(f"Doc similarity: {doc_similarity:.2f}")
+
+        doc_identifier = entry.get("doc_identifier")
+        if doc_identifier:
+            content_parts.append(f"Step: {doc_identifier}")
+
         three_pc_role = entry.get("three_pc_role")
         if three_pc_role:
-            detail_parts.append(f"3PC role: {three_pc_role}")
+            content_parts.append(f"3PC role: {three_pc_role}")
+
+        if confidence_display:
+            content_parts.append(f"Confidence: {confidence_display}")
+
+        if entry.get("pair_status"):
+            content_parts.append(f"Pair status: {entry.get('pair_status')}")
+
+        comm_type = entry.get("communication_type")
+        if comm_type:
+            content_parts.append(f"Communication: {comm_type.upper()}")
+
         if reasons:
-            detail_parts.append("Reasons: " + ", ".join(reasons))
+            content_parts.append("Reasons: " + ", ".join(reasons))
 
-        details_text = "\n".join(detail_parts) if detail_parts else "-"
+        details_text = "\n".join(content_parts) if content_parts else "-"
 
-        start_ts = _format_timestamp(entry.get("start"))
-        end_ts = _format_timestamp(entry.get("end"))
-        has_start = start_ts and start_ts != "-"
-        has_end = end_ts and end_ts != "-"
-        if has_start and has_end:
-            timing_text = f"{start_ts} → {end_ts}"
-        elif has_start:
-            timing_text = start_ts
-        elif has_end:
-            timing_text = end_ts
-        else:
-            timing_text = "-"
-
-        entry_role = entry.get("role")
-        entry_type = entry.get("type")
-        if entry_role and entry_type:
-            role_display = f"{entry_role} ({entry_type})"
-        elif entry_role:
-            role_display = entry_role
-        elif entry_type:
-            role_display = entry_type
-        else:
-            role_display = "-"
+        start_ts = _format_timestamp(entry.get("start")) or "-"
+        end_ts = _format_timestamp(entry.get("end")) or "-"
 
         status_value = entry.get("status") or "-"
 
         values = [
             entry.get("speaker") or "Unknown",
-            role_display,
-            pair_display or "-",
-            timing_text,
-            status_value,
+            start_ts,
+            end_ts,
             details_text,
+            status_value,
         ]
 
         for idx, value in enumerate(values):
             cell = cells[idx]
             text_value = value if isinstance(value, str) else str(value)
 
-            if headers[idx] == "Details" and "\n" in text_value:
+            if headers[idx] == "Content" and "\n" in text_value:
                 cell.text = ""
                 lines = text_value.splitlines()
                 if not lines:
@@ -2747,8 +3104,7 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
 
         status_text = status.capitalize() if status else "-"
         if entry.get("three_pc_role"):
-            role = entry["three_pc_role"]
-            status_text += f" (3PC: {role})"
+            status_text += f" (3PC: {entry.get('three_pc_role')})"
 
         status_cell.text = status_text
 
