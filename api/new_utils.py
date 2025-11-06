@@ -25,7 +25,7 @@ from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter
 from sentence_transformers import SentenceTransformer, util
 import torch  # If not present, add to requirements
 
@@ -1422,8 +1422,6 @@ def _reset_segment_annotations(segment: Dict[str, Any]) -> None:
         "_3pc_confirms",
         "_communication_type",
         "_role",
-        "_bucket_idx",
-        "_bucket_score",
         "_pair_id",
         "_pair_role",
     ):
@@ -1900,160 +1898,115 @@ def _classify_segment_roles(segments: List[Dict[str, Any]]) -> None:
         segment["_role"] = role
 
 
-def _assign_buckets_to_segments(
-    segments: List[Dict[str, Any]],
-    buckets: List[Dict[str, Any]],
-    bucket_embeddings: Optional[np.ndarray],
-    model: SentenceTransformer,
-) -> None:
-    for segment in segments:
+def _prepare_segment_features(segments: List[Dict[str, Any]], model: SentenceTransformer) -> None:
+    """Attach reusable features to each segment for downstream scoring."""
+
+    texts: List[str] = []
+    text_indices: List[int] = []
+
+    for idx, segment in enumerate(segments):
         text = (segment.get("text") or "").strip()
-        if not text:
-            segment["_bucket_idx"] = None
-            segment["_bucket_score"] = 0.0
-            segment["_entities"] = []
-            segment["_actions"] = []
-            continue
+        segment["_entities"] = sorted(_extract_required_entities(text))
+        segment["_actions"] = sorted(_extract_required_actions(text))
 
-        segment_entities = _extract_required_entities(text)
-        segment_actions = _extract_required_actions(text)
-        best_bucket_idx, best_score = _find_best_bucket_match(
-            text,
-            buckets,
-            bucket_embeddings,
-            model,
-            segment_entities,
-            segment_actions,
-        )
+        if text:
+            texts.append(text)
+            text_indices.append(idx)
+        else:
+            segment["_embedding"] = None
 
-        segment["_bucket_idx"] = best_bucket_idx
-        segment["_bucket_score"] = float(best_score)
-        segment["_entities"] = sorted(segment_entities)
-        segment["_actions"] = sorted(segment_actions)
+    if not texts:
+        return
 
+    try:
+        embeddings = model.encode(texts)
+    except Exception as exc:
+        logging.warning("Failed to encode segment texts: %s", exc)
+        for idx in text_indices:
+            segments[idx]["_embedding"] = None
+        return
 
-def _merge_segments_within_bucket(segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not segments:
-        return []
-
-    merged: List[Dict[str, Any]] = []
-
-    def _speaker_key(seg: Dict[str, Any]) -> Optional[str]:
-        return seg.get("speaker") or seg.get("speaker_name") or seg.get("speaker_label")
-
-    for segment in segments:
-        current = segment.copy()
-        if segment.get("words") is not None:
-            current["words"] = [w.copy() for w in segment.get("words") or []]
-
-        if not merged:
-            merged.append(current)
-            continue
-
-        previous = merged[-1]
-        if (
-            previous.get("_bucket_idx") is not None
-            and previous.get("_bucket_idx") == current.get("_bucket_idx")
-            and _speaker_key(previous) == _speaker_key(current)
-            and previous.get("_role") == current.get("_role")
-            and not _is_verification_phrase(previous.get("text", ""))
-            and not _is_verification_phrase(current.get("text", ""))
-        ):
-            prev_text = (previous.get("text") or "").strip()
-            curr_text = (current.get("text") or "").strip()
-            previous["text"] = " ".join(filter(None, [prev_text, curr_text])).strip()
-
-            if current.get("end") is not None:
-                previous["end"] = current.get("end")
-            if previous.get("start") is not None and previous.get("end") is not None:
-                try:
-                    previous["duration"] = round(
-                        float(previous["end"]) - float(previous["start"]), 2
-                    )
-                except (TypeError, ValueError):
-                    previous.pop("duration", None)
-
-            if previous.get("words") or current.get("words"):
-                merged_words = (previous.get("words") or []) + [
-                    w.copy() for w in current.get("words") or []
-                ]
-                merged_words.sort(key=lambda w: w.get("start", 0.0))
-                previous["words"] = merged_words
-
-            previous_entities = set(previous.get("_entities") or [])
-            current_entities = set(current.get("_entities") or [])
-            previous["_entities"] = sorted(previous_entities | current_entities)
-
-            previous_actions = set(previous.get("_actions") or [])
-            current_actions = set(current.get("_actions") or [])
-            previous["_actions"] = sorted(previous_actions | current_actions)
-
-            previous["_bucket_score"] = max(
-                float(previous.get("_bucket_score") or 0.0),
-                float(current.get("_bucket_score") or 0.0),
-            )
-            continue
-
-        merged.append(current)
-
-    return merged
+    for idx, embedding in zip(text_indices, embeddings):
+        segments[idx]["_embedding"] = embedding
 
 
-def _format_bucket_hierarchy(bucket: Dict[str, Any]) -> str:
-    parts = []
-    if bucket.get("section"):
-        parts.append(str(bucket.get("section")))
-    if bucket.get("step"):
-        parts.append(str(bucket.get("step")))
-    if bucket.get("substep"):
-        parts.append(str(bucket.get("substep")))
-    return ".".join(parts)
-
-
-def _bucket_page_display(bucket: Dict[str, Any]) -> Optional[str]:
-    page_range = bucket.get("page_range")
-    if not page_range:
-        return None
-    start_page, end_page = page_range
-    if start_page is None and end_page is None:
-        return None
-    if end_page is None or end_page == start_page:
-        return f"p.{start_page}"
-    return f"p.{start_page}-{end_page}"
+def _segment_speaker(segment: Dict[str, Any]) -> str:
+    return (
+        segment.get("speaker")
+        or segment.get("speaker_name")
+        or segment.get("speaker_label")
+        or "Unknown"
+    )
 
 
 def _evaluate_pair(
     pair_id: str,
-    bucket_idx: int,
-    bucket: Dict[str, Any],
     sender: Dict[str, Any],
     receiver: Optional[Dict[str, Any]],
     verifier: Optional[Dict[str, Any]],
+    match_threshold: float,
+    partial_threshold: float,
 ) -> Dict[str, Any]:
-    bucket_entities = set(bucket.get("required_entities") or [])
-    bucket_actions = set(bucket.get("required_actions") or [])
+    sender_text = (sender.get("text") or "").strip()
+    receiver_text = (receiver.get("text") or "").strip() if receiver else ""
 
     sender_entities = set(sender.get("_entities") or [])
     receiver_entities = set(receiver.get("_entities") or []) if receiver else set()
-    combined_entities = sender_entities | receiver_entities
-
     sender_actions = set(sender.get("_actions") or [])
     receiver_actions = set(receiver.get("_actions") or []) if receiver else set()
 
-    if receiver and receiver_actions:
-        verb_compatibility = (
-            len(receiver_actions & sender_actions) / len(sender_actions)
-            if sender_actions
-            else 0.0
-        )
+    if sender_entities:
+        entity_overlap = len(sender_entities & receiver_entities) / len(sender_entities)
     else:
-        verb_compatibility = 0.0
+        entity_overlap = 1.0 if receiver_entities else 0.0
 
-    entity_coverage = (
-        len(combined_entities & bucket_entities) / len(bucket_entities)
-        if bucket_entities
-        else (1.0 if combined_entities else 0.0)
-    )
+    if sender_actions:
+        action_overlap = len(sender_actions & receiver_actions) / len(sender_actions)
+    else:
+        action_overlap = 1.0 if receiver_actions else 0.0
+
+    sender_embedding = sender.get("_embedding")
+    receiver_embedding = receiver.get("_embedding") if receiver else None
+    semantic_similarity = 0.0
+    if sender_embedding is not None and receiver_embedding is not None:
+        try:
+            semantic_similarity = float(
+                util.cos_sim(
+                    np.array([sender_embedding]),
+                    np.array([receiver_embedding]),
+                )[0][0]
+            )
+        except Exception as exc:
+            logging.debug("Failed semantic similarity computation: %s", exc)
+            semantic_similarity = 0.0
+
+    semantic_similarity = max(0.0, min(1.0, semantic_similarity))
+
+    lexical_similarity = 0.0
+    sequence_similarity = 0.0
+    if receiver_text:
+        try:
+            lexical_similarity = (
+                fuzz.token_set_ratio(
+                    normalize_line(sender_text),
+                    normalize_line(receiver_text),
+                )
+                / 100.0
+            )
+        except Exception:
+            lexical_similarity = 0.0
+        sequence_similarity = SequenceMatcher(
+            None,
+            sender_text.lower(),
+            receiver_text.lower(),
+        ).ratio()
+
+    lexical_similarity = max(0.0, min(1.0, lexical_similarity))
+    sequence_similarity = max(0.0, min(1.0, sequence_similarity))
+    combined_lexical = 0.5 * lexical_similarity + 0.5 * sequence_similarity
+
+    similarity = (0.7 * semantic_similarity) + (0.3 * combined_lexical)
+    coverage = (0.5 * entity_overlap) + (0.5 * action_overlap)
 
     timing_components: List[float] = []
     if sender.get("end") is not None and receiver and receiver.get("start") is not None:
@@ -2068,34 +2021,53 @@ def _evaluate_pair(
             timing_components.append(max(0.0, 1.0 - min(gap / 10.0, 1.0)))
         except (TypeError, ValueError):
             pass
-    timing_score = sum(timing_components) / len(timing_components) if timing_components else 0.5
-
-    a_score = round(float(sender.get("_bucket_score") or 0.0), 3)
-    b_score = round(
-        (0.5 * entity_coverage) + (0.3 * verb_compatibility) + (0.2 * timing_score),
-        3,
+    timing_score = (
+        sum(timing_components) / len(timing_components)
+        if timing_components
+        else (0.7 if verifier else 0.5)
     )
-    confidence = round((a_score + b_score) / 2.0, 3)
+
+    ack_bonus = 0.05 if verifier else 0.0
+    confidence = min(
+        1.0,
+        max(0.0, (0.6 * similarity) + (0.25 * coverage) + (0.15 * timing_score) + ack_bonus),
+    )
 
     reasons: List[str] = []
-    missing_entities = bucket_entities - combined_entities
-    if missing_entities:
-        reasons.append("Missing entity: " + ", ".join(sorted(missing_entities)))
+    status = "general conversation"
 
-    missing_actions = bucket_actions - (sender_actions | receiver_actions)
-    if missing_actions:
-        reasons.append("Missing required action: " + ", ".join(sorted(missing_actions)))
+    if receiver:
+        if similarity >= match_threshold:
+            status = "acknowledged" if verifier else "match"
+        elif similarity >= partial_threshold:
+            status = "partial match"
+        else:
+            status = "mismatch"
 
-    if sender_actions and not receiver_actions and bucket_actions:
-        reasons.append("Receiver missing acknowledgement action")
+        if similarity < match_threshold:
+            reasons.append("Low similarity between sender and receiver")
 
-    status = "match"
-    if (
-        entity_coverage < 1.0
-        or bool(missing_actions)
-        or verb_compatibility < 0.5
-    ):
-        status = "partial match" if entity_coverage > 0 or verb_compatibility > 0 else "mismatch"
+        if sender_entities and entity_overlap < 0.5:
+            reasons.append("Missing entities in acknowledgement")
+
+        if sender_actions and action_overlap < 0.5:
+            reasons.append("Missing actions in acknowledgement")
+
+        if timing_score < 0.4:
+            reasons.append("Long delay between sender and receiver")
+
+        if not verifier:
+            reasons.append("No confirmation")
+    elif verifier:
+        status = "acknowledged"
+        reasons.append("Verification without explicit readback")
+    else:
+        reasons.append("No receiver acknowledgement")
+
+    a_score = round(similarity, 3)
+    b_score = round(coverage, 3)
+    confidence = round(confidence, 3)
+    timing_score = round(timing_score, 3)
 
     sender["_pair_id"] = pair_id
     sender["_pair_role"] = "sender"
@@ -2120,9 +2092,16 @@ def _evaluate_pair(
         verifier["_a_score"] = a_score
         verifier["_b_score"] = b_score
 
+    pair_display = None
+    if receiver:
+        pair_display = f"{_segment_speaker(sender)} → {_segment_speaker(receiver)}"
+        if verifier:
+            pair_display += f" → {_segment_speaker(verifier)}"
+    elif verifier:
+        pair_display = f"{_segment_speaker(sender)} → {_segment_speaker(verifier)}"
+
     return {
         "id": pair_id,
-        "bucket_idx": bucket_idx,
         "sender_segment_id": sender.get("_segment_id"),
         "receiver_segment_id": receiver.get("_segment_id") if receiver else None,
         "verifier_segment_id": verifier.get("_segment_id") if verifier else None,
@@ -2130,96 +2109,141 @@ def _evaluate_pair(
         "b_score": b_score,
         "confidence": confidence,
         "status": status,
-        "reasons": reasons,
-        "entity_coverage": round(entity_coverage, 3),
-        "verb_compatibility": round(verb_compatibility, 3),
-        "timing_score": round(timing_score, 3),
+        "reasons": [reason for reason in reasons if reason],
+        "similarity": a_score,
+        "coverage": b_score,
+        "timing_score": timing_score,
+        "pair_display": pair_display,
     }
 
 
-def _build_bucket_pairs(
+def _build_pairs(
     segments: List[Dict[str, Any]],
-    buckets: List[Dict[str, Any]],
+    match_threshold: float,
+    partial_threshold: float,
 ) -> List[Dict[str, Any]]:
-    bucket_groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-
-    for segment in segments:
-        bucket_idx = segment.get("_bucket_idx")
-        if bucket_idx is None or bucket_idx >= len(buckets):
-            continue
-        bucket_groups[bucket_idx].append(segment)
-
     pairs: List[Dict[str, Any]] = []
+    used_segments: Set[str] = set()
 
-    for bucket_idx, segs in bucket_groups.items():
+    group_members: Dict[int, List[Dict[str, Any]]] = {}
+    for segment in segments:
+        group_id = segment.get("_communication_group")
+        if group_id:
+            group_members.setdefault(group_id, []).append(segment)
+
+    for group_id, segs in group_members.items():
         segs.sort(key=lambda s: float(s.get("start") or 0.0))
-        bucket = buckets[bucket_idx]
+        sender = next((s for s in segs if s.get("_role") == "sender"), None)
+        receiver = next((s for s in segs if s.get("_role") == "receiver"), None)
+        verifier = next((s for s in segs if s.get("_role") == "verifier"), None)
 
-        senders = [seg for seg in segs if seg.get("_role") == "sender"]
-        receivers = [seg for seg in segs if seg.get("_role") == "receiver"]
-        verifiers = [seg for seg in segs if seg.get("_role") == "verifier"]
+        if not sender and receiver:
+            sender = receiver
+            receiver = None
 
-        used_receivers: Set[str] = set()
-        used_verifiers: Set[str] = set()
+        if not sender:
+            continue
 
-        for sender in senders:
+        pair_id = str(uuid.uuid4())
+        pair = _evaluate_pair(pair_id, sender, receiver, verifier, match_threshold, partial_threshold)
+        pairs.append(pair)
+
+        for participant in (sender, receiver, verifier):
+            if participant and participant.get("_segment_id"):
+                used_segments.add(participant["_segment_id"])
+
+    segments_by_start = sorted(
+        [seg for seg in segments if seg.get("_segment_id") not in used_segments],
+        key=lambda s: float(s.get("start") or 0.0),
+    )
+
+    pending_receivers: List[Dict[str, Any]] = []
+
+    for segment in segments_by_start:
+        role = segment.get("_role")
+        segment_id = segment.get("_segment_id")
+        if not segment_id:
+            continue
+
+        if role == "sender":
             receiver_candidate = None
-            best_gap = float("inf")
-            for receiver in receivers:
-                if receiver.get("_segment_id") in used_receivers:
-                    continue
-                try:
-                    sender_end = float(sender.get("end") or sender.get("start") or 0.0)
-                    receiver_start = float(receiver.get("start") or sender_end)
-                    gap = abs(receiver_start - sender_end)
-                except (TypeError, ValueError):
-                    gap = float("inf")
+            verifier_candidate = None
 
-                if receiver_candidate is None or gap < best_gap:
-                    receiver_candidate = receiver
-                    best_gap = gap
-                if sender.get("end") is not None and receiver.get("start") is not None and receiver.get("start") >= sender.get("end"):
+            for candidate in pending_receivers:
+                if candidate.get("_segment_id") in used_segments:
+                    continue
+                receiver_candidate = candidate
+                break
+
+            if not receiver_candidate:
+                for candidate in segments_by_start:
+                    if candidate.get("_segment_id") in used_segments:
+                        continue
+                    if candidate.get("_role") != "receiver":
+                        continue
+                    if candidate.get("start") is not None and segment.get("start") is not None:
+                        if float(candidate.get("start")) < float(segment.get("start")):
+                            continue
+                    receiver_candidate = candidate
                     break
 
-            verifier_candidate = None
             if receiver_candidate:
-                for verifier in verifiers:
-                    if verifier.get("_segment_id") in used_verifiers:
+                used_segments.add(receiver_candidate.get("_segment_id"))
+
+            if receiver_candidate:
+                for candidate in segments_by_start:
+                    if candidate.get("_segment_id") in used_segments:
+                        continue
+                    if candidate.get("_role") != "verifier":
                         continue
                     if (
-                        verifier.get("start") is not None
-                        and receiver_candidate.get("end") is not None
-                        and float(verifier.get("start")) >= float(receiver_candidate.get("end"))
+                        receiver_candidate.get("end") is not None
+                        and candidate.get("start") is not None
+                        and float(candidate.get("start")) < float(receiver_candidate.get("end"))
                     ):
-                        verifier_candidate = verifier
-                        break
+                        continue
+                    verifier_candidate = candidate
+                    break
 
             pair_id = str(uuid.uuid4())
-            if receiver_candidate:
-                used_receivers.add(receiver_candidate.get("_segment_id"))
-            if verifier_candidate:
-                used_verifiers.add(verifier_candidate.get("_segment_id"))
-
-            pairs.append(
-                _evaluate_pair(
-                    pair_id,
-                    bucket_idx,
-                    bucket,
-                    sender,
-                    receiver_candidate,
-                    verifier_candidate,
-                )
+            pair = _evaluate_pair(
+                pair_id,
+                segment,
+                receiver_candidate,
+                verifier_candidate,
+                match_threshold,
+                partial_threshold,
             )
+            pairs.append(pair)
+
+            used_segments.add(segment_id)
+            if verifier_candidate and verifier_candidate.get("_segment_id"):
+                used_segments.add(verifier_candidate.get("_segment_id"))
+
+        elif role == "receiver":
+            pending_receivers.append(segment)
+
+        elif role == "verifier":
+            if segment.get("_segment_id") in used_segments:
+                continue
+            pair_id = str(uuid.uuid4())
+            pair = _evaluate_pair(
+                pair_id,
+                segment,
+                None,
+                None,
+                match_threshold,
+                partial_threshold,
+            )
+            pairs.append(pair)
+            used_segments.add(segment_id)
 
     return pairs
 
 
 def _build_summary_entries(
     segments: List[Dict[str, Any]],
-    buckets: List[Dict[str, Any]],
     pairs: List[Dict[str, Any]],
-    match_threshold: float,
-    partial_threshold: float,
 ) -> List[Dict[str, Any]]:
     pair_lookup = {pair["id"]: pair for pair in pairs}
     entries: List[Dict[str, Any]] = []
@@ -2229,69 +2253,35 @@ def _build_summary_entries(
         if not text:
             continue
 
-        bucket_idx = segment.get("_bucket_idx")
-        bucket = (
-            buckets[bucket_idx]
-            if isinstance(bucket_idx, int) and 0 <= bucket_idx < len(buckets)
-            else None
-        )
         pair_id = segment.get("_pair_id")
         pair_info = pair_lookup.get(pair_id)
 
         status = segment.get("_pair_status")
         if not status:
-            bucket_score = float(segment.get("_bucket_score") or 0.0)
-            if bucket is None or bucket_score < partial_threshold:
-                if segment.get("_entities") or segment.get("_actions"):
-                    status = "partial match"
-                else:
-                    status = "general conversation"
-            elif bucket_score >= match_threshold:
-                status = "match"
-            else:
-                status = "partial match"
-
-            if segment.get("_role") == "verifier" and status == "general conversation":
+            role = segment.get("_role")
+            if role == "verifier":
                 status = "acknowledged"
-
-        confidence = None
-        a_score = None
-        b_score = None
-        reasons: List[str] = []
-        if pair_info:
-            confidence = pair_info.get("confidence")
-            a_score = pair_info.get("a_score")
-            b_score = pair_info.get("b_score")
-            reasons = pair_info.get("reasons") or []
-        else:
-            confidence = round(float(segment.get("_bucket_score") or 0.0), 3)
-            a_score = confidence
-
-        pair_display = None
-        if pair_info:
-            sender_id = pair_info.get("sender_segment_id")
-            receiver_id = pair_info.get("receiver_segment_id")
-            if sender_id and receiver_id:
-                pair_display = f"{sender_id}->{receiver_id}"
+            elif role == "receiver":
+                status = "partial match" if (segment.get("_entities") or segment.get("_actions")) else "general conversation"
             else:
-                pair_display = pair_info.get("id")
+                status = "general conversation"
+
+        confidence = pair_info.get("confidence") if pair_info else None
+        a_score = pair_info.get("a_score") if pair_info else None
+        b_score = pair_info.get("b_score") if pair_info else None
+        reasons = pair_info.get("reasons") if pair_info else []
+
+        pair_display = pair_info.get("pair_display") if pair_info else None
 
         entry = {
             "id": segment.get("_segment_id"),
-            "speaker": segment.get("speaker")
-            or segment.get("speaker_name")
-            or segment.get("speaker_label")
-            or "Unknown",
+            "speaker": _segment_speaker(segment),
             "start": segment.get("start"),
             "end": segment.get("end"),
             "content": text,
             "status": status,
             "role": segment.get("_role"),
             "type": "Verification" if segment.get("_role") == "verifier" else "Instruction",
-            "bucket": bucket.get("title") if bucket else None,
-            "bucket_id": bucket.get("id") if bucket else None,
-            "section_step": _format_bucket_hierarchy(bucket) if bucket else None,
-            "evidence_pages": _bucket_page_display(bucket) if bucket else None,
             "pair": pair_id,
             "pair_display": pair_display,
             "pair_role": segment.get("_pair_role"),
@@ -2300,7 +2290,6 @@ def _build_summary_entries(
             "b_score": b_score,
             "reasons": reasons,
             "three_pc_role": segment.get("_3pc_role"),
-            "reference": " ".join(bucket.get("lines", [])[:2]) if bucket else None,
             "pair_status": pair_info.get("status") if pair_info else None,
             "communication_type": segment.get("_communication_type"),
         }
@@ -2309,193 +2298,6 @@ def _build_summary_entries(
 
     return entries
 
-
-def _coerce_reference_line(line: Any) -> Tuple[str, Optional[int]]:
-    """Return the textual content and optional page number for a reference entry."""
-
-    if isinstance(line, dict):
-        return str(line.get("text", "")).strip(), line.get("page")
-    return str(line).strip(), None
-
-
-def _create_document_buckets(
-    reference_lines: List[Any],
-    model: SentenceTransformer,
-    bucket_size: int = 3,
-) -> Tuple[List[Dict[str, Any]], Optional[np.ndarray]]:
-    """Create structure-aware document buckets keyed by Section → Step → Substep."""
-
-    if not reference_lines:
-        return [], None
-
-    buckets: List[Dict[str, Any]] = []
-    current_bucket: Optional[Dict[str, Any]] = None
-    hierarchy: Dict[str, Optional[str]] = {"section": None, "step": None, "substep": None}
-
-    def _finalise_current_bucket() -> None:
-        nonlocal current_bucket
-        if not current_bucket:
-            return
-
-        text_blob = " ".join(current_bucket["lines"])
-        current_bucket["text"] = text_blob
-        current_bucket["normalized_text"] = normalize_line(text_blob)
-        current_bucket["required_entities"] = sorted(current_bucket["required_entities"])
-        current_bucket["required_actions"] = sorted(current_bucket["required_actions"])
-        if current_bucket.get("page_range"):
-            start_page, end_page = current_bucket["page_range"]
-            current_bucket["page_range"] = (
-                start_page,
-                max(start_page, end_page) if end_page is not None else start_page,
-            )
-        buckets.append(current_bucket)
-        current_bucket = None
-
-    def _ensure_bucket(
-        parsed: Optional[Dict[str, Optional[str]]],
-        marker: Optional[str],
-        idx: int,
-        page: Optional[int],
-        line_text: str,
-    ) -> Dict[str, Any]:
-        nonlocal hierarchy, current_bucket
-
-        if parsed:
-            hierarchy = {
-                "section": parsed.get("section") or hierarchy.get("section"),
-                "step": parsed.get("step")
-                or (parsed.get("section") if hierarchy.get("step") is None else hierarchy.get("step")),
-                "substep": parsed.get("substep"),
-            }
-        elif hierarchy["section"] is None:
-            hierarchy = {"section": "0", "step": None, "substep": None}
-
-        bucket_section = hierarchy["section"]
-        bucket_step = hierarchy["step"]
-        bucket_substep = hierarchy["substep"]
-
-        if marker:
-            marker_tag = marker.upper()
-            bucket_substep = f"{bucket_substep + '-' if bucket_substep else ''}{marker_tag}"
-
-        if current_bucket and (
-            current_bucket["section"] == bucket_section
-            and current_bucket.get("step") == bucket_step
-            and current_bucket.get("substep") == bucket_substep
-        ):
-            return current_bucket
-
-        _finalise_current_bucket()
-
-        bucket_id = f"{bucket_section or '0'}-{bucket_step or '0'}-{bucket_substep or '0'}-{len(buckets)}"
-        title = parsed.get("title") if parsed else line_text[:80]
-        current_bucket = {
-            "id": bucket_id,
-            "section": bucket_section,
-            "step": bucket_step,
-            "substep": bucket_substep,
-            "title": title,
-            "lines": [],
-            "start_idx": idx,
-            "end_idx": idx,
-            "page_range": (page, page) if page is not None else None,
-            "required_entities": set(),
-            "required_actions": set(),
-            "markers": set(marker.split(" ") if marker else []),
-        }
-        return current_bucket
-
-    for idx, raw_line in enumerate(reference_lines):
-        line_text, page = _coerce_reference_line(raw_line)
-        if not line_text:
-            continue
-
-        parsed = _parse_procedure_heading(line_text)
-        markers = _detect_step_markers(line_text)
-        marker_for_bucket = next(iter(markers)) if markers else None
-
-        bucket = _ensure_bucket(parsed, marker_for_bucket, idx, page, line_text)
-        bucket["lines"].append(line_text)
-        bucket["required_entities"].update(_extract_required_entities(line_text))
-        bucket["required_actions"].update(_extract_required_actions(line_text))
-        bucket["markers"].update(markers)
-        bucket["end_idx"] = idx + 1
-
-        if page is not None:
-            start_page, end_page = (bucket.get("page_range") or (page, page))
-            if start_page is None:
-                start_page = page
-            if end_page is None:
-                end_page = page
-            bucket["page_range"] = (min(start_page, page), max(end_page, page))
-
-    _finalise_current_bucket()
-
-    try:
-        bucket_texts = [b["text"] for b in buckets]
-        embeddings = model.encode(bucket_texts)
-        return buckets, np.array(embeddings)
-    except Exception as exc:
-        logging.warning("Failed to create bucket embeddings: %s", exc)
-        return buckets, None
-def _find_best_bucket_match(
-    spoken_text: str,
-    buckets: List[Dict[str, Any]],
-    bucket_embeddings: Optional[np.ndarray],
-    model: SentenceTransformer,
-    segment_entities: Optional[Set[str]] = None,
-    segment_actions: Optional[Set[str]] = None,
-) -> Tuple[Optional[int], float]:
-    """Find the best matching document bucket considering semantics and lexical hints."""
-
-    if not spoken_text or not buckets:
-        return None, 0.0
-
-    normalized_spoken = normalize_line(spoken_text)
-    segment_entities = segment_entities or set()
-    segment_actions = segment_actions or set()
-
-    semantic_scores: Optional[np.ndarray] = None
-    if bucket_embeddings is not None:
-        try:
-            spoken_embedding = model.encode([spoken_text])
-            semantic_scores = util.cos_sim(spoken_embedding, bucket_embeddings)[0]
-            if hasattr(semantic_scores, "cpu"):
-                semantic_scores = semantic_scores.cpu().numpy()
-        except Exception as exc:
-            logging.warning("Failed semantic bucket match: %s", exc)
-            semantic_scores = None
-
-    best_bucket_idx: Optional[int] = None
-    best_score = 0.0
-
-    for idx, bucket in enumerate(buckets):
-        normalized_bucket = bucket.get("normalized_text") or normalize_line(bucket.get("text", ""))
-        fuzzy_score = fuzz.token_set_ratio(normalized_spoken, normalized_bucket) / 100.0
-
-        semantic_score = float(semantic_scores[idx]) if semantic_scores is not None else fuzzy_score
-
-        bucket_entities = set(bucket.get("required_entities") or [])
-        bucket_actions = set(bucket.get("required_actions") or [])
-        entity_overlap = (
-            len(bucket_entities & segment_entities) / len(bucket_entities)
-            if bucket_entities
-            else 0.0
-        )
-        action_overlap = (
-            len(bucket_actions & segment_actions) / len(bucket_actions)
-            if bucket_actions
-            else 0.0
-        )
-
-        lexical_bonus = 0.15 * entity_overlap + 0.1 * action_overlap
-        combined = (0.7 * semantic_score) + (0.3 * fuzzy_score) + lexical_bonus
-
-        if combined > best_score:
-            best_score = combined
-            best_bucket_idx = idx
-
-    return best_bucket_idx, float(best_score)
 
 def build_three_part_communication_summary(
     reference_text: Optional[str],
@@ -2531,38 +2333,19 @@ def build_three_part_communication_summary(
     segments = _detect_3pc_patterns(segments)
     _assign_communication_groups(segments)
 
-    # Parse reference document
-    reference_lines: List[str] = []
-    if reference_text:
-        reference_lines = [ln.strip() for ln in reference_text.splitlines() if ln.strip()]
-    
     # Get semantic model
     try:
         model = _get_sentence_model()
     except:
         model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    # Create document buckets
-    buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
-
     for segment in segments:
         segment["_segment_id"] = segment.get("_segment_id") or str(uuid.uuid4())
 
     _classify_segment_roles(segments)
-    _assign_buckets_to_segments(segments, buckets, bucket_embeddings, model)
+    _prepare_segment_features(segments, model)
 
-    segments = _merge_segments_within_bucket(segments)
-
-    for segment in segments:
-        segment["_segment_id"] = segment.get("_segment_id") or str(uuid.uuid4())
-
-    _classify_segment_roles(segments)
-    _assign_buckets_to_segments(segments, buckets, bucket_embeddings, model)
-
-    pairs = _build_bucket_pairs(segments, buckets)
-    summary_entries = _build_summary_entries(
-        segments, buckets, pairs, match_threshold, partial_threshold
-    )
+    pairs = _build_pairs(segments, match_threshold, partial_threshold)
+    summary_entries = _build_summary_entries(segments, pairs)
 
     summary_entries.sort(
         key=lambda e: (
@@ -2599,19 +2382,17 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         body_font_size = 10
         row_padding = 4
         content_width_ratio = [
-            0.12,
+            0.20,
             0.16,
-            0.12,
-            0.12,
+            0.16,
+            0.16,
             0.14,
-            0.12,
-            0.22,
+            0.18,
         ]
         headers = [
-            "Bucket",
-            "Section/Step",
             "Speaker",
             "Role",
+            "Pair",
             "Timing",
             "Status",
             "Details",
@@ -2780,13 +2561,16 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 content_value = entry.get("content") or ""
                 if content_value:
                     detail_parts.append(content_value)
-                if pair_display and pair_display != "-":
-                    detail_parts.append(f"Pair: {pair_display}")
-                evidence_value = entry.get("evidence_pages") or ""
-                if evidence_value and evidence_value != "-":
-                    detail_parts.append(f"Evidence: {evidence_value}")
                 if confidence_display:
                     detail_parts.append(f"Confidence: {confidence_display}")
+                if entry.get("pair_status"):
+                    detail_parts.append(f"Pair status: {entry.get('pair_status')}")
+                comm_type = entry.get("communication_type")
+                if comm_type:
+                    detail_parts.append(f"Communication: {comm_type.upper()}")
+                three_pc_role = entry.get("three_pc_role")
+                if three_pc_role:
+                    detail_parts.append(f"3PC role: {three_pc_role}")
                 if reasons:
                     detail_parts.append("Reasons: " + ", ".join(reasons))
 
@@ -2804,10 +2588,9 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     role_display = "-"
 
                 row_values = [
-                    entry.get("bucket") or "-",
-                    entry.get("section_step") or "-",
                     entry.get("speaker") or "Unknown",
                     role_display,
+                    pair_display or "-",
                     timing_display,
                     status_text,
                     details_text,
@@ -2849,10 +2632,9 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         return
 
     headers = [
-        "Bucket",
-        "Section/Step",
         "Speaker",
         "Role",
+        "Pair",
         "Timing",
         "Status",
         "Details",
@@ -2893,13 +2675,16 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         content_value = entry.get("content") or ""
         if content_value:
             detail_parts.append(content_value)
-        if pair_display and pair_display != "-":
-            detail_parts.append(f"Pair: {pair_display}")
-        evidence_value = entry.get("evidence_pages") or ""
-        if evidence_value and evidence_value != "-":
-            detail_parts.append(f"Evidence: {evidence_value}")
         if confidence_display:
             detail_parts.append(f"Confidence: {confidence_display}")
+        if entry.get("pair_status"):
+            detail_parts.append(f"Pair status: {entry.get('pair_status')}")
+        comm_type = entry.get("communication_type")
+        if comm_type:
+            detail_parts.append(f"Communication: {comm_type.upper()}")
+        three_pc_role = entry.get("three_pc_role")
+        if three_pc_role:
+            detail_parts.append(f"3PC role: {three_pc_role}")
         if reasons:
             detail_parts.append("Reasons: " + ", ".join(reasons))
 
@@ -2932,10 +2717,9 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         status_value = entry.get("status") or "-"
 
         values = [
-            entry.get("bucket") or "-",
-            entry.get("section_step") or "-",
             entry.get("speaker") or "Unknown",
             role_display,
+            pair_display or "-",
             timing_text,
             status_value,
             details_text,
