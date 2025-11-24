@@ -31,16 +31,29 @@ from sentence_transformers import SentenceTransformer, util
 from sentence_transformers import SentenceTransformer
 import torch  # If not present, add to requirements
 
+# Compute device helper (CPU fallback if no GPU)
+_DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
 # Lazy global model (thread-safe)
 _SENTENCE_MODEL = None
 _MODEL_LOCK = threading.Lock()
+
+
+def _get_compute_device() -> torch.device:
+    """Return the preferred torch device (GPU when available)."""
+
+    return _DEVICE
+
 
 def _get_sentence_model():
     global _SENTENCE_MODEL
     if _SENTENCE_MODEL is None:
         with _MODEL_LOCK:
             if _SENTENCE_MODEL is None:
-                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+                _SENTENCE_MODEL = SentenceTransformer(
+                    'all-MiniLM-L6-v2', device=str(_get_compute_device())
+                )
     return _SENTENCE_MODEL
 
 from docx.enum.text import WD_COLOR_INDEX
@@ -54,12 +67,13 @@ from pyannote.core import Segment
 from .models import SpeakerProfile
 from .speaker_utils import match_speaker_embedding
 
-# Load Whisper model once
-model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
+# Load Whisper model once (GPU when available, otherwise CPU)
+model = whisper.load_model(
+    getattr(settings, 'WHISPER_MODEL', 'small.en'), device=str(_get_compute_device())
+)
 
 _DIARIZATION_PIPELINE: Optional[Pipeline] = None
 _EMBEDDING_INFERENCE: Optional[Inference] = None
-_MODEL_LOCK = threading.Lock()
 
 
 def _get_hf_token() -> Optional[str]:
@@ -78,6 +92,7 @@ def _get_diarization_pipeline() -> Pipeline:
                     "pyannote/speaker-diarization-3.1",
                     use_auth_token=_get_hf_token(),
                 )
+                _DIARIZATION_PIPELINE.to(_get_compute_device())
     return _DIARIZATION_PIPELINE
 
 
@@ -91,7 +106,9 @@ def _get_embedding_inference() -> Inference:
                     "pyannote/embedding",
                     use_auth_token=_get_hf_token(),
                 )
-                _EMBEDDING_INFERENCE = Inference(embedding_model, window="whole")
+                _EMBEDDING_INFERENCE = Inference(
+                    embedding_model, window="whole", device=_get_compute_device()
+                )
     return _EMBEDDING_INFERENCE
 
 # Initialize S3 client
@@ -1654,7 +1671,7 @@ def build_three_part_communication_summary(
     try:
         model = _get_sentence_model()
     except:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model = SentenceTransformer('all-MiniLM-L6-v2', device=str(_get_compute_device()))
     
     # Create document buckets
     buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
