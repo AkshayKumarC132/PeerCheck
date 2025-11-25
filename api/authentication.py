@@ -1,15 +1,15 @@
-from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
-from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth import authenticate, login
 from django.views.decorators.csrf import csrf_exempt
-from .serializers import *
-from .models import *
-from django.db import IntegrityError, transaction
+from django.db import IntegrityError
 from rest_framework.views import APIView
 from knox.models import AuthToken
 from django.utils.decorators import method_decorator
 from rest_framework import generics, status
+
+from .models import UserProfile
+from .serializers import LoginSerializer, UserProfileSerializer
 
 from .rag_integration import ensure_rag_token  # NEW
 
@@ -107,19 +107,19 @@ class LoginViewAPI(generics.CreateAPIView):
 class LogoutViewAPI(APIView):
     def post(self, request, token):
         try:
-            auth_token_instance = KnoxAuthtoken.objects.get(token_key=token[:8])
-        except :
+            auth_token_instance = AuthToken.objects.get(token_key=token[:8])
+        except AuthToken.DoesNotExist:
             return Response({"message": "Invalid Token"}, status=status.HTTP_400_BAD_REQUEST)
 
-        if auth_token_instance:
-            try:
-                auth_token_instance.delete()
-                # NOTE: Do NOT clear RAG token here (per requirements)
-                return Response({"message": "Logout successful"}, status=status.HTTP_200_OK)
-            except Exception as e:
-                return Response({"message": f"Error during logout: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        else:
-            return Response({"message": "Invalid token or already logged out"}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            auth_token_instance.delete()
+            # NOTE: Do NOT clear RAG token here (per requirements)
+            return Response({"message": "Logout successful"}, status=status.HTTP_200_OK)
+        except Exception as e:
+            return Response(
+                {"message": f"Error during logout: {str(e)}"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
 # ---------------- Token check helper (used by views) ----------------
 

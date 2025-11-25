@@ -33,48 +33,24 @@ class RoleBasedPermission(permissions.BasePermission):
             logger.info("Admin role granted full access")
             return True
 
-        # Define permissions per role
+        # Define permissions per role for active endpoints only
         permissions = {
-            'operator': {
-                'sopcreateview': ['post'],
-                'soplistview': ['get'],
-                'sopdetailview': ['get', 'put', 'delete'], 
-                'audiofiledetailview': ['get', 'delete'],
-                'processaudioview': ['post'],
-                'feedbackview': ['post'], 
-                'feedbacklistview': ['get'], 
-                'feedbackdetailview': ['get', 'put', 'patch', 'delete'], 
-                'getaudiorecordsview': ['get'],
-                'reanalyzeaudioview': ['post'],
-                'sessioncreateview': ['post'],
-                'sessionlistview': ['get'],
-                'sessiondetailview': ['get', 'put', 'patch', 'delete'], 
-                'feedbackreviewlistview': ['get'], # Added FeedbackReviewListView
-                'feedbackreviewdetailview': ['get'],      # Added FeedbackReviewDetailView (Operator GET only)
-                'usersettingsview': ['get', 'patch'],
-                'sessionstatusupdateview': ['patch'], 
-                'adminuserlistview': ['get'],
-                'userprofiledetailsview': ['get'],
+            "operator": {
+                "getaudiorecordsview": {"get"},
+                "dashboardsummaryview": {"get"},
+                "usersettingsview": {"get", "patch"},
+                "userprofiledetailsview": {"get"},
             },
-            'reviewer': {
-                'soplistview': ['get'],
-                'sopdetailview': ['get'], 
-                'audiofiledetailview': ['get'],
-                'feedbacklistview': ['get'], 
-                'feedbackdetailview': ['get'], 
-                'getaudiorecordsview': ['get'],
-                'sessionlistview': ['get'],
-                'sessiondetailview': ['get'], 
-                'sessionreviewview': ['get', 'post'], # Existing permission for creating reviews
-                'feedbackreviewlistview': ['get'], # Added FeedbackReviewListView
-                'feedbackreviewdetailview': ['get', 'put', 'patch', 'delete'], # Added FeedbackReviewDetailView
-                'auditlogview': ['get'],
-                'usersettingsview': ['get', 'patch'],
-                'userprofiledetailsview': ['get'],
-            }
+            "reviewer": {
+                "getaudiorecordsview": {"get"},
+                "dashboardsummaryview": {"get"},
+                "usersettingsview": {"get", "patch"},
+                "auditlogview": {"get"},
+                "userprofiledetailsview": {"get"},
+            },
         }
 
-        allowed_methods = permissions.get(role, {}).get(view_name, [])
+        allowed_methods = permissions.get(role, {}).get(view_name, set())
         is_allowed = method in allowed_methods
         logger.info(f"Permission check result: {'Allowed' if is_allowed else 'Denied'}")
         return is_allowed
