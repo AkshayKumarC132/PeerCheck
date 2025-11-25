@@ -34,6 +34,8 @@ Thumbs.db
 .vscode/
 .idea/
 *.iml
+.zencoder/
+.qodo/
 
 # Configuration files
 *.sqlite3
@@ -69,8 +71,13 @@ vosk-model-small-en-us-0.15
 vosk-model-en-us-0.22
 *.rar
 vosk-model-spk-0.4
+vosk-model-en-us-0.42-gigaspeech
 
 # File Extensions
 *.txt
 *.pdf
 *.docx
+
+# Other directories
+pretrained_models/
+output/

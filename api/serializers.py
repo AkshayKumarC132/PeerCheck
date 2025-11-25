@@ -101,3 +101,7 @@ class AudioFileSerializer(serializers.ModelSerializer):
         model = AudioFile
         fields = "__all__"
         depth = 1
+
+class ErrorResponseSerializer(serializers.Serializer):
+    error = serializers.CharField(help_text="A description of the error that occurred.")
+    detail = serializers.CharField(required=False, help_text="Sometimes used by DRF for single string error messages.")
