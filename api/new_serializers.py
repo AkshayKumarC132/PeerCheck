@@ -1,6 +1,18 @@
+import json
+
 from rest_framework import serializers
 from django.core.exceptions import ObjectDoesNotExist
-from .models import ReferenceDocument, AudioFile, ProcessingSession, UserProfile, RAGAssistant, RAGThread, RAGMessage, RAGRun
+from .models import (
+    ReferenceDocument,
+    AudioFile,
+    ProcessingSession,
+    UserProfile,
+    SpeakerProfile,
+    RAGAssistant,
+    RAGThread,
+    RAGMessage,
+    RAGRun,
+)
 from .new_utils import allowed_file
 from peercheck import settings
 
@@ -82,6 +94,7 @@ class ProcessingResultSerializer(serializers.Serializer):
     missing_content = serializers.CharField(read_only=True)
     entire_document = serializers.CharField(read_only=True)
     processing_time = serializers.FloatField(read_only=True, required=False)
+    diarization_status = serializers.CharField(read_only=True, required=False)
 
 class DownloadRequestSerializer(serializers.Serializer):
     session_id = serializers.CharField(help_text="Processing session ID received from upload response")
@@ -96,13 +109,70 @@ class ReferenceDocumentDetailSerializer(serializers.ModelSerializer):
             # add other fields as needed
         ]
 
+class ReferenceDocumentUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ReferenceDocument
+        fields = ['name', 'document_type']
+
 class AudioFileDetailSerializer(serializers.ModelSerializer):
     class Meta:
         model = AudioFile
         fields = [
-            'id', 'original_filename', 'status', 'duration',
+            'id', 'original_filename', 'status', 'diarization_status', 'duration',
             'coverage', 'created_at', 'updated_at'
         ]
+
+class AudioFileUpdateSerializer(serializers.Serializer):
+    STATUS_CHOICES = ('pending', 'processing', 'processed', 'failed')
+    DIARIZATION_CHOICES = ('pending', 'processing', 'completed', 'failed')
+
+    original_filename = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    status = serializers.ChoiceField(choices=STATUS_CHOICES, required=False)
+    diarization_status = serializers.ChoiceField(choices=DIARIZATION_CHOICES, required=False)
+    summary = serializers.CharField(required=False, allow_blank=True)
+    keywords_detected = serializers.JSONField(required=False)
+    reference_document_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_keywords_detected(self, value):
+        if value in (None, ''):
+            return []
+        if isinstance(value, list):
+            return value
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return [value]
+        return value
+
+class AudioFileFullSerializer(serializers.ModelSerializer):
+    reference_document_id = serializers.SerializerMethodField()
+
+    class Meta:
+        model = AudioFile
+        fields = [
+            'id', 'original_filename', 'file_path', 'status', 'diarization_status',
+            'duration', 'coverage', 'summary', 'keywords_detected',
+            'reference_document_id', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'file_path', 'created_at', 'updated_at']
+
+    def get_reference_document_id(self, obj):
+        if obj.reference_document_id:
+            return str(obj.reference_document_id)
+        return None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        keywords = data.get('keywords_detected')
+        if isinstance(keywords, str):
+            try:
+                data['keywords_detected'] = json.loads(keywords)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        return data
 
 class UserDocumentsSerializer(serializers.Serializer):
     documents = ReferenceDocumentDetailSerializer(many=True, read_only=True)
@@ -147,6 +217,36 @@ class SpeakerProfileMappingSerializer(serializers.Serializer):
     speaker_label = serializers.CharField(max_length=50)
     name = serializers.CharField(max_length=255)
     profile_id = serializers.IntegerField(required=False)
+
+class SpeakerProfileDetailSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SpeakerProfile
+        fields = ['id', 'name', 'embedding', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'created_at', 'updated_at']
+
+class SpeakerProfileCreateUpdateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SpeakerProfile
+        fields = ['name', 'embedding']
+        extra_kwargs = {
+            'name': {'required': True},
+            'embedding': {'required': False},
+        }
+
+    def validate_embedding(self, value):
+        if value is None:
+            return []
+        return value
+
+    def create(self, validated_data):
+        if 'embedding' not in validated_data:
+            validated_data['embedding'] = []
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        if 'embedding' in validated_data and validated_data['embedding'] is None:
+            validated_data['embedding'] = []
+        return super().update(instance, validated_data)
 
 # --------- NEW: RAG conversational serializers (simple) ---------
 

@@ -249,14 +249,14 @@ CELERY_BEAT_SCHEDULE = {
 }
 
 if DATABASES['default']['ENGINE'] == 'django.db.backends.sqlite3':
-    RAGITIFY_BASE_URL = os.getenv("RAGITIFY_BASE_URL", "http://localhost:8000/").rstrip("/")
+    RAGITIFY_BASE_URL = os.getenv("RAGITIFY_BASE_URL", "http://localhost:5000/").rstrip("/")
 elif DATABASES['default']['ENGINE'] == 'django.db.backends.postgresql_psycopg2' and DATABASES['default']['NAME'] == 'peercheck_dev':
     RAGITIFY_BASE_URL = os.getenv("RAGITIFY_BASE_URL", "https://rag.xamplify.co/").rstrip("/")
 else:
     RAGITIFY_BASE_URL = os.getenv("RAGITIFY_BASE_URL", "http://localhost:8000/").rstrip("/")
 
 # --- RAGitify Plug-and-Play ---
-RAGITIFY_ENABLED = os.getenv("RAGITIFY_ENABLED", "true").lower() == "true"
+RAGITIFY_ENABLED = os.getenv("RAGITIFY_ENABLED", "false").lower() == "true"
 RAGITIFY_TIMEOUT_SECONDS = int(os.getenv("RAGITIFY_TIMEOUT_SECONDS", "30"))
 RAGITIFY_DEFAULT_PASSWORD = os.getenv("RAGITIFY_DEFAULT_PASSWORD", "ChangeMe!123")
 

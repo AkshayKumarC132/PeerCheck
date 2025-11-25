@@ -3,7 +3,8 @@ from rest_framework.test import APIClient
 from .models import UserProfile, SOP, SOPStep, AudioFile, Session
 from knox.models import AuthToken
 from django.core.files.uploadedfile import SimpleUploadedFile
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from .new_utils import build_three_part_communication_summary
 import json
 
 class SOPTests(TestCase):
@@ -186,3 +187,167 @@ class RoleBasedAccessTests(TestCase):
     def test_get_audio_records_auditor(self):
         response = self.client.get(f'/api/audio-records/{self.auditor_token}/')
         self.assertEqual(response.status_code, 200)
+
+
+class ThreePartCommunicationSummaryTests(TestCase):
+    @patch("api.new_utils._get_sentence_model")
+    def test_verification_phrase_is_split_into_individual_segment(self, mock_model):
+        dummy_model = MagicMock()
+        dummy_model.encode.return_value = []
+        mock_model.return_value = dummy_model
+
+        segments = [
+            {"speaker": "Speaker_1", "start": 0.0, "end": 3.0, "text": "You're ready for eight two"},
+            {
+                "speaker": "Speaker_2",
+                "start": 3.0,
+                "end": 9.0,
+                "text": "That's correct. Proceeding to the next task now.",
+            },
+        ]
+
+        entries = build_three_part_communication_summary(
+            reference_text=None,
+            diarization_segments=segments,
+            match_threshold=0.0,
+            partial_threshold=0.0,
+        )
+
+        self.assertEqual(len(entries), 3)
+
+        confirmation_entry = next(
+            entry for entry in entries if entry["status"] == "acknowledged"
+        )
+        self.assertEqual(confirmation_entry["content"], "That's correct.")
+        self.assertEqual(confirmation_entry.get("communication_type"), "2pc")
+        self.assertAlmostEqual(confirmation_entry["start"], 3.0)
+        self.assertLess(confirmation_entry["end"], 9.0)
+
+        trailing_entry = next(
+            entry for entry in entries if entry["content"].startswith("Proceeding")
+        )
+        self.assertGreater(trailing_entry["start"], confirmation_entry["end"])
+
+    @patch("api.new_utils._get_sentence_model")
+    def test_only_verification_phrase_is_isolated(self, mock_model):
+        dummy_model = MagicMock()
+        dummy_model.encode.return_value = []
+        mock_model.return_value = dummy_model
+
+        segments = [
+            {
+                "speaker": "Nathan",
+                "start": 50.0,
+                "end": 93.0,
+                "text": (
+                    "That's correct. All right, so 8.2. I have Alpha Lima HK6 Alpha open. "
+                    "And I have checked my indications. I got a green light not lit on Alpha "
+                    "Lima HK6, a red light indicated as lit. And my SFAS panel is lit and NIPIS "
+                    "is showing indications are open. I am ready for you to perform 8.2.3 to "
+                    "locally close KA Charlie 1477."
+                ),
+            }
+        ]
+
+        entries = build_three_part_communication_summary(
+            reference_text=None,
+            diarization_segments=segments,
+            match_threshold=0.0,
+            partial_threshold=0.0,
+        )
+
+        self.assertEqual(len(entries), 2)
+
+        confirmation_entry = next(
+            entry for entry in entries if entry["content"] == "That's correct."
+        )
+
+        narrative_entry = next(
+            entry for entry in entries if entry is not confirmation_entry
+        )
+        self.assertTrue(
+            narrative_entry["content"].startswith("All right, so 8.2."),
+            narrative_entry["content"],
+        )
+        self.assertTrue(
+            narrative_entry["content"].endswith("locally close KA Charlie 1477."),
+            narrative_entry["content"],
+        )
+        self.assertGreater(narrative_entry["end"], confirmation_entry["end"])
+
+    @patch("api.new_utils._get_sentence_model")
+    def test_non_verification_speech_is_recombined(self, mock_model):
+        dummy_model = MagicMock()
+        dummy_model.encode.return_value = []
+        mock_model.return_value = dummy_model
+
+        segments = [
+            {
+                "speaker": "Nathan",
+                "start": 0.0,
+                "end": 4.0,
+                "text": "That's correct. Additional statement one.",
+            },
+            {
+                "speaker": "Nathan",
+                "start": 4.0,
+                "end": 10.0,
+                "text": "Continuing the instructions with more detail.",
+            },
+        ]
+
+        entries = build_three_part_communication_summary(
+            reference_text=None,
+            diarization_segments=segments,
+            match_threshold=0.0,
+            partial_threshold=0.0,
+        )
+
+        self.assertEqual(len(entries), 2)
+
+        confirmation_entry = next(
+            entry for entry in entries if entry["content"] == "That's correct."
+        )
+
+        narrative_entry = next(
+            entry for entry in entries if entry is not confirmation_entry
+        )
+        self.assertIn("Additional statement one.", narrative_entry["content"])
+        self.assertIn("Continuing the instructions", narrative_entry["content"])
+        self.assertAlmostEqual(
+            float(narrative_entry["start"]), float(confirmation_entry["end"]), places=2
+        )
+        self.assertAlmostEqual(narrative_entry["end"], 10.0)
+
+    @patch("api.new_utils._get_sentence_model")
+    def test_three_part_communication_is_tagged(self, mock_model):
+        dummy_model = MagicMock()
+        dummy_model.encode.return_value = []
+        mock_model.return_value = dummy_model
+
+        segments = [
+            {"speaker": "Alpha", "start": 0.0, "end": 3.0, "text": "Initiating step eight now"},
+            {
+                "speaker": "Bravo",
+                "start": 3.0,
+                "end": 6.0,
+                "text": "You are on step eight now",
+            },
+            {"speaker": "Alpha", "start": 6.0, "end": 7.5, "text": "That's correct"},
+        ]
+
+        entries = build_three_part_communication_summary(
+            reference_text=None,
+            diarization_segments=segments,
+            match_threshold=0.0,
+            partial_threshold=0.0,
+        )
+
+        roles = {entry.get("three_pc_role"): entry for entry in entries if entry.get("three_pc_role")}
+
+        self.assertIn("statement", roles)
+        self.assertIn("readback", roles)
+        self.assertIn("confirmation", roles)
+
+        for role_entry in roles.values():
+            self.assertEqual(role_entry.get("communication_type"), "3pc")
