@@ -28,8 +28,11 @@ import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
 # Add at top (after existing ML imports like whisper/pyannote)
-from sentence_transformers import SentenceTransformer
 import torch  # If not present, add to requirements
+
+# Detect device
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+logging.info(f"Using device: {DEVICE}")
 
 # Lazy global model (thread-safe)
 _SENTENCE_MODEL = None
@@ -40,7 +43,7 @@ def _get_sentence_model():
     if _SENTENCE_MODEL is None:
         with _MODEL_LOCK:
             if _SENTENCE_MODEL is None:
-                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
     return _SENTENCE_MODEL
 
 from docx.enum.text import WD_COLOR_INDEX
@@ -55,7 +58,7 @@ from .models import SpeakerProfile
 from .speaker_utils import match_speaker_embedding
 
 # Load Whisper model once
-model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
+model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'), device=DEVICE)
 
 _DIARIZATION_PIPELINE: Optional[Pipeline] = None
 _EMBEDDING_INFERENCE: Optional[Inference] = None
@@ -78,6 +81,7 @@ def _get_diarization_pipeline() -> Pipeline:
                     "pyannote/speaker-diarization-3.1",
                     use_auth_token=_get_hf_token(),
                 )
+                _DIARIZATION_PIPELINE.to(DEVICE)
     return _DIARIZATION_PIPELINE
 
 
@@ -91,7 +95,7 @@ def _get_embedding_inference() -> Inference:
                     "pyannote/embedding",
                     use_auth_token=_get_hf_token(),
                 )
-                _EMBEDDING_INFERENCE = Inference(embedding_model, window="whole")
+                _EMBEDDING_INFERENCE = Inference(embedding_model, window="whole", device=DEVICE)
     return _EMBEDDING_INFERENCE
 
 # Initialize S3 client
@@ -628,7 +632,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     relevant_page_nums = sorted([i for i in top_pages if 0 <= i < len(target_doc)])
     
     # --- 2. Semantic Matching Setup ---
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
     query_chunks = split_into_sentences(query_text)
     if not query_chunks: query_chunks = [query_text]
     query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
@@ -1614,7 +1618,7 @@ def _find_best_bucket_match(
 def build_three_part_communication_summary(
     reference_text: Optional[str],
     diarization_segments: Optional[List[Dict]],
-    match_threshold: float = 0.6,
+    match_threshold: float = 0.53,
     partial_threshold: float = 0.3,
     max_entries: int = 1000,
 ) -> List[Dict[str, Any]]:
@@ -1654,7 +1658,7 @@ def build_three_part_communication_summary(
     try:
         model = _get_sentence_model()
     except:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model = SentenceTransformer('all-MiniLM-L6-v2', device = DEVICE)
     
     # Create document buckets
     buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
