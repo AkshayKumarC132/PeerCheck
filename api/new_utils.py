@@ -31,7 +31,10 @@ from sentence_transformers import SentenceTransformer, util
 import torch  # If not present, add to requirements
 
 # Detect device
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+DEVICE = get_device()
 logging.info(f"Using device: {DEVICE}")
 
 # Lazy global model (thread-safe)
@@ -1737,9 +1740,13 @@ def build_three_part_communication_summary(
                 "start": segment.get("start"),
                 "end": segment.get("end"),
                 "content": spoken_text,
-                "status": "general conversation",
+                # Use the same key your color maps know (blue)
+                "status": "acknowledged",
                 "reference": None,
-                "similarity": 0.0,
+                "similarity": 1.0,
+                # Make sure it renders with “(3PC: confirmation)”
+                "three_pc_role": "confirmation",
+                "communication_type": segment.get("_communication_type"),
             })
             continue
         
