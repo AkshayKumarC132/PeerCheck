@@ -28,8 +28,14 @@ import uuid
 from collections import Counter
 from sentence_transformers import SentenceTransformer, util
 # Add at top (after existing ML imports like whisper/pyannote)
-from sentence_transformers import SentenceTransformer
 import torch  # If not present, add to requirements
+
+# Detect device
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+DEVICE = get_device()
+logging.info(f"Using device: {DEVICE}")
 
 # Lazy global model (thread-safe)
 _SENTENCE_MODEL = None
@@ -40,7 +46,7 @@ def _get_sentence_model():
     if _SENTENCE_MODEL is None:
         with _MODEL_LOCK:
             if _SENTENCE_MODEL is None:
-                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2')
+                _SENTENCE_MODEL = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
     return _SENTENCE_MODEL
 
 from docx.enum.text import WD_COLOR_INDEX
@@ -55,7 +61,7 @@ from .models import SpeakerProfile
 from .speaker_utils import match_speaker_embedding
 
 # Load Whisper model once
-model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'))
+model = whisper.load_model(getattr(settings, 'WHISPER_MODEL', 'small.en'), device=DEVICE)
 
 _DIARIZATION_PIPELINE: Optional[Pipeline] = None
 _EMBEDDING_INFERENCE: Optional[Inference] = None
@@ -78,6 +84,7 @@ def _get_diarization_pipeline() -> Pipeline:
                     "pyannote/speaker-diarization-3.1",
                     use_auth_token=_get_hf_token(),
                 )
+                _DIARIZATION_PIPELINE.to(DEVICE)
     return _DIARIZATION_PIPELINE
 
 
@@ -91,7 +98,7 @@ def _get_embedding_inference() -> Inference:
                     "pyannote/embedding",
                     use_auth_token=_get_hf_token(),
                 )
-                _EMBEDDING_INFERENCE = Inference(embedding_model, window="whole")
+                _EMBEDDING_INFERENCE = Inference(embedding_model, window="whole", device=DEVICE)
     return _EMBEDDING_INFERENCE
 
 # Initialize S3 client
@@ -628,7 +635,7 @@ def generate_highlighted_pdf(doc_path, query_text, output_path, require_transcri
     relevant_page_nums = sorted([i for i in top_pages if 0 <= i < len(target_doc)])
     
     # --- 2. Semantic Matching Setup ---
-    model = SentenceTransformer('all-MiniLM-L6-v2')
+    model = SentenceTransformer('all-MiniLM-L6-v2', device=DEVICE)
     query_chunks = split_into_sentences(query_text)
     if not query_chunks: query_chunks = [query_text]
     query_embeddings = model.encode(query_chunks, convert_to_tensor=True)
@@ -1290,6 +1297,160 @@ def _merge_incomplete_segments(segments: List[Dict], max_gap: float = 1.5) -> Li
     logging.info(f"Segment merging: {len(segments)} → {len(merged)}")
     return merged
 
+
+def _split_segments_on_verification_phrases(segments: List[Dict]) -> List[Dict]:
+    """Split segments so that verification phrases are isolated."""
+
+    if not segments:
+        return []
+
+    # Build a single regex so that longer phrases are matched first and we can
+    # capture every occurrence, even if multiple appear within the same
+    # diarization segment.
+    phrases = sorted(VERIFICATION_PHRASES, key=len, reverse=True)
+    pattern = re.compile(r"(?i)\b(" + "|".join(re.escape(p) for p in phrases) + r")\b")
+    trailing_punctuation = ",.;:!?)}]\"'”’"
+
+    split_segments: List[Dict] = []
+
+    for segment in segments:
+        original_text = (segment.get("text") or "").strip()
+        if not original_text:
+            split_segments.append(segment)
+            continue
+
+        matches = list(pattern.finditer(original_text))
+        if not matches:
+            split_segments.append(segment)
+            continue
+
+        parts: List[str] = []
+        cursor = 0
+        for match in matches:
+            start_idx, end_idx = match.span()
+
+            # Leading speech before the verification phrase.
+            leading = original_text[cursor:start_idx].strip()
+            if leading:
+                parts.append(leading)
+
+            trailing_end = end_idx
+            # Include trailing punctuation directly attached to the phrase.
+            while (
+                trailing_end < len(original_text)
+                and original_text[trailing_end] in trailing_punctuation
+            ):
+                trailing_end += 1
+
+            verification_text = original_text[start_idx:trailing_end].strip()
+            parts.append(verification_text)
+            cursor = trailing_end
+
+        # Remainder after the last match.
+        trailing_text = original_text[cursor:].strip()
+        if trailing_text:
+            parts.append(trailing_text)
+
+        # Allocate timestamps proportionally across the new segments.
+        start = segment.get("start")
+        end = segment.get("end")
+        total_duration = None
+        if start is not None and end is not None:
+            try:
+                total_duration = max(float(end) - float(start), 0.0)
+            except (TypeError, ValueError):
+                total_duration = None
+
+        weights = [max(len(text), 1) for text in parts]
+        weight_sum = sum(weights) or 1
+        current_start = float(start) if total_duration is not None else start
+
+        for idx, text in enumerate(parts):
+            new_segment = segment.copy()
+            new_segment["text"] = text
+
+            if total_duration is not None and start is not None and end is not None:
+                portion = total_duration * (weights[idx] / weight_sum)
+                new_start = current_start if current_start is not None else float(start)
+                new_end = new_start + portion if idx < len(parts) - 1 else float(end)
+                new_segment["start"] = round(new_start, 2)
+                new_segment["end"] = round(new_end, 2)
+                new_segment["duration"] = round(new_segment["end"] - new_segment["start"], 2)
+                current_start = new_end
+            else:
+                new_segment["start"] = segment.get("start")
+                new_segment["end"] = segment.get("end")
+                if "duration" in new_segment and isinstance(new_segment.get("duration"), (int, float)):
+                    new_segment["duration"] = segment.get("duration")
+
+            split_segments.append(new_segment)
+
+    logging.info(
+        "Segment verification split: %d → %d", len(segments), len(split_segments)
+    )
+    return split_segments
+
+
+def _combine_non_verification_runs(segments: List[Dict]) -> List[Dict]:
+    """Combine adjacent non-verification segments spoken by the same speaker."""
+
+    if not segments:
+        return []
+
+    combined: List[Dict] = []
+
+    def _speaker_identity(segment: Dict) -> Optional[str]:
+        return (
+            segment.get("speaker")
+            or segment.get("speaker_name")
+            or segment.get("speaker_label")
+        )
+
+    for segment in segments:
+        text = (segment.get("text") or "").strip()
+        if not text:
+            combined.append(segment)
+            continue
+
+        speaker_id = _speaker_identity(segment)
+        if not combined:
+            combined.append(segment.copy())
+            continue
+
+        previous = combined[-1]
+        previous_text = (previous.get("text") or "").strip()
+        previous_speaker = _speaker_identity(previous)
+
+        if (
+            speaker_id
+            and speaker_id == previous_speaker
+            and not _is_verification_phrase(previous_text)
+            and not _is_verification_phrase(text)
+        ):
+            merged_text = " ".join(filter(None, [previous_text, text]))
+            previous["text"] = merged_text.strip()
+
+            # Update timing metadata when available.
+            if segment.get("end") is not None:
+                previous["end"] = segment.get("end")
+            if previous.get("start") is not None and previous.get("end") is not None:
+                try:
+                    previous["duration"] = round(
+                        float(previous["end"]) - float(previous["start"]), 2
+                    )
+                except (TypeError, ValueError):
+                    previous.pop("duration", None)
+
+            continue
+
+        combined.append(segment.copy())
+
+    logging.info(
+        "Combined non-verification runs: %d → %d", len(segments), len(combined)
+    )
+    return combined
+
+
 def _detect_3pc_patterns(segments: List[Dict]) -> List[Dict]:
     """
     Detect 3PC patterns: Statement → Readback → Confirmation
@@ -1335,6 +1496,54 @@ def _detect_3pc_patterns(segments: List[Dict]) -> List[Dict]:
                 prev['_3pc_role'] = 'statement'
     
     return segments
+
+
+def _assign_communication_groups(segments: List[Dict]) -> None:
+    """Label segments as part of two-part or three-part communications."""
+
+    group_id = 0
+    processed_indices: Set[int] = set()
+
+    for idx, segment in enumerate(segments):
+        if segment.get("_3pc_role") != "confirmation" or idx in processed_indices:
+            continue
+
+        group_members: Set[int] = {idx}
+        roles_present: Set[str] = {"confirmation"}
+
+        readback_idx = segment.get("_3pc_confirms")
+        statement_idx = None
+
+        if isinstance(readback_idx, int) and 0 <= readback_idx < len(segments):
+            readback_segment = segments[readback_idx]
+            if readback_segment.get("_3pc_role") == "readback":
+                group_members.add(readback_idx)
+                roles_present.add("readback")
+                statement_idx = readback_segment.get("_3pc_confirms")
+
+        if isinstance(statement_idx, int) and 0 <= statement_idx < len(segments):
+            statement_segment = segments[statement_idx]
+            if statement_segment.get("_3pc_role") == "statement":
+                group_members.add(statement_idx)
+                roles_present.add("statement")
+
+        # Fallback: confirmations may directly point to statements without readbacks.
+        if ("readback" not in roles_present) and isinstance(readback_idx, int):
+            statement_candidate = segments[readback_idx]
+            if statement_candidate.get("_3pc_role") == "statement":
+                group_members.add(readback_idx)
+                roles_present.add("statement")
+
+        if len(group_members) <= 1:
+            continue
+
+        group_id += 1
+        communication_type = "3pc" if {"statement", "readback", "confirmation"} <= roles_present else "2pc"
+
+        for member_idx in group_members:
+            segments[member_idx]["_communication_group"] = group_id
+            segments[member_idx]["_communication_type"] = communication_type
+            processed_indices.add(member_idx)
 
 
 def _create_document_buckets(
@@ -1412,7 +1621,7 @@ def _find_best_bucket_match(
 def build_three_part_communication_summary(
     reference_text: Optional[str],
     diarization_segments: Optional[List[Dict]],
-    match_threshold: float = 0.6,
+    match_threshold: float = 0.53,
     partial_threshold: float = 0.3,
     max_entries: int = 1000,
 ) -> List[Dict[str, Any]]:
@@ -1433,10 +1642,16 @@ def build_three_part_communication_summary(
     
     # STEP 1: Conservative merging
     segments = _merge_incomplete_segments(segments, max_gap=1.5)
-    
-    # STEP 2: Detect 3PC patterns
+
+    # STEP 2: Split verification phrases that are bundled with other speech
+    segments = _split_segments_on_verification_phrases(segments)
+    # STEP 2a: Recombine the remaining speech for the same speaker
+    segments = _combine_non_verification_runs(segments)
+
+    # STEP 3: Detect 3PC patterns
     segments = _detect_3pc_patterns(segments)
-    
+    _assign_communication_groups(segments)
+
     # Parse reference document
     reference_lines: List[str] = []
     if reference_text:
@@ -1446,7 +1661,7 @@ def build_three_part_communication_summary(
     try:
         model = _get_sentence_model()
     except:
-        model = SentenceTransformer('all-MiniLM-L6-v2')
+        model = SentenceTransformer('all-MiniLM-L6-v2', device = DEVICE)
     
     # Create document buckets
     buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
@@ -1486,6 +1701,7 @@ def build_three_part_communication_summary(
                 "reference": reference_content,
                 "similarity": 1.0,
                 "three_pc_role": "confirmation",
+                "communication_type": segment.get("_communication_type"),
             })
             logging.info(f"✓ Added 3PC Confirmation: {speaker} - '{spoken_text}'")
             continue
@@ -1513,6 +1729,7 @@ def build_three_part_communication_summary(
                 "reference": matched_reference,
                 "similarity": round(best_score, 2),
                 "three_pc_role": "readback",
+                "communication_type": segment.get("_communication_type"),
             })
             continue
         
@@ -1523,9 +1740,13 @@ def build_three_part_communication_summary(
                 "start": segment.get("start"),
                 "end": segment.get("end"),
                 "content": spoken_text,
-                "status": "general conversation",
+                # Use the same key your color maps know (blue)
+                "status": "acknowledged",
                 "reference": None,
-                "similarity": 0.0,
+                "similarity": 1.0,
+                # Make sure it renders with “(3PC: confirmation)”
+                "three_pc_role": "confirmation",
+                "communication_type": segment.get("_communication_type"),
             })
             continue
         
@@ -1565,10 +1786,11 @@ def build_three_part_communication_summary(
             "reference": matched_reference,
             "similarity": round(best_score, 2),
         }
-        
+
         if three_pc_role == 'statement':
             entry["three_pc_role"] = "statement"
-        
+            entry["communication_type"] = segment.get("_communication_type")
+
         summary_entries.append(entry)
     
     # Sort by timestamp
