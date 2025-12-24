@@ -2088,49 +2088,20 @@ def build_three_part_communication_summary(
         
         # PRIORITY 1: 3PC Confirmation ("That's correct")
         if three_pc_role == 'confirmation':
-            statement_idx = None
-            readback_idx = None
-
+            reference_content = None
             if confirms_idx is not None and confirms_idx < len(segments):
-                target = segments[confirms_idx]
-                if target.get('_3pc_role') == 'readback':
-                    readback_idx = confirms_idx
-                    if confirms_idx > 0 and segments[confirms_idx - 1].get('_3pc_role') == 'statement':
-                        statement_idx = confirms_idx - 1
-                elif target.get('_3pc_role') == 'statement':
-                    statement_idx = confirms_idx
+                confirmed_seg = segments[confirms_idx]
+                reference_content = confirmed_seg.get('text', '')
 
-            if statement_idx is None:
-                statement_idx = last_statement_idx
-
-            statement_text = (statement_context.get(statement_idx, {}) or {}).get("text")
-            readback_text = (segments[readback_idx].get("text") or "").strip() if readback_idx is not None else None
-
-            comparison_targets = [t for t in [statement_text, readback_text] if t]
-            similarity_scores = [
-                _similarity_to_text(spoken_text, t) for t in comparison_targets
-            ]
-
-            min_similarity = min(similarity_scores) if similarity_scores else 0.0
-            if similarity_scores:
-                if min_similarity >= match_threshold:
-                    status = "acknowledged"
-                elif min_similarity >= partial_threshold:
-                    status = "partial match"
-                else:
-                    status = "mismatch"
-            else:
-                status = "mismatch"
-
-            reference_content = " / ".join(comparison_targets) if comparison_targets else None
+            status = "acknowledged"
 
             reason = _build_reason(
                 status,
                 "confirmation",
                 reference_content,
-                min_similarity,
+                None,
                 {
-                    "anchor_label": "readback" if readback_text else ("statement" if statement_text else None),
+                    "anchor_label": "readback" if reference_content else None,
                     "anchor_text": reference_content,
                 },
             )
@@ -2142,7 +2113,7 @@ def build_three_part_communication_summary(
                 "content": spoken_text,
                 "status": status,
                 "reference": reference_content,
-                "similarity": round(min_similarity, 2),
+                "similarity": 1.0,
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
                 "reason": reason,
