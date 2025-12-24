@@ -16,7 +16,7 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
             CRITICAL: The highlight_start_quote and highlight_end_quote MUST be EXACT TEXT from the PROCEDURE DOCUMENT, NOT from the transcript!
 
             OBJECTIVES:
-            1. Identify which REAL section number from the procedure (e.g., "8.4") is being discussed in the transcript.
+            1. Identify which REAL section number from the procedure is being discussed in the transcript.
             2. Locate that section in the PROCEDURE DOCUMENT.
             3. Copy the EXACT FIRST LINE of that section from the PROCEDURE DOCUMENT as highlight_start_quote.
             4. Copy the EXACT LAST LINE of that section from the PROCEDURE DOCUMENT as highlight_end_quote.
@@ -26,7 +26,7 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
             - highlight_start_quote = First line/sentence of the section FROM THE PROCEDURE DOCUMENT
             - highlight_end_quote = Last line/sentence of the section FROM THE PROCEDURE DOCUMENT
             - DO NOT use transcript text for quotes! Only procedure document text!
-            - Numbers in this prompt (e.g., 8.4) are EXAMPLES ONLY. Return the ACTUAL section number from the procedure that best matches the transcript context, never the example unless it truly exists in the document.
+            - Numbers in this prompt are EXAMPLES ONLY. Return the ACTUAL section number from the procedure that best matches the transcript context, never an example unless it truly exists in the document.
             - If multiple sections are mentioned, pick the one whose wording best aligns with the transcript. Never default to a placeholder section number.
 
             3PC Classification:
@@ -57,7 +57,7 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
 
             Example (numbers shown here are placeholders—return the actual section number from the procedure that fits the transcript context):
             {{
-            "relevant_section_number": "8.4",
+            "relevant_section_number": "<matching section number>",
             "highlight_start_quote": "Exact first sentence or line from the section",
             "highlight_end_quote": "Exact last sentence or line from the section",
             "interactions": [
@@ -71,7 +71,7 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
             }}
 
             INSTRUCTIONS:
-            1. Search the transcript for section numbers (like "8.4", "7.0", "3.1") and confirm they truly exist in the procedure document. Never assume an example number.
+            1. Search the transcript for section numbers that appear in the procedure document. Never assume an example number.
             2. Find that section in the procedure document (or pick the best matching section by wording when no explicit number is spoken).
             3. Copy the EXACT first line/sentence as highlight_start_quote.
             4. Copy the EXACT last line/sentence as highlight_end_quote.
@@ -114,7 +114,7 @@ def _find_section_for_quote(procedure_text: str, quote: str, sections: List[Tupl
 
 def _ensure_real_section_number(parsed: Dict[str, Any], procedure_text: str) -> Dict[str, Any]:
     """
-    Avoid placeholder section numbers (e.g., examples like 8.4) by validating against
+    Avoid placeholder section numbers (e.g., example values from prompts) by validating against
     headings found in the procedure document or inferring from the quote locations.
     """
 

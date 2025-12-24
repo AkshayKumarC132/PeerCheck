@@ -797,7 +797,7 @@ def create_highlighted_pdf_document(
 def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, provider: str = "ollama"):
     """
     Use the Local LLM to analyze the transcript + document and:
-      1. Identify the relevant section (e.g., \"8.4\") and its start/end quotes.
+      1. Identify the relevant section number from the procedure and its start/end quotes.
       2. Within that *Active Region* only, apply word-level Green/Red highlighting:
          - Green: word appears in the transcript (spoken).
          - Red:   word does not appear in the transcript (missed/skipped).
