@@ -267,6 +267,7 @@ LOCAL_LLM_MODEL = os.getenv(
 # OpenAI defaults
 OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 
 if DATABASES['default']['ENGINE'] == 'django.db.backends.sqlite3':
