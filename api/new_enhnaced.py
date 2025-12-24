@@ -918,6 +918,11 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         .lower()
                         == "true"
                     )
+                    use_llm = (
+                        request.query_params.get("use_llm", "true").lower()
+                        not in ("false", "0", "no")
+                    )
+                    llm_provider = request.query_params.get("llm_provider", "ollama")
                     logging.info(
                         "validate_abbreviations=%s in DownloadProcessedDocumentView",
                         use_transcript,
@@ -932,6 +937,8 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         reference_doc.file_path,
                         transcript,
                         require_transcript_match=use_transcript,
+                        use_llm=use_llm,
+                        llm_provider=llm_provider,
                     )
                     print(f"Created processed document: {processed_s3_url}")
                     # Save S3 URL to session
@@ -1134,6 +1141,12 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
 
             three_pc_entries = build_three_part_communication_summary(reference_text, diarization_segments)
 
+            use_llm = (
+                request.query_params.get("use_llm", "true").lower()
+                not in ("false", "0", "no")
+            )
+            llm_provider = request.query_params.get("llm_provider", "ollama")
+
             try:
                 previous_url = session.processed_docx_with_diarization_path
                 reusable_url = (
@@ -1147,6 +1160,8 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                         reference_doc.file_path,
                         transcript,
                         three_pc_entries=three_pc_entries,
+                        use_llm=use_llm,
+                        llm_provider=llm_provider,
                     )
 
                 if previous_url and previous_url != processed_s3_url:

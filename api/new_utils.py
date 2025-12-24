@@ -731,6 +731,8 @@ def create_highlighted_pdf_document(
     transcript,
     require_transcript_match=True,
     three_pc_entries: Optional[List[Dict]] = None,
+    use_llm: bool = True,
+    llm_provider: str = "ollama",
 ):
     """
     Orchestrates the generation of a highlighted PDF using LLM analysis.
@@ -746,29 +748,31 @@ def create_highlighted_pdf_document(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_output_path = temp_file.name
 
-        # generate_highlighted_pdf(
-        #     temp_input_path,
-        #     transcript,
-        #     temp_output_path,
-        #     require_transcript_match=require_transcript_match,
-        # )
+        interactions: List[Dict[str, Any]] = []
 
-        # if three_pc_entries is not None:
-        #     append_three_pc_summary_to_pdf(temp_output_path, three_pc_entries)
+        if use_llm:
+            # --- KEY CHANGE: LLM does the analysis inside generate_highlighted_pdf ---
+            # It returns the structured analysis (including interactions)
+            llm_analysis = generate_highlighted_pdf_with_llm(
+                temp_input_path,
+                transcript,
+                temp_output_path,
+                provider=llm_provider,
+            )
 
-        # --- KEY CHANGE: LLM does the analysis inside generate_highlighted_pdf ---
-        # It returns the structured analysis (including interactions)
-        llm_analysis = generate_highlighted_pdf_with_llm(
-            temp_input_path,
-            transcript,
-            temp_output_path
-        )
+            # Use LLM-detected interactions if available, otherwise fallback (or empty)
+            interactions = llm_analysis.get("interactions", []) if llm_analysis else []
+        else:
+            # Use semantic/keyword highlighting without an LLM
+            generate_highlighted_pdf(
+                temp_input_path,
+                transcript,
+                temp_output_path,
+                require_transcript_match=require_transcript_match,
+            )
 
-        # Use LLM-detected interactions if available, otherwise fallback (or empty)
-        interactions = llm_analysis.get("interactions", []) if llm_analysis else []
-        
         # If user explicitly passed entries (rare now), use them, else use LLM's
-        final_entries = three_pc_entries if three_pc_entries else interactions
+        final_entries = three_pc_entries if three_pc_entries is not None else interactions
 
         if final_entries:
             # Map LLM "interactions" to the format expected by summary table if needed
@@ -790,7 +794,7 @@ def create_highlighted_pdf_document(
             except PermissionError:
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
-def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
+def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, provider: str = "ollama"):
     """
     Use the Local LLM to analyze the transcript + document and:
       1. Identify the relevant section (e.g., \"8.4\") and its start/end quotes.
@@ -799,7 +803,7 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
          - Red:   word does not appear in the transcript (missed/skipped).
       3. Leave all text outside the Active Region uncolored.
     """
-    from .llm_service import analyze_3pc_with_openai
+    from .llm_service import analyze_3pc
     import fitz
 
     # 1. Load PDF and Extract Text
@@ -814,7 +818,7 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
 
     # 2. Analyze with Local LLM
     logging.info("Sending Transcript + Procedure to Local LLM for analysis (3PC + section detection)...")
-    analysis = analyze_3pc_with_openai(transcript_text, full_pdf_text)
+    analysis = analyze_3pc(transcript_text, full_pdf_text, provider=provider)
     
     start_quote = (analysis.get("highlight_start_quote") or "").strip()
     end_quote = (analysis.get("highlight_end_quote") or "").strip()
@@ -961,11 +965,6 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
     doc.close()
     
     return analysis
-
-# --- RETAIN OLD FUNCTION NAME alias for safety if needed, or replace usage ---
-generate_highlighted_pdf = generate_highlighted_pdf_with_llm
-
-
 
 def create_highlighted_docx_from_s3(
     text_s3_url,
@@ -1951,9 +1950,53 @@ def build_three_part_communication_summary(
     
     # Create document buckets
     buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
-    
+
     summary_entries: List[Dict[str, Any]] = []
     used_bucket_indices: Set[int] = set()
+
+    # Cache embeddings for repeated similarity checks between segment texts
+    _text_embedding_cache: Dict[str, Any] = {}
+
+    def _embed_text(text: str):
+        key = (text or "").strip()
+        if not key:
+            return None
+        if key not in _text_embedding_cache:
+            _text_embedding_cache[key] = model.encode(key, convert_to_tensor=True)
+        return _text_embedding_cache[key]
+
+    def _similarity_to_text(text_a: str, text_b: str) -> float:
+        emb_a = _embed_text(text_a)
+        emb_b = _embed_text(text_b)
+        if emb_a is None or emb_b is None:
+            return 0.0
+        try:
+            sim_tensor = util.cos_sim(emb_a, emb_b)
+            return float(sim_tensor.item())
+        except Exception:
+            return 0.0
+
+    def _classify_against_document(spoken: str):
+        best_bucket_idx, best_score = _find_best_bucket_match(
+            spoken, buckets, bucket_embeddings, model
+        )
+
+        matched_reference = None
+        if best_bucket_idx is not None and best_score >= partial_threshold:
+            bucket = buckets[best_bucket_idx]
+            matched_reference = " ".join(bucket["lines"][:2])
+
+        if best_score >= match_threshold:
+            status = "match"
+        elif best_score >= partial_threshold:
+            status = "partial match"
+        else:
+            status = "mismatch"
+
+        return status, matched_reference, best_score, best_bucket_idx
+
+    statement_context: Dict[int, Dict[str, Any]] = {}
+    last_statement_idx: Optional[int] = None
     
     # STEP 3: Classify each segment
     for seg_idx, segment in enumerate(segments):
@@ -1973,39 +2016,82 @@ def build_three_part_communication_summary(
         
         # PRIORITY 1: 3PC Confirmation ("That's correct")
         if three_pc_role == 'confirmation':
-            reference_content = None
+            statement_idx = None
+            readback_idx = None
+
             if confirms_idx is not None and confirms_idx < len(segments):
-                confirmed_seg = segments[confirms_idx]
-                reference_content = confirmed_seg.get('text', '')
-            
+                target = segments[confirms_idx]
+                if target.get('_3pc_role') == 'readback':
+                    readback_idx = confirms_idx
+                    if confirms_idx > 0 and segments[confirms_idx - 1].get('_3pc_role') == 'statement':
+                        statement_idx = confirms_idx - 1
+                elif target.get('_3pc_role') == 'statement':
+                    statement_idx = confirms_idx
+
+            if statement_idx is None:
+                statement_idx = last_statement_idx
+
+            statement_text = (statement_context.get(statement_idx, {}) or {}).get("text")
+            readback_text = (segments[readback_idx].get("text") or "").strip() if readback_idx is not None else None
+
+            comparison_targets = [t for t in [statement_text, readback_text] if t]
+            similarity_scores = [
+                _similarity_to_text(spoken_text, t) for t in comparison_targets
+            ]
+
+            min_similarity = min(similarity_scores) if similarity_scores else 0.0
+            if similarity_scores:
+                if min_similarity >= match_threshold:
+                    status = "acknowledged"
+                elif min_similarity >= partial_threshold:
+                    status = "partial match"
+                else:
+                    status = "mismatch"
+            else:
+                status = "mismatch"
+
+            reference_content = " / ".join(comparison_targets) if comparison_targets else None
+
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
                 "end": segment.get("end"),
                 "content": spoken_text,
-                "status": "acknowledged",  # BLUE
+                "status": status,
                 "reference": reference_content,
-                "similarity": 1.0,
+                "similarity": round(min_similarity, 2),
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
             })
             logging.info(f"✓ Added 3PC Confirmation: {speaker} - '{spoken_text}'")
             continue
-        
+
         # PRIORITY 2: 3PC Readback
         if three_pc_role == 'readback':
-            best_bucket_idx, best_score = _find_best_bucket_match(
-                spoken_text, buckets, bucket_embeddings, model
-            )
-            
-            matched_reference = None
-            if best_bucket_idx is not None and best_score >= partial_threshold:
-                bucket = buckets[best_bucket_idx]
-                matched_reference = " ".join(bucket["lines"][:2])
-                used_bucket_indices.add(best_bucket_idx)
-            
-            status = "match" if best_score >= match_threshold else "partial match"
-            
+            linked_statement_idx = None
+            if seg_idx > 0 and segments[seg_idx - 1].get('_3pc_role') == 'statement':
+                linked_statement_idx = seg_idx - 1
+            if linked_statement_idx is None:
+                linked_statement_idx = last_statement_idx
+
+            statement_info = statement_context.get(linked_statement_idx)
+            statement_text = (statement_info or {}).get("text")
+            similarity_to_statement = _similarity_to_text(spoken_text, statement_text) if statement_text else 0.0
+
+            if statement_text:
+                if similarity_to_statement >= match_threshold:
+                    status = "match"
+                elif similarity_to_statement >= partial_threshold:
+                    status = "partial match"
+                else:
+                    status = "mismatch"
+                matched_reference = statement_text
+                similarity_value = similarity_to_statement
+            else:
+                status, matched_reference, similarity_value, best_bucket_idx = _classify_against_document(spoken_text)
+                if best_bucket_idx is not None and status == "match":
+                    used_bucket_indices.add(best_bucket_idx)
+
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
@@ -2013,7 +2099,7 @@ def build_three_part_communication_summary(
                 "content": spoken_text,
                 "status": status,
                 "reference": matched_reference,
-                "similarity": round(best_score, 2),
+                "similarity": round(similarity_value, 2),
                 "three_pc_role": "readback",
                 "communication_type": segment.get("_communication_type"),
             })
@@ -2037,45 +2123,43 @@ def build_three_part_communication_summary(
             continue
         
         # STEP 4: Standard classification
-        best_bucket_idx, best_score = _find_best_bucket_match(
-            spoken_text, buckets, bucket_embeddings, model
-        )
-        
-        matched_reference = None
-        word_count = len(spoken_text.split())
-        is_short = word_count < 4
-        
-        if not buckets:
-            status = "general conversation" if is_short else "match"
+        status, matched_reference, similarity_value, best_bucket_idx = _classify_against_document(spoken_text)
+
+        # Statements must align to the procedure text; downgrade short utterances to mismatch
+        if three_pc_role == 'statement':
+            entry_status = status
         else:
-            if best_bucket_idx is not None and best_score >= match_threshold:
-                status = "match"
-                bucket = buckets[best_bucket_idx]
-                matched_reference = " ".join(bucket["lines"][:2])
+            word_count = len(spoken_text.split())
+            is_short = word_count < 4
+            if best_bucket_idx is not None and status == "match":
                 used_bucket_indices.add(best_bucket_idx)
-            elif is_short:
-                status = "general conversation"
-            elif best_score >= partial_threshold:
-                status = "partial match"
-                if best_bucket_idx is not None:
-                    bucket = buckets[best_bucket_idx]
-                    matched_reference = " ".join(bucket["lines"][:2])
+            if not buckets:
+                entry_status = "general conversation" if is_short else status
             else:
-                status = "mismatch"
-        
+                if status == "mismatch" and is_short:
+                    entry_status = "general conversation"
+                else:
+                    entry_status = status
+
         entry = {
             "speaker": speaker,
             "start": segment.get("start"),
             "end": segment.get("end"),
             "content": spoken_text,
-            "status": status,
+            "status": entry_status,
             "reference": matched_reference,
-            "similarity": round(best_score, 2),
+            "similarity": round(similarity_value, 2),
         }
 
         if three_pc_role == 'statement':
             entry["three_pc_role"] = "statement"
             entry["communication_type"] = segment.get("_communication_type")
+            statement_context[seg_idx] = {
+                "text": spoken_text,
+                "reference": matched_reference,
+                "similarity": similarity_value,
+            }
+            last_statement_idx = seg_idx
 
         summary_entries.append(entry)
     
