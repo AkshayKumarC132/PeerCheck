@@ -2022,6 +2022,7 @@ def build_three_part_communication_summary(
         anchor_text = matched_reference or context.get("anchor_text")
         sim_label = _similarity_label(similarity_value)
         sim_text = f" ({sim_label} similarity)" if sim_label else ""
+        note = context.get("note")
 
         if status == "match":
             if role == "readback":
@@ -2049,7 +2050,8 @@ def build_three_part_communication_summary(
             return "Content does not match the expected text."
 
         if status == "general conversation":
-            return "Short/non-procedural remark treated as general conversation."
+            base = "Short/non-procedural remark treated as general conversation."
+            return f"{base} {note}".strip() if note else base
 
         if status == "acknowledged":
             return "Verification or acknowledgement phrase confirming prior instruction."
@@ -2257,6 +2259,8 @@ def build_three_part_communication_summary(
         # STEP 4: Standard classification
         status, matched_reference, similarity_value, best_bucket_idx = _classify_against_document(spoken_text)
 
+        downgrade_note = None
+
         # Statements must align to the procedure text; downgrade short utterances to mismatch
         if three_pc_role == 'statement':
             entry_status = status
@@ -2272,6 +2276,18 @@ def build_three_part_communication_summary(
                     entry_status = "general conversation"
                 else:
                     entry_status = status
+
+        # Outside explicit 3PC exchanges, avoid over-confident matches that look conversational
+        if (
+            entry_status == "match"
+            and three_pc_role is None
+            and segment.get("_communication_type") is None
+        ):
+            similarity_label = _similarity_label(similarity_value)
+            if similarity_label in {"Medium", "Low"}:
+                if word_count <= 12 or not matched_reference:
+                    entry_status = "general conversation"
+                    downgrade_note = "Downgraded from match due to conversational context (medium/low similarity)."
 
         similarity_label = _similarity_label(similarity_value)
         entry_status = _normalize_partial_status(
@@ -2290,6 +2306,7 @@ def build_three_part_communication_summary(
             {
                 "anchor_label": "procedure" if matched_reference else None,
                 "anchor_text": matched_reference,
+                "note": downgrade_note,
             },
         )
 
