@@ -2152,8 +2152,9 @@ def build_three_part_communication_summary(
                 "content": spoken_text,
                 "status": status,
                 "reference": reference_content,
-                "similarity": 1.0,
+                "similarity": similarity_label,
                 "similarity_label": similarity_label,
+                "similarity_score": 1.0,
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
                 "reason": reason,
@@ -2206,6 +2207,8 @@ def build_three_part_communication_summary(
                 },
             )
 
+            similarity_label = _similarity_label(similarity_value)
+            
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
@@ -2213,8 +2216,9 @@ def build_three_part_communication_summary(
                 "content": spoken_text,
                 "status": status,
                 "reference": matched_reference,
-                "similarity": round(similarity_value, 2) if similarity_value is not None else None,
-                "similarity_label": _similarity_label(similarity_value),
+                "similarity": similarity_label,
+                "similarity_label": similarity_label,
+                "similarity_score": round(similarity_value, 2) if similarity_value is not None else None,
                 "three_pc_role": "readback",
                 "communication_type": segment.get("_communication_type"),
                 "reason": reason,
@@ -2240,8 +2244,9 @@ def build_three_part_communication_summary(
                 # Use the same key your color maps know (blue)
                 "status": "acknowledged",
                 "reference": None,
-                "similarity": 1.0,
+                "similarity": _similarity_label(1.0),
                 "similarity_label": _similarity_label(1.0),
+                "similarity_score": 1.0,
                 # Make sure it renders with “(3PC: confirmation)”
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
@@ -2295,8 +2300,9 @@ def build_three_part_communication_summary(
             "content": spoken_text,
             "status": entry_status,
             "reference": matched_reference,
-            "similarity": round(similarity_value, 2) if similarity_value is not None else None,
+            "similarity": similarity_label,
             "similarity_label": similarity_label,
+            "similarity_score": round(similarity_value, 2) if similarity_value is not None else None,
             "reason": reason,
         }
 
