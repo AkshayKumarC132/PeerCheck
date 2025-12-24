@@ -1472,6 +1472,24 @@ def _format_timestamp(seconds: Optional[float]) -> str:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
 
+
+def _format_time_range(start: Optional[float], end: Optional[float]) -> str:
+    """Combine start and end timestamps into a compact range."""
+
+    start_text = _format_timestamp(start)
+    end_text = _format_timestamp(end)
+
+    if start_text == "-" and end_text == "-":
+        return "-"
+
+    if start_text == "-":
+        return end_text
+
+    if end_text == "-":
+        return start_text
+
+    return f"{start_text} - {end_text}"
+
 # Verification/Acknowledgment phrases (case-insensitive)
 VERIFICATION_PHRASES = {
     "that's correct", "that's right", "correct","it is correct", "yes that's right",
@@ -1976,6 +1994,60 @@ def build_three_part_communication_summary(
         except Exception:
             return 0.0
 
+    def _build_reason(
+        status: str,
+        role: Optional[str],
+        matched_reference: Optional[str],
+        similarity_value: Optional[float],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Construct a human-readable reason for the assigned status."""
+
+        context = context or {}
+        anchor_label = context.get("anchor_label")
+        anchor_text = matched_reference or context.get("anchor_text")
+        sim_text = (
+            f" (similarity {similarity_value:.2f})"
+            if similarity_value is not None
+            else ""
+        )
+
+        if status == "match":
+            if role == "readback":
+                return f"Readback aligns with the {anchor_label or 'statement'}{sim_text}."
+            if role == "confirmation":
+                return "Acknowledgement confirms the prior instruction/readback."
+            if role == "statement" and anchor_text:
+                return f"Statement matches procedure text: \"{anchor_text}\"{sim_text}."
+            if anchor_text:
+                return f"Content matches procedure context{sim_text}."
+            return "Content closely matches the expected text."
+
+        if status == "partial match":
+            if role == "readback":
+                return f"Readback is partially aligned with the {anchor_label or 'statement'}{sim_text}."
+            if anchor_text:
+                return f"Partially matches procedure text{sim_text}."
+            return "Content partially aligns with the expected text."
+
+        if status == "mismatch":
+            if role == "readback":
+                return f"Readback differs from the {anchor_label or 'statement'}{sim_text}."
+            if anchor_text:
+                return f"No close match to procedure text{sim_text}."
+            return "Content does not match the expected text."
+
+        if status == "general conversation":
+            return "Short/non-procedural remark treated as general conversation."
+
+        if status == "acknowledged":
+            return "Verification or acknowledgement phrase confirming prior instruction."
+
+        if anchor_text and similarity_value is not None:
+            return f"Compared against reference text{sim_text}."
+
+        return "Status assigned based on dialogue context."
+
     def _classify_against_document(spoken: str):
         best_bucket_idx, best_score = _find_best_bucket_match(
             spoken, buckets, bucket_embeddings, model
@@ -2052,6 +2124,17 @@ def build_three_part_communication_summary(
 
             reference_content = " / ".join(comparison_targets) if comparison_targets else None
 
+            reason = _build_reason(
+                status,
+                "confirmation",
+                reference_content,
+                min_similarity,
+                {
+                    "anchor_label": "readback" if readback_text else ("statement" if statement_text else None),
+                    "anchor_text": reference_content,
+                },
+            )
+
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
@@ -2062,6 +2145,7 @@ def build_three_part_communication_summary(
                 "similarity": round(min_similarity, 2),
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
+                "reason": reason,
             })
             logging.info(f"✓ Added 3PC Confirmation: {speaker} - '{spoken_text}'")
             continue
@@ -2092,6 +2176,17 @@ def build_three_part_communication_summary(
                 if best_bucket_idx is not None and status == "match":
                     used_bucket_indices.add(best_bucket_idx)
 
+            reason = _build_reason(
+                status,
+                "readback",
+                matched_reference,
+                similarity_value,
+                {
+                    "anchor_label": "statement" if statement_text else ("procedure" if matched_reference else None),
+                    "anchor_text": statement_text or matched_reference,
+                },
+            )
+
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
@@ -2102,11 +2197,21 @@ def build_three_part_communication_summary(
                 "similarity": round(similarity_value, 2),
                 "three_pc_role": "readback",
                 "communication_type": segment.get("_communication_type"),
+                "reason": reason,
             })
             continue
         
         # PRIORITY 3: Standalone verification (not in 3PC)
         if _is_verification_phrase(spoken_text):
+            reason = _build_reason(
+                "acknowledged",
+                "confirmation",
+                None,
+                1.0,
+                {
+                    "anchor_label": "statement" if last_statement_idx is not None else None,
+                },
+            )
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
@@ -2119,6 +2224,7 @@ def build_three_part_communication_summary(
                 # Make sure it renders with “(3PC: confirmation)”
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
+                "reason": reason,
             })
             continue
         
@@ -2141,6 +2247,17 @@ def build_three_part_communication_summary(
                 else:
                     entry_status = status
 
+        reason = _build_reason(
+            entry_status,
+            three_pc_role,
+            matched_reference,
+            similarity_value,
+            {
+                "anchor_label": "procedure" if matched_reference else None,
+                "anchor_text": matched_reference,
+            },
+        )
+
         entry = {
             "speaker": speaker,
             "start": segment.get("start"),
@@ -2149,6 +2266,7 @@ def build_three_part_communication_summary(
             "status": entry_status,
             "reference": matched_reference,
             "similarity": round(similarity_value, 2),
+            "reason": reason,
         }
 
         if three_pc_role == 'statement':
@@ -2196,9 +2314,11 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         margin = 36
         title_font_size = 16
         body_font_size = 10
+        compact_font_size = 9
         row_padding = 4
-        content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
-        headers = ["Speaker", "Start", "End", "Content", "Status"]
+        content_width_ratio = [0.16, 0.18, 0.32, 0.14, 0.2]
+        headers = ["Speaker", "Time", "Content", "Status", "Reason"]
+        column_font_sizes = [body_font_size, compact_font_size, body_font_size, body_font_size, compact_font_size]
         
         status_colors = {
             "match": (0, 0.5, 0),
@@ -2240,10 +2360,10 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             
             return page, y_pos, height
 
-        def _wrap_cell(text: str, max_width: float) -> List[str]:
+        def _wrap_cell(text: str, max_width: float, font_size: int) -> List[str]:
             if not text:
                 return [""]
-            approx_char_width = max(int(max_width / (body_font_size * 0.6)), 1)
+            approx_char_width = max(int(max_width / (font_size * 0.6)), 1)
             return textwrap.wrap(text, width=approx_char_width) or [""]
 
         def _draw_row(page, y_pos, page_height, values: List[str]):
@@ -2255,13 +2375,13 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             # Calculate row height
             columns = []
             max_lines = 1
-            for value, ratio in zip(values, content_width_ratio):
+            for value, ratio, font_size in zip(values, content_width_ratio, column_font_sizes):
                 col_width = content_width * ratio
-                lines = _wrap_cell(value, col_width - (2 * row_padding))
-                columns.append((col_width, lines))
+                lines = _wrap_cell(value, col_width - (2 * row_padding), font_size)
+                columns.append((col_width, lines, font_size))
                 max_lines = max(max_lines, len(lines))
 
-            row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+            row_height = max_lines * (max(column_font_sizes) + 2) + (2 * row_padding)
 
             # CHECK: Do we need a new page?
             if y_pos + row_height > available_height:
@@ -2272,22 +2392,22 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 # Recalculate columns for new page
                 columns = []
                 max_lines = 1
-                for value, ratio in zip(values, content_width_ratio):
+                for value, ratio, font_size in zip(values, content_width_ratio, column_font_sizes):
                     col_width = content_width * ratio
-                    lines = _wrap_cell(value, col_width - (2 * row_padding))
-                    columns.append((col_width, lines))
+                    lines = _wrap_cell(value, col_width - (2 * row_padding), font_size)
+                    columns.append((col_width, lines, font_size))
                     max_lines = max(max_lines, len(lines))
-                row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+                row_height = max_lines * (max(column_font_sizes) + 2) + (2 * row_padding)
 
             # Draw the row
             x = margin
-            for idx, (col_width, lines) in enumerate(columns):
+            for idx, (col_width, lines, font_size) in enumerate(columns):
                 rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
                 page.draw_rect(rect, color=(0.7, 0.7, 0.7))
 
-                text_y = y_pos + row_padding + body_font_size
+                text_y = y_pos + row_padding + font_size
                 color = (0, 0, 0)
-                
+
                 if headers[idx] == "Status":
                     status_key = values[idx].strip().lower()
                     base_status = status_key.split('(')[0].strip()
@@ -2297,11 +2417,11 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     page.insert_text(
                         (x + row_padding, text_y),
                         line,
-                        fontsize=body_font_size,
+                        fontsize=font_size,
                         fontname="helv",
                         fill=color,
                     )
-                    text_y += body_font_size + 2
+                    text_y += font_size + 2
                 
                 x += col_width
 
@@ -2324,13 +2444,13 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 if entry.get("three_pc_role"):
                     role = entry["three_pc_role"]
                     status_text += f" (3PC: {role})"
-                
+
                 row_values = [
                     entry.get("speaker") or "Unknown",
-                    _format_timestamp(entry.get("start")),
-                    _format_timestamp(entry.get("end")),
+                    _format_time_range(entry.get("start"), entry.get("end")),
                     entry.get("content") or "",
                     status_text,
+                    entry.get("reason") or "-",
                 ]
                 
                 page, y_cursor, page_height = _draw_row(page, y_cursor, page_height, row_values)
@@ -2357,7 +2477,7 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
 def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]]) -> None:
     """Append 3PC summary to DOCX with proper colors."""
     import docx
-    from docx.shared import RGBColor
+    from docx.shared import RGBColor, Pt, Inches
     
     document = docx.Document(docx_path)
     document.add_page_break()
@@ -2368,13 +2488,16 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         document.save(docx_path)
         return
 
-    headers = ["Speaker", "Start", "End", "Content", "Status"]
+    headers = ["Speaker", "Time", "Content", "Status", "Reason"]
     table = document.add_table(rows=1, cols=len(headers))
     try:
         table.style = "Light Grid Accent 1"
     except KeyError:
         table.style = "Light Grid"
-    
+
+    table.autofit = False
+    column_widths = [Inches(1.2), Inches(1.4), Inches(3.0), Inches(1.2), Inches(1.6)]
+
     for cell, title in zip(table.rows[0].cells, headers):
         cell.text = title
 
@@ -2386,22 +2509,31 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         "mismatch": RGBColor(192, 0, 0),
     }
 
+    for col, width in zip(table.columns, column_widths):
+        for cell in col.cells:
+            cell.width = width
+
     for entry in entries:
         row = table.add_row()
         cells = row.cells
-        
+
         values = [
             entry.get("speaker") or "Unknown",
-            _format_timestamp(entry.get("start")),
-            _format_timestamp(entry.get("end")),
+            _format_time_range(entry.get("start"), entry.get("end")),
             entry.get("content") or "",
         ]
 
         for idx, value in enumerate(values):
             cells[idx].text = value
+            cells[idx].width = column_widths[idx]
+            if headers[idx] in {"Time"}:
+                for paragraph in cells[idx].paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(9)
 
         status = (entry.get("status") or "").lower()
-        status_cell = cells[len(headers) - 1]
+        status_cell = cells[len(headers) - 2]
+        status_cell.width = column_widths[len(headers) - 2]
         
         status_text = status.capitalize() if status else "-"
         if entry.get("three_pc_role"):
@@ -2409,11 +2541,18 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
             status_text += f" (3PC: {role})"
         
         status_cell.text = status_text
-        
+
         if status in status_colors:
             for paragraph in status_cell.paragraphs:
                 for run in paragraph.runs:
                     run.font.color.rgb = status_colors[status]
+
+        reason_cell = cells[len(headers) - 1]
+        reason_cell.width = column_widths[len(headers) - 1]
+        reason_cell.text = entry.get("reason") or "-"
+        for paragraph in reason_cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(9)
 
     document.save(docx_path)
     logging.info(f"✓ 3PC DOCX saved: {len(entries)} entries")
