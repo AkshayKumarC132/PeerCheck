@@ -890,13 +890,28 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
     sections = _parse_procedure_sections(full_pdf_text)
     transcript_sections = set(re.findall(r"\b(\d+(?:\.\d+)+)\b", transcript_text or ""))
 
+    def _section_for_quote(quote: str) -> Optional[str]:
+        if not quote:
+            return None
+
+        idx = full_pdf_text.lower().find(quote.lower())
+        if idx == -1:
+            return None
+
+        for sec in sections:
+            if sec["start"] <= idx < sec["end"]:
+                return sec["number"]
+
+        return None
+
     # Build candidate sections: include the LLM-picked section plus any explicitly mentioned
-    # sections in the transcript that exist in the procedure text.
+    # sections in the transcript that exist in the procedure text or inferred from quote
+    # locations. This keeps highlighting even if the LLM omits one of the anchors.
     candidate_numbers = []
-    if section_id and section_id != "Unknown":
-        candidate_numbers.append(section_id)
-    for num in transcript_sections:
-        if num not in candidate_numbers:
+    quote_sections = [_section_for_quote(start_quote), _section_for_quote(end_quote)]
+
+    for num in [section_id if section_id != "Unknown" else None, *transcript_sections, *quote_sections]:
+        if num and num not in candidate_numbers:
             candidate_numbers.append(num)
 
     # Keep order as they appear in the procedure to avoid double-highlighting or skips
@@ -1061,13 +1076,17 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
         logging.info("Highlighting %d section(s): %s", len(ordered_sections), logged_numbers)
         for sec in ordered_sections:
             highlight_section(sec)
-    elif start_quote and end_quote:
-        logging.warning("Falling back to single-quote highlight for %s", section_id)
+    elif start_quote or end_quote:
+        logging.warning(
+            "LLM returned incomplete highlight anchors (start='%s', end='%s'). Using available text for a single-region highlight.",
+            start_quote,
+            end_quote,
+        )
         highlight_section(
             {
                 "number": section_id,
-                "heading_line": start_quote,
-                "last_line": end_quote,
+                "heading_line": start_quote or end_quote or section_id,
+                "last_line": end_quote or start_quote or section_id,
                 "next_heading": "",
             }
         )
