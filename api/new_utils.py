@@ -794,49 +794,6 @@ def create_highlighted_pdf_document(
             except PermissionError:
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
-def _parse_procedure_sections(procedure_text: str):
-    """Return ordered section metadata with heading lines and trailing content.
-
-    Each item: {
-        "number": "8.1",
-        "heading_line": "8.1 Title of the section",
-        "start": index in procedure_text,
-        "end": next section start (or len(text)),
-        "last_line": last non-empty line within the section body,
-        "next_heading": heading line for the next section (if any),
-    }
-    """
-
-    section_re = re.compile(r"(?m)^(?P<num>\d+(?:\.\d+)*)(?P<title>[^\n]*)")
-    matches = list(section_re.finditer(procedure_text))
-    sections = []
-
-    for idx, match in enumerate(matches):
-        num = match.group("num").strip()
-        heading_line = (match.group(0) or "").strip()
-        start = match.start()
-        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(procedure_text)
-
-        body = procedure_text[start:end]
-        body_lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
-        last_line = body_lines[-1] if body_lines else heading_line
-
-        next_heading = (matches[idx + 1].group(0) or "").strip() if idx + 1 < len(matches) else ""
-
-        sections.append(
-            {
-                "number": num,
-                "heading_line": heading_line,
-                "start": start,
-                "end": end,
-                "last_line": last_line,
-                "next_heading": next_heading,
-            }
-        )
-
-    return sections
-
-
 def _locate_quote(doc, quote: str, search_last: bool = False):
     if not quote:
         return None
@@ -886,52 +843,6 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
 
     logging.info("LLM identified Section %s", section_id)
     logging.info("Highlighting region from '%s' to '%s'", start_quote, end_quote)
-
-    sections = _parse_procedure_sections(full_pdf_text)
-    transcript_sections = set(re.findall(r"\b(\d+(?:\.\d+)+)\b", transcript_text or ""))
-
-    def _section_for_quote(quote: str) -> Optional[str]:
-        if not quote:
-            return None
-
-        idx = full_pdf_text.lower().find(quote.lower())
-        if idx == -1:
-            return None
-
-        for sec in sections:
-            if sec["start"] <= idx < sec["end"]:
-                return sec["number"]
-
-        return None
-
-    # Build candidate sections: include the LLM-picked section plus any explicitly mentioned
-    # sections in the transcript that exist in the procedure text or inferred from quote
-    # locations. This keeps highlighting even if the LLM omits one of the anchors.
-    candidate_numbers = []
-    quote_sections = [_section_for_quote(start_quote), _section_for_quote(end_quote)]
-
-    for num in [section_id if section_id != "Unknown" else None, *transcript_sections, *quote_sections]:
-        if num and num not in candidate_numbers:
-            candidate_numbers.append(num)
-
-    # Keep order as they appear in the procedure to avoid double-highlighting or skips
-    ordered_sections = []
-    for sec in sections:
-        if sec["number"] in candidate_numbers or any(
-            cn.startswith(sec["number"]) or sec["number"].startswith(cn) for cn in candidate_numbers
-        ):
-            ordered_sections.append(sec)
-
-    # Fallback: if nothing matched but we have start/end quotes, try highlighting once
-    if not ordered_sections and (start_quote or end_quote):
-        ordered_sections.append(
-            {
-                "number": section_id,
-                "heading_line": start_quote or section_id,
-                "last_line": end_quote or start_quote or section_id,
-                "next_heading": "",
-            }
-        )
 
     # Pre-compute normalized transcript word set for Green/Red logic
     def _norm_word(w: str) -> str:
@@ -991,42 +902,26 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
 
         return False
 
-    def _section_regions(section):
-        """Return active rectangles per page for a section without re-reading page words."""
-
-        start_loc = _locate_quote(doc, section.get("heading_line") or "")
+    def _single_region(start_loc, end_loc):
+        """Build a single active region spanning from start to end across pages."""
 
         if not start_loc:
-            # As a fallback, try locating by section number only
-            start_loc = _locate_quote(doc, section.get("number") or "")
+            return {}
 
-        end_loc = _locate_quote(doc, section.get("last_line") or "", search_last=True)
-
-        if not end_loc and section.get("next_heading"):
-            # Use the next heading as a boundary marker so the entire current section is covered
-            end_loc = _locate_quote(doc, section.get("next_heading"), search_last=False)
-
+        # Default the end to the final page if the quote is missing
         if not end_loc:
-            # Final fallback to the end of the document
             end_page = doc.page_count - 1
             end_rect = doc[end_page].rect
             end_loc = (end_page, end_rect)
 
-        if not start_loc:
-            logging.warning(
-                "Unable to locate start of section %s for highlighting", section.get("number")
-            )
-            return {}
-
         start_page, start_rect = start_loc
         end_page, end_rect = end_loc
 
-        # Ensure the boundary ordering is correct
         if start_page > end_page:
             end_page = start_page
             end_rect = start_rect
 
-        regions = {}
+        regions: Dict[int, List[fitz.Rect]] = defaultdict(list)
 
         for p_idx in range(start_page, end_page + 1):
             page = doc[p_idx]
@@ -1056,36 +951,40 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
             else:
                 active_rect = page_rect
 
-            regions.setdefault(p_idx, []).append(active_rect)
+            regions[p_idx].append(active_rect)
 
         return regions
 
+    # Locate the active region using the available anchors (single section only)
     page_regions: Dict[int, List[fitz.Rect]] = defaultdict(list)
 
-    if ordered_sections:
-        logged_numbers = ", ".join(sec.get("number", "?") for sec in ordered_sections)
-        logging.info("Highlighting %d section(s): %s", len(ordered_sections), logged_numbers)
-        for sec in ordered_sections:
-            for p_idx, rects in _section_regions(sec).items():
+    if start_quote or end_quote or section_id != "Unknown":
+        start_loc = _locate_quote(doc, start_quote or section_id)
+
+        if not start_loc and section_id and section_id != "Unknown":
+            start_loc = _locate_quote(doc, section_id)
+
+        end_loc = _locate_quote(doc, end_quote or start_quote or section_id, search_last=True)
+
+        if not start_loc:
+            logging.warning(
+                "Unable to locate highlight anchors (start='%s', section='%s'). Skipping section-scoped highlighting.",
+                start_quote,
+                section_id,
+            )
+        else:
+            if not end_loc:
+                logging.warning(
+                    "LLM returned incomplete highlight anchors (start='%s', end='%s'). Using available text for a single-region highlighting.",
+                    start_quote,
+                    end_quote,
+                )
+
+            for p_idx, rects in _single_region(start_loc, end_loc).items():
                 page_regions[p_idx].extend(rects)
-    elif start_quote or end_quote:
-        logging.warning(
-            "LLM returned incomplete highlight anchors (start='%s', end='%s'). Using available text for a single-region highlight.",
-            start_quote,
-            end_quote,
-        )
-        for p_idx, rects in _section_regions(
-            {
-                "number": section_id,
-                "heading_line": start_quote or end_quote or section_id,
-                "last_line": end_quote or start_quote or section_id,
-                "next_heading": "",
-            }
-        ).items():
-            page_regions[p_idx].extend(rects)
     else:
         logging.warning(
-            "LLM did not return highlight anchors and no sections were detected. Skipping section-scoped highlighting."
+            "LLM did not return highlight anchors. Skipping section-scoped highlighting."
         )
 
     if page_regions:
@@ -1111,7 +1010,6 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
                 annot.set_colors(stroke=color)
                 annot.set_opacity(0.3)
                 annot.update()
-
     # Save
     doc.save(output_path)
     doc.close()
