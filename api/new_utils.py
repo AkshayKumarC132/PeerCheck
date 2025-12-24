@@ -2067,6 +2067,33 @@ def build_three_part_communication_summary(
 
         return status, matched_reference, best_score, best_bucket_idx
 
+    def _normalize_partial_status(
+        status: str,
+        spoken: str,
+        matched_reference: Optional[str],
+        similarity_value: Optional[float],
+        role: Optional[str] = None,
+    ) -> str:
+        if status != "partial match":
+            return status
+
+        word_count = len(spoken.split())
+        low_confidence = (
+            similarity_value is not None and similarity_value < (partial_threshold + 0.1)
+        )
+        missing_anchor = not matched_reference
+        conversational_length = word_count < 4
+
+        if role == "statement":
+            if missing_anchor and (conversational_length or low_confidence):
+                return "general conversation"
+            return status
+
+        if conversational_length or missing_anchor or low_confidence:
+            return "general conversation"
+
+        return status
+
     statement_context: Dict[int, Dict[str, Any]] = {}
     last_statement_idx: Optional[int] = None
     
@@ -2147,6 +2174,14 @@ def build_three_part_communication_summary(
                 if best_bucket_idx is not None and status == "match":
                     used_bucket_indices.add(best_bucket_idx)
 
+            status = _normalize_partial_status(
+                status,
+                spoken_text,
+                matched_reference,
+                similarity_value,
+                role="readback",
+            )
+
             reason = _build_reason(
                 status,
                 "readback",
@@ -2217,6 +2252,14 @@ def build_three_part_communication_summary(
                     entry_status = "general conversation"
                 else:
                     entry_status = status
+
+        entry_status = _normalize_partial_status(
+            entry_status,
+            spoken_text,
+            matched_reference,
+            similarity_value,
+            role=three_pc_role,
+        )
 
         reason = _build_reason(
             entry_status,
