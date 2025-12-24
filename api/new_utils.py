@@ -1914,8 +1914,22 @@ def _find_best_bucket_match(
             if fuzzy_score > best_score:
                 best_score = fuzzy_score
                 best_bucket_idx = idx
-    
+
     return best_bucket_idx, best_score
+
+
+def _similarity_label(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    if value >= 0.7:
+        return "High"
+    if value >= 0.45:
+        return "Medium"
+    return "Low"
+
+
+def _similarity_legend() -> str:
+    return "Similarity Legend: High (≥0.70) | Medium (0.45–0.69) | Low (<0.45)"
 
 def build_three_part_communication_summary(
     reference_text: Optional[str],
@@ -2006,11 +2020,8 @@ def build_three_part_communication_summary(
         context = context or {}
         anchor_label = context.get("anchor_label")
         anchor_text = matched_reference or context.get("anchor_text")
-        sim_text = (
-            f" (similarity {similarity_value:.2f})"
-            if similarity_value is not None
-            else ""
-        )
+        sim_label = _similarity_label(similarity_value)
+        sim_text = f" ({sim_label} similarity)" if sim_label else ""
 
         if status == "match":
             if role == "readback":
@@ -2121,6 +2132,7 @@ def build_three_part_communication_summary(
                 reference_content = confirmed_seg.get('text', '')
 
             status = "acknowledged"
+            similarity_label = _similarity_label(1.0)
 
             reason = _build_reason(
                 status,
@@ -2141,6 +2153,7 @@ def build_three_part_communication_summary(
                 "status": status,
                 "reference": reference_content,
                 "similarity": 1.0,
+                "similarity_label": similarity_label,
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
                 "reason": reason,
@@ -2200,7 +2213,8 @@ def build_three_part_communication_summary(
                 "content": spoken_text,
                 "status": status,
                 "reference": matched_reference,
-                "similarity": round(similarity_value, 2),
+                "similarity": round(similarity_value, 2) if similarity_value is not None else None,
+                "similarity_label": _similarity_label(similarity_value),
                 "three_pc_role": "readback",
                 "communication_type": segment.get("_communication_type"),
                 "reason": reason,
@@ -2227,6 +2241,7 @@ def build_three_part_communication_summary(
                 "status": "acknowledged",
                 "reference": None,
                 "similarity": 1.0,
+                "similarity_label": _similarity_label(1.0),
                 # Make sure it renders with “(3PC: confirmation)”
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
@@ -2253,6 +2268,7 @@ def build_three_part_communication_summary(
                 else:
                     entry_status = status
 
+        similarity_label = _similarity_label(similarity_value)
         entry_status = _normalize_partial_status(
             entry_status,
             spoken_text,
@@ -2279,7 +2295,8 @@ def build_three_part_communication_summary(
             "content": spoken_text,
             "status": entry_status,
             "reference": matched_reference,
-            "similarity": round(similarity_value, 2),
+            "similarity": round(similarity_value, 2) if similarity_value is not None else None,
+            "similarity_label": similarity_label,
             "reason": reason,
         }
 
@@ -2355,7 +2372,16 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     fontsize=title_font_size,
                     fontname="helv",
                 )
-                y_pos += title_font_size + 8
+                y_pos += title_font_size + 4
+
+                legend_text = _similarity_legend()
+                page.insert_text(
+                    (margin, y_pos),
+                    legend_text,
+                    fontsize=compact_font_size,
+                    fontname="helv",
+                )
+                y_pos += compact_font_size + 8
 
                 content_width = width - 2 * margin
                 x = margin
@@ -2496,6 +2522,11 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
     document = docx.Document(docx_path)
     document.add_page_break()
     document.add_heading("Three-Part Communication (3PC) Summary", level=1)
+
+    legend_para = document.add_paragraph(_similarity_legend())
+    for run in legend_para.runs:
+        run.font.size = Pt(9)
+    legend_para.paragraph_format.space_after = Pt(6)
 
     if not entries:
         document.add_paragraph("No speaker diarization data available.")
