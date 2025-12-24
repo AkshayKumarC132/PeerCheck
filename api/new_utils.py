@@ -794,6 +794,66 @@ def create_highlighted_pdf_document(
             except PermissionError:
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
+def _parse_procedure_sections(procedure_text: str):
+    """Return ordered section metadata with heading lines and trailing content.
+
+    Each item: {
+        "number": "8.1",
+        "heading_line": "8.1 Title of the section",
+        "start": index in procedure_text,
+        "end": next section start (or len(text)),
+        "last_line": last non-empty line within the section body,
+        "next_heading": heading line for the next section (if any),
+    }
+    """
+
+    section_re = re.compile(r"(?m)^(?P<num>\d+(?:\.\d+)*)(?P<title>[^\n]*)")
+    matches = list(section_re.finditer(procedure_text))
+    sections = []
+
+    for idx, match in enumerate(matches):
+        num = match.group("num").strip()
+        heading_line = (match.group(0) or "").strip()
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(procedure_text)
+
+        body = procedure_text[start:end]
+        body_lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        last_line = body_lines[-1] if body_lines else heading_line
+
+        next_heading = (matches[idx + 1].group(0) or "").strip() if idx + 1 < len(matches) else ""
+
+        sections.append(
+            {
+                "number": num,
+                "heading_line": heading_line,
+                "start": start,
+                "end": end,
+                "last_line": last_line,
+                "next_heading": next_heading,
+            }
+        )
+
+    return sections
+
+
+def _locate_quote(doc, quote: str, search_last: bool = False):
+    if not quote:
+        return None
+
+    found = None
+    for p_idx, page in enumerate(doc):
+        hits = page.search_for(quote)
+        if not hits:
+            continue
+        if search_last:
+            found = (p_idx, hits[-1])
+        else:
+            return (p_idx, hits[0])
+
+    return found
+
+
 def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, provider: str = "ollama"):
     """
     Use the Local LLM to analyze the transcript + document and:
@@ -822,10 +882,41 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
     
     start_quote = (analysis.get("highlight_start_quote") or "").strip()
     end_quote = (analysis.get("highlight_end_quote") or "").strip()
-    section_id = analysis.get("relevant_section_number", "Unknown")
+    section_id = (analysis.get("relevant_section_number") or "").strip() or "Unknown"
 
     logging.info("LLM identified Section %s", section_id)
     logging.info("Highlighting region from '%s' to '%s'", start_quote, end_quote)
+
+    sections = _parse_procedure_sections(full_pdf_text)
+    transcript_sections = set(re.findall(r"\b(\d+(?:\.\d+)+)\b", transcript_text or ""))
+
+    # Build candidate sections: include the LLM-picked section plus any explicitly mentioned
+    # sections in the transcript that exist in the procedure text.
+    candidate_numbers = []
+    if section_id and section_id != "Unknown":
+        candidate_numbers.append(section_id)
+    for num in transcript_sections:
+        if num not in candidate_numbers:
+            candidate_numbers.append(num)
+
+    # Keep order as they appear in the procedure to avoid double-highlighting or skips
+    ordered_sections = []
+    for sec in sections:
+        if sec["number"] in candidate_numbers or any(
+            cn.startswith(sec["number"]) or sec["number"].startswith(cn) for cn in candidate_numbers
+        ):
+            ordered_sections.append(sec)
+
+    # Fallback: if nothing matched but we have start/end quotes, try highlighting once
+    if not ordered_sections and (start_quote or end_quote):
+        ordered_sections.append(
+            {
+                "number": section_id,
+                "heading_line": start_quote or section_id,
+                "last_line": end_quote or start_quote or section_id,
+                "next_heading": "",
+            }
+        )
 
     # Pre-compute normalized transcript word set for Green/Red logic
     def _norm_word(w: str) -> str:
@@ -835,130 +926,155 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
         _norm_word(w) for w in transcript_text.split() if _norm_word(w)
     }
 
-    # 3. Define Active Region using start/end quotes
-    if start_quote and end_quote:
-        start_loc = None
-        end_loc = None
-        
-        for p_idx, page in enumerate(doc):
-            s_hits = page.search_for(start_quote)
-            if s_hits and not start_loc:
-                # First occurrence of start quote
-                start_loc = (p_idx, s_hits[0])
-            e_hits = page.search_for(end_quote)
-            if e_hits:
-                # Use the last occurrence of end quote on the farthest page we see it
-                end_loc = (p_idx, e_hits[-1])
-        
-        if start_loc and end_loc:
-            start_page, start_rect = start_loc
-            end_page, end_rect = end_loc
+    # 3. Define Active Region using section-aware ranges (supports multiple mentions)
+    GREEN = (0.6, 1.0, 0.6)
+    RED = (1.0, 0.6, 0.6)
 
-            GREEN = (0.6, 1.0, 0.6)
-            RED = (1.0, 0.6, 0.6)
+    # --- LOAD ACRONYM MAPPINGS ---
+    # Maps acronym (uppercase) -> list of spoken words (lowercase)
+    # e.g., "AL" -> ["alpha", "lima"]
+    acronym_to_spoken = {}
+    try:
+        import csv
+        csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                abbr = row.get("Abbreviation", "").strip().upper()
+                meaning = row.get("Meaning", "").strip()
+                if abbr and meaning:
+                    # Convert meaning to individual words (lowercase)
+                    spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
+                    if spoken_words:
+                        acronym_to_spoken[abbr] = spoken_words
+        logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
+    except Exception as e:
+        logging.warning(f"Could not load Acronyms1.csv: {e}")
 
-            # --- LOAD ACRONYM MAPPINGS ---
-            # Maps acronym (uppercase) -> list of spoken words (lowercase)
-            # e.g., "AL" -> ["alpha", "lima"]
-            acronym_to_spoken = {}
-            try:
-                import csv
-                csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        abbr = row.get("Abbreviation", "").strip().upper()
-                        meaning = row.get("Meaning", "").strip()
-                        if abbr and meaning:
-                            # Convert meaning to individual words (lowercase)
-                            spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
-                            if spoken_words:
-                                acronym_to_spoken[abbr] = spoken_words
-                logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
-            except Exception as e:
-                logging.warning(f"Could not load Acronyms1.csv: {e}")
+    def word_matches_transcript(pdf_word: str) -> bool:
+        """
+        Returns True if the PDF word appears in the transcript OR
+        if any word from the acronym's expansion appears in transcript.
+        """
+        norm = _norm_word(pdf_word)
+        if not norm:
+            return False
 
-            def word_matches_transcript(pdf_word: str) -> bool:
-                """
-                Returns True if the PDF word appears in the transcript OR
-                if any word from the acronym's expansion appears in transcript.
-                """
-                norm = _norm_word(pdf_word)
-                if not norm:
-                    return False
-                
-                # Direct match
-                if norm in transcript_word_set:
+        # Direct match
+        if norm in transcript_word_set:
+            return True
+
+        # Acronym expansion match
+        # Check if the PDF word (uppercase) is an acronym
+        upper_word = pdf_word.strip().upper()
+        if upper_word in acronym_to_spoken:
+            # Check if ANY of the spoken expansion words appear in transcript
+            spoken_words = acronym_to_spoken[upper_word]
+            for spoken_w in spoken_words:
+                if spoken_w in transcript_word_set:
                     return True
-                
-                # Acronym expansion match
-                # Check if the PDF word (uppercase) is an acronym
-                upper_word = pdf_word.strip().upper()
-                if upper_word in acronym_to_spoken:
-                    # Check if ANY of the spoken expansion words appear in transcript
-                    spoken_words = acronym_to_spoken[upper_word]
-                    for spoken_w in spoken_words:
-                        if spoken_w in transcript_word_set:
-                            return True
-                
-                return False
 
-            for p_idx in range(start_page, end_page + 1):
-                page = doc[p_idx]
-                page_rect = page.rect
+        return False
 
-                # Compute the Active Region rectangle for this page
-                if start_page == end_page:
-                    # Start & end on the same page: bound vertically between them
-                    active_rect = fitz.Rect(
-                        page_rect.x0,
-                        start_rect.y0,
-                        page_rect.x1,
-                        end_rect.y1,
-                    )
-                elif p_idx == start_page:
-                    active_rect = fitz.Rect(
-                        page_rect.x0,
-                        start_rect.y0,
-                        page_rect.x1,
-                        page_rect.y1,
-                    )
-                elif p_idx == end_page:
-                    active_rect = fitz.Rect(
-                        page_rect.x0,
-                        page_rect.y0,
-                        page_rect.x1,
-                        end_rect.y1,
-                    )
-                else:
-                    # Intermediate page: full page is inside the section
-                    active_rect = page_rect
+    def highlight_section(section):
+        start_loc = _locate_quote(doc, section.get("heading_line") or "")
 
-                # 4. Word-level highlighting inside Active Region only
-                words_on_page = page.get_text("words")
-                for w in words_on_page:
-                    x0, y0, x1, y1, word_text, *_ = w
-                    rect = fitz.Rect(x0, y0, x1, y1)
+        if not start_loc:
+            # As a fallback, try locating by section number only
+            start_loc = _locate_quote(doc, section.get("number") or "")
 
-                    # Skip words outside the Active Region
-                    if not active_rect.intersects(rect):
-                        continue
+        end_loc = _locate_quote(doc, section.get("last_line") or "", search_last=True)
 
-                    norm = _norm_word(word_text)
-                    if not norm:
-                        continue
+        if not end_loc and section.get("next_heading"):
+            # Use the next heading as a boundary marker so the entire current section is covered
+            end_loc = _locate_quote(doc, section.get("next_heading"), search_last=False)
 
-                    # Use acronym-aware matching
-                    color = GREEN if word_matches_transcript(word_text) else RED
+        if not end_loc:
+            # Final fallback to the end of the document
+            end_page = doc.page_count - 1
+            end_rect = doc[end_page].rect
+            end_loc = (end_page, end_rect)
 
-                    annot = page.add_highlight_annot(rect)
-                    annot.set_colors(stroke=color)
-                    annot.set_opacity(0.3)
-                    annot.update()
-        else:
+        if not start_loc:
             logging.warning(
-                "LLM did not return both start and end quotes. Skipping section-scoped highlighting."
+                "Unable to locate start of section %s for highlighting", section.get("number")
             )
+            return
+
+        start_page, start_rect = start_loc
+        end_page, end_rect = end_loc
+
+        # Ensure the boundary ordering is correct
+        if start_page > end_page:
+            end_page = start_page
+            end_rect = start_rect
+
+        for p_idx in range(start_page, end_page + 1):
+            page = doc[p_idx]
+            page_rect = page.rect
+
+            if start_page == end_page:
+                active_rect = fitz.Rect(
+                    page_rect.x0,
+                    start_rect.y0,
+                    page_rect.x1,
+                    end_rect.y1,
+                )
+            elif p_idx == start_page:
+                active_rect = fitz.Rect(
+                    page_rect.x0,
+                    start_rect.y0,
+                    page_rect.x1,
+                    page_rect.y1,
+                )
+            elif p_idx == end_page:
+                active_rect = fitz.Rect(
+                    page_rect.x0,
+                    page_rect.y0,
+                    page_rect.x1,
+                    end_rect.y1,
+                )
+            else:
+                active_rect = page_rect
+
+            words_on_page = page.get_text("words")
+            for w in words_on_page:
+                x0, y0, x1, y1, word_text, *_ = w
+                rect = fitz.Rect(x0, y0, x1, y1)
+
+                if not active_rect.intersects(rect):
+                    continue
+
+                norm = _norm_word(word_text)
+                if not norm:
+                    continue
+
+                color = GREEN if word_matches_transcript(word_text) else RED
+
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=color)
+                annot.set_opacity(0.3)
+                annot.update()
+
+    if ordered_sections:
+        logged_numbers = ", ".join(sec.get("number", "?") for sec in ordered_sections)
+        logging.info("Highlighting %d section(s): %s", len(ordered_sections), logged_numbers)
+        for sec in ordered_sections:
+            highlight_section(sec)
+    elif start_quote and end_quote:
+        logging.warning("Falling back to single-quote highlight for %s", section_id)
+        highlight_section(
+            {
+                "number": section_id,
+                "heading_line": start_quote,
+                "last_line": end_quote,
+                "next_heading": "",
+            }
+        )
+    else:
+        logging.warning(
+            "LLM did not return highlight anchors and no sections were detected. Skipping section-scoped highlighting."
+        )
 
     # Save
     doc.save(output_path)
