@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-from typing import Any, Dict, Tuple
+import re
+from typing import Any, Dict, List, Tuple
 
 import requests
 from peercheck import settings as project_settings
@@ -15,17 +16,18 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
             CRITICAL: The highlight_start_quote and highlight_end_quote MUST be EXACT TEXT from the PROCEDURE DOCUMENT, NOT from the transcript!
 
             OBJECTIVES:
-            1. Find which section number (like "8.4") is being discussed in the transcript
-            2. Locate that section in the PROCEDURE DOCUMENT
-            3. Copy the EXACT FIRST LINE of that section from the PROCEDURE DOCUMENT as highlight_start_quote
-            4. Copy the EXACT LAST LINE of that section from the PROCEDURE DOCUMENT as highlight_end_quote
-            5. Analyze 3PC (Statement/Readback/Acknowledgement) patterns
+            1. Identify which REAL section number from the procedure (e.g., "8.4") is being discussed in the transcript.
+            2. Locate that section in the PROCEDURE DOCUMENT.
+            3. Copy the EXACT FIRST LINE of that section from the PROCEDURE DOCUMENT as highlight_start_quote.
+            4. Copy the EXACT LAST LINE of that section from the PROCEDURE DOCUMENT as highlight_end_quote.
+            5. Analyze 3PC (Statement/Readback/Acknowledgement) patterns.
 
             IMPORTANT RULES:
             - highlight_start_quote = First line/sentence of the section FROM THE PROCEDURE DOCUMENT
             - highlight_end_quote = Last line/sentence of the section FROM THE PROCEDURE DOCUMENT
             - DO NOT use transcript text for quotes! Only procedure document text!
-            - Example: If section 8.4 starts with "ENSURE AL-V010 is open" and ends with "Record stroke time in data sheet", use those exact texts.
+            - Numbers in this prompt (e.g., 8.4) are EXAMPLES ONLY. Return the ACTUAL section number from the procedure that best matches the transcript context, never the example unless it truly exists in the document.
+            - If multiple sections are mentioned, pick the one whose wording best aligns with the transcript. Never default to a placeholder section number.
 
             3PC Classification:
             - "Match": Statement in procedure + Readback matches + Acknowledgement present
@@ -34,7 +36,7 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
 
             Return ONLY valid JSON:
             {
-            "relevant_section_number": "8.4",
+            "relevant_section_number": "<actual section number from procedure>",
             "highlight_start_quote": "EXACT first line FROM PROCEDURE DOCUMENT",
             "highlight_end_quote": "EXACT last line FROM PROCEDURE DOCUMENT",
             "interactions": [
@@ -53,7 +55,7 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
 
             TASK: Return a JSON object with this exact structure (fill in all fields with actual values, not null or empty):
 
-            Example:
+            Example (numbers shown here are placeholders—return the actual section number from the procedure that fits the transcript context):
             {{
             "relevant_section_number": "8.4",
             "highlight_start_quote": "Exact first sentence or line from the section",
@@ -69,16 +71,77 @@ def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]
             }}
 
             INSTRUCTIONS:
-            1. Search the transcript for section numbers (like "8.4", "7.0", "3.1")
-            2. Find that section in the procedure document
-            3. Copy the EXACT first line/sentence as highlight_start_quote
-            4. Copy the EXACT last line/sentence as highlight_end_quote
-            5. List any Statement/Readback/Acknowledgement patterns from the transcript
+            1. Search the transcript for section numbers (like "8.4", "7.0", "3.1") and confirm they truly exist in the procedure document. Never assume an example number.
+            2. Find that section in the procedure document (or pick the best matching section by wording when no explicit number is spoken).
+            3. Copy the EXACT first line/sentence as highlight_start_quote.
+            4. Copy the EXACT last line/sentence as highlight_end_quote.
+            5. List any Statement/Readback/Acknowledgement patterns from the transcript.
+            6. If no section number is spoken, infer the best-fitting section from context—do not output placeholder example numbers.
 
             Return your JSON analysis now:
         """
 
     return system_prompt, user_prompt
+
+
+def _extract_section_positions(procedure_text: str) -> List[Tuple[str, int]]:
+    """Return a sorted list of (section_number, start_index) pairs found in the procedure text."""
+
+    section_matches = re.finditer(r"(?m)^(?P<num>\d+(?:\.\d+)*)(?:\s|[-:])", procedure_text)
+    sections: List[Tuple[str, int]] = []
+    for match in section_matches:
+        sections.append((match.group("num"), match.start()))
+    return sorted(sections, key=lambda item: item[1])
+
+
+def _find_section_for_quote(procedure_text: str, quote: str, sections: List[Tuple[str, int]]) -> str:
+    """Locate the section heading nearest to where a quote appears in the procedure text."""
+
+    if not quote:
+        return ""
+
+    idx = procedure_text.lower().find(quote.lower())
+    if idx == -1 or not sections:
+        return ""
+
+    prior_sections = [sec for sec in sections if sec[1] <= idx]
+    if prior_sections:
+        return prior_sections[-1][0]
+
+    # If quote occurs before the first heading, pick the earliest section number
+    return sections[0][0] if sections else ""
+
+
+def _ensure_real_section_number(parsed: Dict[str, Any], procedure_text: str) -> Dict[str, Any]:
+    """
+    Avoid placeholder section numbers (e.g., examples like 8.4) by validating against
+    headings found in the procedure document or inferring from the quote locations.
+    """
+
+    sections = _extract_section_positions(procedure_text)
+    provided = (parsed.get("relevant_section_number") or "").strip()
+
+    # Prefer a section that actually exists in the procedure document
+    for num, _pos in sections:
+        if provided and (num == provided or provided.startswith(num) or num.startswith(provided)):
+            parsed["relevant_section_number"] = num
+            return parsed
+
+    # Try to infer section by locating the start/end quotes inside the procedure text
+    inferred = _find_section_for_quote(procedure_text, parsed.get("highlight_start_quote", ""), sections)
+    if not inferred:
+        inferred = _find_section_for_quote(procedure_text, parsed.get("highlight_end_quote", ""), sections)
+
+    if inferred:
+        parsed["relevant_section_number"] = inferred
+    elif not provided:
+        # If nothing is provided and we have only one candidate, use it instead of placeholders
+        parsed["relevant_section_number"] = sections[0][0] if len(sections) == 1 else ""
+    else:
+        # Retain the provided value for logging even if it was a placeholder
+        parsed["relevant_section_number"] = provided
+
+    return parsed
 
 
 def analyze_3pc_with_ollama(transcript_text: str, procedure_text: str) -> Dict[str, Any]:
@@ -198,6 +261,8 @@ def analyze_3pc_with_ollama(transcript_text: str, procedure_text: str) -> Dict[s
             parsed.setdefault("highlight_end_quote", "")
             parsed.setdefault("interactions", [])
 
+            parsed = _ensure_real_section_number(parsed, procedure_text)
+
             # Log the final keys for debugging
             logger.info("Final parsed keys: %s", list(parsed.keys()))
             logger.info("--- LOCAL LLM RESPONSE END ---")
@@ -285,6 +350,8 @@ def analyze_3pc_with_openai_api(transcript_text: str, procedure_text: str) -> Di
         parsed.setdefault("highlight_start_quote", "")
         parsed.setdefault("highlight_end_quote", "")
         parsed.setdefault("interactions", [])
+
+        parsed = _ensure_real_section_number(parsed, procedure_text)
 
         return parsed
     except requests.RequestException as exc:
