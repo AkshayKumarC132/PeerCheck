@@ -1041,6 +1041,75 @@ def create_highlighted_docx_from_s3(
         if output_path and os.path.exists(output_path) and is_s3_url: # Keep local file if not using S3
             os.unlink(output_path)
 
+def _is_other_speaker(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    return name.strip().lower() in {"other", "other speaker"}
+
+
+def _drop_overlapping_duplicates(segments: List[Dict], min_overlap: float = 0.25) -> List[Dict]:
+    """Remove overlapping diarization segments that are likely duplicates."""
+    if not segments:
+        return []
+
+    cleaned: List[Dict] = []
+
+    def _duration(seg: Dict) -> float:
+        try:
+            return float(seg.get("duration") or (seg.get("end") - seg.get("start")))
+        except Exception:
+            return 0.0
+
+    segments = sorted(
+        segments, key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
+    )
+
+    for seg in segments:
+        if not cleaned:
+            cleaned.append(seg)
+            continue
+
+        prev = cleaned[-1]
+        try:
+            overlap_start = max(float(prev.get("start")), float(seg.get("start")))
+            overlap_end = min(float(prev.get("end")), float(seg.get("end")))
+        except Exception:
+            cleaned.append(seg)
+            continue
+
+        overlap = overlap_end - overlap_start
+        if overlap < min_overlap:
+            cleaned.append(seg)
+            continue
+
+        prev_other = _is_other_speaker(prev.get("speaker") or prev.get("speaker_name"))
+        seg_other = _is_other_speaker(seg.get("speaker") or seg.get("speaker_name"))
+
+        if prev_other and not seg_other:
+            cleaned[-1] = seg
+            continue
+        if seg_other and not prev_other:
+            continue
+
+        prev_dur = _duration(prev)
+        seg_dur = _duration(seg)
+        prev_text = (prev.get("text") or "").strip()
+        seg_text = (seg.get("text") or "").strip()
+
+        if seg_dur > prev_dur or len(seg_text) > len(prev_text):
+            cleaned[-1] = seg
+            continue
+
+        if prev_text and prev_text == seg_text:
+            prev["end"] = max(prev.get("end", overlap_end), seg.get("end", overlap_end))
+            try:
+                prev["duration"] = round(float(prev["end"]) - float(prev.get("start", 0.0)), 2)
+            except Exception:
+                prev.pop("duration", None)
+
+    return cleaned
+
+
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
     import contextlib
     import requests
@@ -1330,6 +1399,9 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
             segment["speaker_profile_id"] = profile.id
         else:
             segment.setdefault("speaker_name", None)
+
+    # Remove overlapping placeholder segments that duplicate confident speakers.
+    diarization_segments = _drop_overlapping_duplicates(diarization_segments)
 
     # Clean up
     if os.path.exists(wav_path):
@@ -1827,6 +1899,10 @@ def build_three_part_communication_summary(
     - All segments included (no truncation)
     """
     segments = diarization_segments or []
+
+    # Clean up overlapping placeholder segments before further processing to
+    # keep the 3PC report aligned with the final diarization output.
+    segments = _drop_overlapping_duplicates(segments)
     
     if not segments:
         return []
