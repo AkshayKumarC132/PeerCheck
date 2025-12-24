@@ -42,6 +42,7 @@ from .new_utils import (
     create_highlighted_pdf_document,
     build_three_part_communication_summary,
     get_media_duration,
+    _drop_overlapping_duplicates,
 )
 from .authentication import token_verification
 from .new_serializers import (
@@ -810,8 +811,14 @@ class DownloadProcessedDocumentView(GenericAPIView):
         
         user = user_data['user']
         print(f"User: {user.username}, Session ID: {session_id}")
-        
+
         try:
+            serializer = self.get_serializer(
+                data={"session_id": session_id, **request.query_params}
+            )
+            serializer.is_valid(raise_exception=True)
+            validated = serializer.validated_data
+
             # Get processing session
             session = ProcessingSession.objects.get(
                 id=session_id
@@ -917,6 +924,8 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         .lower()
                         == "true"
                     )
+                    use_llm = validated.get("use_llm", True)
+                    llm_provider = validated.get("llm_provider", "ollama")
                     logging.info(
                         "validate_abbreviations=%s in DownloadProcessedDocumentView",
                         use_transcript,
@@ -931,6 +940,8 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         reference_doc.file_path,
                         transcript,
                         require_transcript_match=use_transcript,
+                        use_llm=use_llm,
+                        llm_provider=llm_provider,
                     )
                     print(f"Created processed document: {processed_s3_url}")
                     # Save S3 URL to session
@@ -1030,6 +1041,12 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
         print(f"User: {user.username}, Session ID: {session_id}")
 
         try:
+            serializer = self.get_serializer(
+                data={"session_id": session_id, **request.query_params}
+            )
+            serializer.is_valid(raise_exception=True)
+            validated = serializer.validated_data
+
             session = ProcessingSession.objects.get(id=session_id)
 
             reference_doc = session.reference_document
@@ -1118,6 +1135,8 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
             else:
                 diarization_segments = diarization_payload
 
+            diarization_segments = _drop_overlapping_duplicates(diarization_segments)
+
             reference_text = reference_doc.extracted_text or ''
             if not reference_text and reference_doc.file_path:
                 try:
@@ -1130,6 +1149,9 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                     reference_doc.save(update_fields=['extracted_text'])
 
             three_pc_entries = build_three_part_communication_summary(reference_text, diarization_segments)
+
+            use_llm = validated.get("use_llm", True)
+            llm_provider = validated.get("llm_provider", "ollama")
 
             try:
                 previous_url = session.processed_docx_with_diarization_path
@@ -1144,6 +1166,8 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                         reference_doc.file_path,
                         transcript,
                         three_pc_entries=three_pc_entries,
+                        use_llm=use_llm,
+                        llm_provider=llm_provider,
                     )
 
                 if previous_url and previous_url != processed_s3_url:

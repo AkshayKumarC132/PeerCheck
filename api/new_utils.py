@@ -25,7 +25,7 @@ from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
 import uuid
-from collections import Counter
+from collections import Counter, defaultdict
 from sentence_transformers import SentenceTransformer, util
 # Add at top (after existing ML imports like whisper/pyannote)
 import torch  # If not present, add to requirements
@@ -731,6 +731,8 @@ def create_highlighted_pdf_document(
     transcript,
     require_transcript_match=True,
     three_pc_entries: Optional[List[Dict]] = None,
+    use_llm: bool = True,
+    llm_provider: str = "ollama",
 ):
     """
     Orchestrates the generation of a highlighted PDF using LLM analysis.
@@ -746,29 +748,31 @@ def create_highlighted_pdf_document(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_output_path = temp_file.name
 
-        # generate_highlighted_pdf(
-        #     temp_input_path,
-        #     transcript,
-        #     temp_output_path,
-        #     require_transcript_match=require_transcript_match,
-        # )
+        interactions: List[Dict[str, Any]] = []
 
-        # if three_pc_entries is not None:
-        #     append_three_pc_summary_to_pdf(temp_output_path, three_pc_entries)
+        if use_llm:
+            # --- KEY CHANGE: LLM does the analysis inside generate_highlighted_pdf ---
+            # It returns the structured analysis (including interactions)
+            llm_analysis = generate_highlighted_pdf_with_llm(
+                temp_input_path,
+                transcript,
+                temp_output_path,
+                provider=llm_provider,
+            )
 
-        # --- KEY CHANGE: LLM does the analysis inside generate_highlighted_pdf ---
-        # It returns the structured analysis (including interactions)
-        llm_analysis = generate_highlighted_pdf_with_llm(
-            temp_input_path,
-            transcript,
-            temp_output_path
-        )
+            # Use LLM-detected interactions if available, otherwise fallback (or empty)
+            interactions = llm_analysis.get("interactions", []) if llm_analysis else []
+        else:
+            # Use semantic/keyword highlighting without an LLM
+            generate_highlighted_pdf(
+                temp_input_path,
+                transcript,
+                temp_output_path,
+                require_transcript_match=require_transcript_match,
+            )
 
-        # Use LLM-detected interactions if available, otherwise fallback (or empty)
-        interactions = llm_analysis.get("interactions", []) if llm_analysis else []
-        
         # If user explicitly passed entries (rare now), use them, else use LLM's
-        final_entries = three_pc_entries if three_pc_entries else interactions
+        final_entries = three_pc_entries if three_pc_entries is not None else interactions
 
         if final_entries:
             # Map LLM "interactions" to the format expected by summary table if needed
@@ -790,16 +794,76 @@ def create_highlighted_pdf_document(
             except PermissionError:
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
-def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
+def _parse_procedure_sections(procedure_text: str):
+    """Return ordered section metadata with heading lines and trailing content.
+
+    Each item: {
+        "number": "8.1",
+        "heading_line": "8.1 Title of the section",
+        "start": index in procedure_text,
+        "end": next section start (or len(text)),
+        "last_line": last non-empty line within the section body,
+        "next_heading": heading line for the next section (if any),
+    }
+    """
+
+    section_re = re.compile(r"(?m)^(?P<num>\d+(?:\.\d+)*)(?P<title>[^\n]*)")
+    matches = list(section_re.finditer(procedure_text))
+    sections = []
+
+    for idx, match in enumerate(matches):
+        num = match.group("num").strip()
+        heading_line = (match.group(0) or "").strip()
+        start = match.start()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(procedure_text)
+
+        body = procedure_text[start:end]
+        body_lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+        last_line = body_lines[-1] if body_lines else heading_line
+
+        next_heading = (matches[idx + 1].group(0) or "").strip() if idx + 1 < len(matches) else ""
+
+        sections.append(
+            {
+                "number": num,
+                "heading_line": heading_line,
+                "start": start,
+                "end": end,
+                "last_line": last_line,
+                "next_heading": next_heading,
+            }
+        )
+
+    return sections
+
+
+def _locate_quote(doc, quote: str, search_last: bool = False):
+    if not quote:
+        return None
+
+    found = None
+    for p_idx, page in enumerate(doc):
+        hits = page.search_for(quote)
+        if not hits:
+            continue
+        if search_last:
+            found = (p_idx, hits[-1])
+        else:
+            return (p_idx, hits[0])
+
+    return found
+
+
+def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, provider: str = "ollama"):
     """
     Use the Local LLM to analyze the transcript + document and:
-      1. Identify the relevant section (e.g., \"8.4\") and its start/end quotes.
+      1. Identify the relevant section number from the procedure and its start/end quotes.
       2. Within that *Active Region* only, apply word-level Green/Red highlighting:
          - Green: word appears in the transcript (spoken).
          - Red:   word does not appear in the transcript (missed/skipped).
       3. Leave all text outside the Active Region uncolored.
     """
-    from .llm_service import analyze_3pc_with_openai
+    from .llm_service import analyze_3pc
     import fitz
 
     # 1. Load PDF and Extract Text
@@ -814,14 +878,60 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
 
     # 2. Analyze with Local LLM
     logging.info("Sending Transcript + Procedure to Local LLM for analysis (3PC + section detection)...")
-    analysis = analyze_3pc_with_openai(transcript_text, full_pdf_text)
+    analysis = analyze_3pc(transcript_text, full_pdf_text, provider=provider)
     
     start_quote = (analysis.get("highlight_start_quote") or "").strip()
     end_quote = (analysis.get("highlight_end_quote") or "").strip()
-    section_id = analysis.get("relevant_section_number", "Unknown")
+    section_id = (analysis.get("relevant_section_number") or "").strip() or "Unknown"
 
     logging.info("LLM identified Section %s", section_id)
     logging.info("Highlighting region from '%s' to '%s'", start_quote, end_quote)
+
+    sections = _parse_procedure_sections(full_pdf_text)
+    transcript_sections = set(re.findall(r"\b(\d+(?:\.\d+)+)\b", transcript_text or ""))
+
+    def _section_for_quote(quote: str) -> Optional[str]:
+        if not quote:
+            return None
+
+        idx = full_pdf_text.lower().find(quote.lower())
+        if idx == -1:
+            return None
+
+        for sec in sections:
+            if sec["start"] <= idx < sec["end"]:
+                return sec["number"]
+
+        return None
+
+    # Build candidate sections: include the LLM-picked section plus any explicitly mentioned
+    # sections in the transcript that exist in the procedure text or inferred from quote
+    # locations. This keeps highlighting even if the LLM omits one of the anchors.
+    candidate_numbers = []
+    quote_sections = [_section_for_quote(start_quote), _section_for_quote(end_quote)]
+
+    for num in [section_id if section_id != "Unknown" else None, *transcript_sections, *quote_sections]:
+        if num and num not in candidate_numbers:
+            candidate_numbers.append(num)
+
+    # Keep order as they appear in the procedure to avoid double-highlighting or skips
+    ordered_sections = []
+    for sec in sections:
+        if sec["number"] in candidate_numbers or any(
+            cn.startswith(sec["number"]) or sec["number"].startswith(cn) for cn in candidate_numbers
+        ):
+            ordered_sections.append(sec)
+
+    # Fallback: if nothing matched but we have start/end quotes, try highlighting once
+    if not ordered_sections and (start_quote or end_quote):
+        ordered_sections.append(
+            {
+                "number": section_id,
+                "heading_line": start_quote or section_id,
+                "last_line": end_quote or start_quote or section_id,
+                "next_heading": "",
+            }
+        )
 
     # Pre-compute normalized transcript word set for Green/Red logic
     def _norm_word(w: str) -> str:
@@ -831,141 +941,182 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
         _norm_word(w) for w in transcript_text.split() if _norm_word(w)
     }
 
-    # 3. Define Active Region using start/end quotes
-    if start_quote and end_quote:
-        start_loc = None
-        end_loc = None
-        
-        for p_idx, page in enumerate(doc):
-            s_hits = page.search_for(start_quote)
-            if s_hits and not start_loc:
-                # First occurrence of start quote
-                start_loc = (p_idx, s_hits[0])
-            e_hits = page.search_for(end_quote)
-            if e_hits:
-                # Use the last occurrence of end quote on the farthest page we see it
-                end_loc = (p_idx, e_hits[-1])
-        
-        if start_loc and end_loc:
-            start_page, start_rect = start_loc
-            end_page, end_rect = end_loc
+    # 3. Define Active Region using section-aware ranges (supports multiple mentions)
+    GREEN = (0.6, 1.0, 0.6)
+    RED = (1.0, 0.6, 0.6)
 
-            GREEN = (0.6, 1.0, 0.6)
-            RED = (1.0, 0.6, 0.6)
+    # --- LOAD ACRONYM MAPPINGS ---
+    # Maps acronym (uppercase) -> list of spoken words (lowercase)
+    # e.g., "AL" -> ["alpha", "lima"]
+    acronym_to_spoken = {}
+    try:
+        import csv
+        csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                abbr = row.get("Abbreviation", "").strip().upper()
+                meaning = row.get("Meaning", "").strip()
+                if abbr and meaning:
+                    # Convert meaning to individual words (lowercase)
+                    spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
+                    if spoken_words:
+                        acronym_to_spoken[abbr] = spoken_words
+        logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
+    except Exception as e:
+        logging.warning(f"Could not load Acronyms1.csv: {e}")
 
-            # --- LOAD ACRONYM MAPPINGS ---
-            # Maps acronym (uppercase) -> list of spoken words (lowercase)
-            # e.g., "AL" -> ["alpha", "lima"]
-            acronym_to_spoken = {}
-            try:
-                import csv
-                csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
-                with open(csv_path, "r", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    for row in reader:
-                        abbr = row.get("Abbreviation", "").strip().upper()
-                        meaning = row.get("Meaning", "").strip()
-                        if abbr and meaning:
-                            # Convert meaning to individual words (lowercase)
-                            spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
-                            if spoken_words:
-                                acronym_to_spoken[abbr] = spoken_words
-                logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
-            except Exception as e:
-                logging.warning(f"Could not load Acronyms1.csv: {e}")
+    def word_matches_transcript(pdf_word: str) -> bool:
+        """
+        Returns True if the PDF word appears in the transcript OR
+        if any word from the acronym's expansion appears in transcript.
+        """
+        norm = _norm_word(pdf_word)
+        if not norm:
+            return False
 
-            def word_matches_transcript(pdf_word: str) -> bool:
-                """
-                Returns True if the PDF word appears in the transcript OR
-                if any word from the acronym's expansion appears in transcript.
-                """
-                norm = _norm_word(pdf_word)
-                if not norm:
-                    return False
-                
-                # Direct match
-                if norm in transcript_word_set:
+        # Direct match
+        if norm in transcript_word_set:
+            return True
+
+        # Acronym expansion match
+        # Check if the PDF word (uppercase) is an acronym
+        upper_word = pdf_word.strip().upper()
+        if upper_word in acronym_to_spoken:
+            # Check if ANY of the spoken expansion words appear in transcript
+            spoken_words = acronym_to_spoken[upper_word]
+            for spoken_w in spoken_words:
+                if spoken_w in transcript_word_set:
                     return True
-                
-                # Acronym expansion match
-                # Check if the PDF word (uppercase) is an acronym
-                upper_word = pdf_word.strip().upper()
-                if upper_word in acronym_to_spoken:
-                    # Check if ANY of the spoken expansion words appear in transcript
-                    spoken_words = acronym_to_spoken[upper_word]
-                    for spoken_w in spoken_words:
-                        if spoken_w in transcript_word_set:
-                            return True
-                
-                return False
 
-            for p_idx in range(start_page, end_page + 1):
-                page = doc[p_idx]
-                page_rect = page.rect
+        return False
 
-                # Compute the Active Region rectangle for this page
-                if start_page == end_page:
-                    # Start & end on the same page: bound vertically between them
-                    active_rect = fitz.Rect(
-                        page_rect.x0,
-                        start_rect.y0,
-                        page_rect.x1,
-                        end_rect.y1,
-                    )
-                elif p_idx == start_page:
-                    active_rect = fitz.Rect(
-                        page_rect.x0,
-                        start_rect.y0,
-                        page_rect.x1,
-                        page_rect.y1,
-                    )
-                elif p_idx == end_page:
-                    active_rect = fitz.Rect(
-                        page_rect.x0,
-                        page_rect.y0,
-                        page_rect.x1,
-                        end_rect.y1,
-                    )
-                else:
-                    # Intermediate page: full page is inside the section
-                    active_rect = page_rect
+    def _section_regions(section):
+        """Return active rectangles per page for a section without re-reading page words."""
 
-                # 4. Word-level highlighting inside Active Region only
-                words_on_page = page.get_text("words")
-                for w in words_on_page:
-                    x0, y0, x1, y1, word_text, *_ = w
-                    rect = fitz.Rect(x0, y0, x1, y1)
+        start_loc = _locate_quote(doc, section.get("heading_line") or "")
 
-                    # Skip words outside the Active Region
-                    if not active_rect.intersects(rect):
-                        continue
+        if not start_loc:
+            # As a fallback, try locating by section number only
+            start_loc = _locate_quote(doc, section.get("number") or "")
 
-                    norm = _norm_word(word_text)
-                    if not norm:
-                        continue
+        end_loc = _locate_quote(doc, section.get("last_line") or "", search_last=True)
 
-                    # Use acronym-aware matching
-                    color = GREEN if word_matches_transcript(word_text) else RED
+        if not end_loc and section.get("next_heading"):
+            # Use the next heading as a boundary marker so the entire current section is covered
+            end_loc = _locate_quote(doc, section.get("next_heading"), search_last=False)
 
-                    annot = page.add_highlight_annot(rect)
-                    annot.set_colors(stroke=color)
-                    annot.set_opacity(0.3)
-                    annot.update()
-        else:
+        if not end_loc:
+            # Final fallback to the end of the document
+            end_page = doc.page_count - 1
+            end_rect = doc[end_page].rect
+            end_loc = (end_page, end_rect)
+
+        if not start_loc:
             logging.warning(
-                "LLM did not return both start and end quotes. Skipping section-scoped highlighting."
+                "Unable to locate start of section %s for highlighting", section.get("number")
             )
+            return {}
+
+        start_page, start_rect = start_loc
+        end_page, end_rect = end_loc
+
+        # Ensure the boundary ordering is correct
+        if start_page > end_page:
+            end_page = start_page
+            end_rect = start_rect
+
+        regions = {}
+
+        for p_idx in range(start_page, end_page + 1):
+            page = doc[p_idx]
+            page_rect = page.rect
+
+            if start_page == end_page:
+                active_rect = fitz.Rect(
+                    page_rect.x0,
+                    start_rect.y0,
+                    page_rect.x1,
+                    end_rect.y1,
+                )
+            elif p_idx == start_page:
+                active_rect = fitz.Rect(
+                    page_rect.x0,
+                    start_rect.y0,
+                    page_rect.x1,
+                    page_rect.y1,
+                )
+            elif p_idx == end_page:
+                active_rect = fitz.Rect(
+                    page_rect.x0,
+                    page_rect.y0,
+                    page_rect.x1,
+                    end_rect.y1,
+                )
+            else:
+                active_rect = page_rect
+
+            regions.setdefault(p_idx, []).append(active_rect)
+
+        return regions
+
+    page_regions: Dict[int, List[fitz.Rect]] = defaultdict(list)
+
+    if ordered_sections:
+        logged_numbers = ", ".join(sec.get("number", "?") for sec in ordered_sections)
+        logging.info("Highlighting %d section(s): %s", len(ordered_sections), logged_numbers)
+        for sec in ordered_sections:
+            for p_idx, rects in _section_regions(sec).items():
+                page_regions[p_idx].extend(rects)
+    elif start_quote or end_quote:
+        logging.warning(
+            "LLM returned incomplete highlight anchors (start='%s', end='%s'). Using available text for a single-region highlight.",
+            start_quote,
+            end_quote,
+        )
+        for p_idx, rects in _section_regions(
+            {
+                "number": section_id,
+                "heading_line": start_quote or end_quote or section_id,
+                "last_line": end_quote or start_quote or section_id,
+                "next_heading": "",
+            }
+        ).items():
+            page_regions[p_idx].extend(rects)
+    else:
+        logging.warning(
+            "LLM did not return highlight anchors and no sections were detected. Skipping section-scoped highlighting."
+        )
+
+    if page_regions:
+        for p_idx, regions in page_regions.items():
+            page = doc[p_idx]
+            words_on_page = page.get_text("words")
+
+            for w in words_on_page:
+                x0, y0, x1, y1, word_text, *_ = w
+                rect = fitz.Rect(x0, y0, x1, y1)
+
+                if not any(region.intersects(rect) for region in regions):
+                    continue
+
+                norm = _norm_word(word_text)
+
+                if not norm:
+                    continue
+
+                color = GREEN if word_matches_transcript(word_text) else RED
+
+                annot = page.add_highlight_annot(rect)
+                annot.set_colors(stroke=color)
+                annot.set_opacity(0.3)
+                annot.update()
 
     # Save
     doc.save(output_path)
     doc.close()
     
     return analysis
-
-# --- RETAIN OLD FUNCTION NAME alias for safety if needed, or replace usage ---
-generate_highlighted_pdf = generate_highlighted_pdf_with_llm
-
-
 
 def create_highlighted_docx_from_s3(
     text_s3_url,
@@ -1040,6 +1191,92 @@ def create_highlighted_docx_from_s3(
             os.unlink(docx_in_path)
         if output_path and os.path.exists(output_path) and is_s3_url: # Keep local file if not using S3
             os.unlink(output_path)
+
+def _is_other_speaker(name: Optional[str]) -> bool:
+    if not name:
+        return False
+    return name.strip().lower() in {"other", "other speaker"}
+
+
+def _drop_overlapping_duplicates(segments: List[Dict], min_overlap: float = 0.25) -> List[Dict]:
+    """Remove overlapping diarization segments that are likely duplicates.
+
+    The filter is conservative: it keeps longer, higher-content segments and
+    prefers non-placeholder speakers when two segments substantially overlap or
+    touch with nearly identical text.
+    """
+    if not segments:
+        return []
+
+    cleaned: List[Dict] = []
+
+    def _duration(seg: Dict) -> float:
+        try:
+            return float(seg.get("duration") or (seg.get("end") - seg.get("start")))
+        except Exception:
+            return 0.0
+
+    segments = sorted(
+        segments, key=lambda s: (float(s.get("start", 0.0)), float(s.get("end", 0.0)))
+    )
+
+    for seg in segments:
+        if not cleaned:
+            cleaned.append(seg)
+            continue
+
+        prev = cleaned[-1]
+        try:
+            prev_start = float(prev.get("start"))
+            prev_end = float(prev.get("end"))
+            seg_start = float(seg.get("start"))
+            seg_end = float(seg.get("end"))
+        except Exception:
+            cleaned.append(seg)
+            continue
+
+        overlap_start = max(prev_start, seg_start)
+        overlap_end = min(prev_end, seg_end)
+        overlap = max(0.0, overlap_end - overlap_start)
+
+        # Consider segments that overlap *or* directly touch with near-identical
+        # text as duplicates to avoid repeated rows in downstream reports.
+        touching = 0 <= (seg_start - prev_end) <= 0.25
+        text_similarity = SequenceMatcher(
+            None, (prev.get("text") or "").lower(), (seg.get("text") or "").lower()
+        ).ratio()
+
+        if not touching and overlap < min_overlap and text_similarity < 0.9:
+            cleaned.append(seg)
+            continue
+
+        prev_other = _is_other_speaker(prev.get("speaker") or prev.get("speaker_name"))
+        seg_other = _is_other_speaker(seg.get("speaker") or seg.get("speaker_name"))
+
+        if prev_other and not seg_other:
+            cleaned[-1] = seg
+            continue
+        if seg_other and not prev_other:
+            continue
+
+        prev_dur = _duration(prev)
+        seg_dur = _duration(seg)
+        prev_text = (prev.get("text") or "").strip()
+        seg_text = (seg.get("text") or "").strip()
+
+        if seg_dur > prev_dur or len(seg_text) > len(prev_text):
+            cleaned[-1] = seg
+            continue
+
+        if prev_text and (prev_text == seg_text or text_similarity >= 0.9):
+            prev["end"] = max(prev.get("end", overlap_end), seg.get("end", overlap_end))
+            try:
+                prev["duration"] = round(float(prev["end"]) - float(prev.get("start", 0.0)), 2)
+            except Exception:
+                prev.pop("duration", None)
+
+    return cleaned
+
 
 def diarization_from_audio(audio_url, transcript_segments, transcript_words=None):
     import contextlib
@@ -1331,6 +1568,9 @@ def diarization_from_audio(audio_url, transcript_segments, transcript_words=None
         else:
             segment.setdefault("speaker_name", None)
 
+    # Remove overlapping placeholder segments that duplicate confident speakers.
+    diarization_segments = _drop_overlapping_duplicates(diarization_segments)
+
     # Clean up
     if os.path.exists(wav_path):
         os.unlink(wav_path)
@@ -1383,6 +1623,24 @@ def _format_timestamp(seconds: Optional[float]) -> str:
     if hours:
         return f"{hours:02d}:{minutes:02d}:{secs:02d}"
     return f"{minutes:02d}:{secs:02d}"
+
+
+def _format_time_range(start: Optional[float], end: Optional[float]) -> str:
+    """Combine start and end timestamps into a compact range."""
+
+    start_text = _format_timestamp(start)
+    end_text = _format_timestamp(end)
+
+    if start_text == "-" and end_text == "-":
+        return "-"
+
+    if start_text == "-":
+        return end_text
+
+    if end_text == "-":
+        return start_text
+
+    return f"{start_text} - {end_text}"
 
 # Verification/Acknowledgment phrases (case-insensitive)
 VERIFICATION_PHRASES = {
@@ -1808,8 +2066,22 @@ def _find_best_bucket_match(
             if fuzzy_score > best_score:
                 best_score = fuzzy_score
                 best_bucket_idx = idx
-    
+
     return best_bucket_idx, best_score
+
+
+def _similarity_label(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    if value >= 0.7:
+        return "High"
+    if value >= 0.45:
+        return "Medium"
+    return "Low"
+
+
+def _similarity_legend() -> str:
+    return "Similarity Legend: High (≥0.70) | Medium (0.45–0.69) | Low (<0.45)"
 
 def build_three_part_communication_summary(
     reference_text: Optional[str],
@@ -1827,6 +2099,10 @@ def build_three_part_communication_summary(
     - All segments included (no truncation)
     """
     segments = diarization_segments or []
+
+    # Clean up overlapping placeholder segments before further processing to
+    # keep the 3PC report aligned with the final diarization output.
+    segments = _drop_overlapping_duplicates(segments)
     
     if not segments:
         return []
@@ -1858,9 +2134,133 @@ def build_three_part_communication_summary(
     
     # Create document buckets
     buckets, bucket_embeddings = _create_document_buckets(reference_lines, model)
-    
+
     summary_entries: List[Dict[str, Any]] = []
     used_bucket_indices: Set[int] = set()
+
+    # Cache embeddings for repeated similarity checks between segment texts
+    _text_embedding_cache: Dict[str, Any] = {}
+
+    def _embed_text(text: str):
+        key = (text or "").strip()
+        if not key:
+            return None
+        if key not in _text_embedding_cache:
+            _text_embedding_cache[key] = model.encode(key, convert_to_tensor=True)
+        return _text_embedding_cache[key]
+
+    def _similarity_to_text(text_a: str, text_b: str) -> float:
+        emb_a = _embed_text(text_a)
+        emb_b = _embed_text(text_b)
+        if emb_a is None or emb_b is None:
+            return 0.0
+        try:
+            sim_tensor = util.cos_sim(emb_a, emb_b)
+            return float(sim_tensor.item())
+        except Exception:
+            return 0.0
+
+    def _build_reason(
+        status: str,
+        role: Optional[str],
+        matched_reference: Optional[str],
+        similarity_value: Optional[float],
+        context: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Construct a human-readable reason for the assigned status."""
+
+        context = context or {}
+        anchor_label = context.get("anchor_label")
+        anchor_text = matched_reference or context.get("anchor_text")
+        sim_label = _similarity_label(similarity_value)
+        sim_text = f" ({sim_label} similarity)" if sim_label else ""
+        note = context.get("note")
+
+        if status == "match":
+            if role == "readback":
+                return f"Readback aligns with the {anchor_label or 'statement'}{sim_text}."
+            if role == "confirmation":
+                return "Acknowledgement confirms the prior instruction/readback."
+            if role == "statement" and anchor_text:
+                return f"Statement matches procedure text: \"{anchor_text}\"{sim_text}."
+            if anchor_text:
+                return f"Content matches procedure context{sim_text}."
+            return "Content closely matches the expected text."
+
+        if status == "partial match":
+            if role == "readback":
+                return f"Readback is partially aligned with the {anchor_label or 'statement'}{sim_text}."
+            if anchor_text:
+                return f"Partially matches procedure text{sim_text}."
+            return "Content partially aligns with the expected text."
+
+        if status == "mismatch":
+            if role == "readback":
+                return f"Readback differs from the {anchor_label or 'statement'}{sim_text}."
+            if anchor_text:
+                return f"No close match to procedure text{sim_text}."
+            return "Content does not match the expected text."
+
+        if status == "general conversation":
+            base = "Short/non-procedural remark treated as general conversation."
+            return f"{base} {note}".strip() if note else base
+
+        if status == "acknowledged":
+            return "Verification or acknowledgement phrase confirming prior instruction."
+
+        if anchor_text and similarity_value is not None:
+            return f"Compared against reference text{sim_text}."
+
+        return "Status assigned based on dialogue context."
+
+    def _classify_against_document(spoken: str):
+        best_bucket_idx, best_score = _find_best_bucket_match(
+            spoken, buckets, bucket_embeddings, model
+        )
+
+        matched_reference = None
+        if best_bucket_idx is not None and best_score >= partial_threshold:
+            bucket = buckets[best_bucket_idx]
+            matched_reference = " ".join(bucket["lines"][:2])
+
+        if best_score >= match_threshold:
+            status = "match"
+        elif best_score >= partial_threshold:
+            status = "partial match"
+        else:
+            status = "mismatch"
+
+        return status, matched_reference, best_score, best_bucket_idx
+
+    def _normalize_partial_status(
+        status: str,
+        spoken: str,
+        matched_reference: Optional[str],
+        similarity_value: Optional[float],
+        role: Optional[str] = None,
+    ) -> str:
+        if status != "partial match":
+            return status
+
+        word_count = len(spoken.split())
+        low_confidence = (
+            similarity_value is not None and similarity_value < (partial_threshold + 0.1)
+        )
+        missing_anchor = not matched_reference
+        conversational_length = word_count < 4
+
+        if role == "statement":
+            if missing_anchor and (conversational_length or low_confidence):
+                return "general conversation"
+            return status
+
+        if conversational_length or missing_anchor or low_confidence:
+            return "general conversation"
+
+        return status
+
+    statement_context: Dict[int, Dict[str, Any]] = {}
+    last_statement_idx: Optional[int] = None
     
     # STEP 3: Classify each segment
     for seg_idx, segment in enumerate(segments):
@@ -1884,34 +2284,84 @@ def build_three_part_communication_summary(
             if confirms_idx is not None and confirms_idx < len(segments):
                 confirmed_seg = segments[confirms_idx]
                 reference_content = confirmed_seg.get('text', '')
-            
+
+            status = "acknowledged"
+            similarity_label = _similarity_label(1.0)
+
+            reason = _build_reason(
+                status,
+                "confirmation",
+                reference_content,
+                None,
+                {
+                    "anchor_label": "readback" if reference_content else None,
+                    "anchor_text": reference_content,
+                },
+            )
+
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
                 "end": segment.get("end"),
                 "content": spoken_text,
-                "status": "acknowledged",  # BLUE
+                "status": status,
                 "reference": reference_content,
-                "similarity": 1.0,
+                "similarity": similarity_label,
+                "similarity_label": similarity_label,
+                "similarity_score": 1.0,
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
+                "reason": reason,
             })
             logging.info(f"✓ Added 3PC Confirmation: {speaker} - '{spoken_text}'")
             continue
-        
+
         # PRIORITY 2: 3PC Readback
         if three_pc_role == 'readback':
-            best_bucket_idx, best_score = _find_best_bucket_match(
-                spoken_text, buckets, bucket_embeddings, model
+            linked_statement_idx = None
+            if seg_idx > 0 and segments[seg_idx - 1].get('_3pc_role') == 'statement':
+                linked_statement_idx = seg_idx - 1
+            if linked_statement_idx is None:
+                linked_statement_idx = last_statement_idx
+
+            statement_info = statement_context.get(linked_statement_idx)
+            statement_text = (statement_info or {}).get("text")
+            similarity_to_statement = _similarity_to_text(spoken_text, statement_text) if statement_text else 0.0
+
+            if statement_text:
+                if similarity_to_statement >= match_threshold:
+                    status = "match"
+                elif similarity_to_statement >= partial_threshold:
+                    status = "partial match"
+                else:
+                    status = "mismatch"
+                matched_reference = statement_text
+                similarity_value = similarity_to_statement
+            else:
+                status, matched_reference, similarity_value, best_bucket_idx = _classify_against_document(spoken_text)
+                if best_bucket_idx is not None and status == "match":
+                    used_bucket_indices.add(best_bucket_idx)
+
+            status = _normalize_partial_status(
+                status,
+                spoken_text,
+                matched_reference,
+                similarity_value,
+                role="readback",
             )
-            
-            matched_reference = None
-            if best_bucket_idx is not None and best_score >= partial_threshold:
-                bucket = buckets[best_bucket_idx]
-                matched_reference = " ".join(bucket["lines"][:2])
-                used_bucket_indices.add(best_bucket_idx)
-            
-            status = "match" if best_score >= match_threshold else "partial match"
+
+            reason = _build_reason(
+                status,
+                "readback",
+                matched_reference,
+                similarity_value,
+                {
+                    "anchor_label": "statement" if statement_text else ("procedure" if matched_reference else None),
+                    "anchor_text": statement_text or matched_reference,
+                },
+            )
+
+            similarity_label = _similarity_label(similarity_value)
             
             summary_entries.append({
                 "speaker": speaker,
@@ -1920,14 +2370,26 @@ def build_three_part_communication_summary(
                 "content": spoken_text,
                 "status": status,
                 "reference": matched_reference,
-                "similarity": round(best_score, 2),
+                "similarity": similarity_label,
+                "similarity_label": similarity_label,
+                "similarity_score": round(similarity_value, 2) if similarity_value is not None else None,
                 "three_pc_role": "readback",
                 "communication_type": segment.get("_communication_type"),
+                "reason": reason,
             })
             continue
         
         # PRIORITY 3: Standalone verification (not in 3PC)
         if _is_verification_phrase(spoken_text):
+            reason = _build_reason(
+                "acknowledged",
+                "confirmation",
+                None,
+                1.0,
+                {
+                    "anchor_label": "statement" if last_statement_idx is not None else None,
+                },
+            )
             summary_entries.append({
                 "speaker": speaker,
                 "start": segment.get("start"),
@@ -1936,53 +2398,92 @@ def build_three_part_communication_summary(
                 # Use the same key your color maps know (blue)
                 "status": "acknowledged",
                 "reference": None,
-                "similarity": 1.0,
+                "similarity": _similarity_label(1.0),
+                "similarity_label": _similarity_label(1.0),
+                "similarity_score": 1.0,
                 # Make sure it renders with “(3PC: confirmation)”
                 "three_pc_role": "confirmation",
                 "communication_type": segment.get("_communication_type"),
+                "reason": reason,
             })
             continue
         
         # STEP 4: Standard classification
-        best_bucket_idx, best_score = _find_best_bucket_match(
-            spoken_text, buckets, bucket_embeddings, model
-        )
-        
-        matched_reference = None
-        word_count = len(spoken_text.split())
-        is_short = word_count < 4
-        
-        if not buckets:
-            status = "general conversation" if is_short else "match"
+        status, matched_reference, similarity_value, best_bucket_idx = _classify_against_document(spoken_text)
+
+        downgrade_note = None
+
+        # Statements must align to the procedure text; downgrade short utterances to mismatch
+        if three_pc_role == 'statement':
+            entry_status = status
         else:
-            if best_bucket_idx is not None and best_score >= match_threshold:
-                status = "match"
-                bucket = buckets[best_bucket_idx]
-                matched_reference = " ".join(bucket["lines"][:2])
+            word_count = len(spoken_text.split())
+            is_short = word_count < 4
+            if best_bucket_idx is not None and status == "match":
                 used_bucket_indices.add(best_bucket_idx)
-            elif is_short:
-                status = "general conversation"
-            elif best_score >= partial_threshold:
-                status = "partial match"
-                if best_bucket_idx is not None:
-                    bucket = buckets[best_bucket_idx]
-                    matched_reference = " ".join(bucket["lines"][:2])
+            if not buckets:
+                entry_status = "general conversation" if is_short else status
             else:
-                status = "mismatch"
-        
+                if status == "mismatch" and is_short:
+                    entry_status = "general conversation"
+                else:
+                    entry_status = status
+
+        # Outside explicit 3PC exchanges, avoid over-confident matches that look conversational
+        if (
+            entry_status == "match"
+            and three_pc_role is None
+            and segment.get("_communication_type") is None
+        ):
+            similarity_label = _similarity_label(similarity_value)
+            if similarity_label in {"Medium", "Low"}:
+                if word_count <= 12 or not matched_reference:
+                    entry_status = "general conversation"
+                    downgrade_note = "Downgraded from match due to conversational context (medium/low similarity)."
+
+        similarity_label = _similarity_label(similarity_value)
+        entry_status = _normalize_partial_status(
+            entry_status,
+            spoken_text,
+            matched_reference,
+            similarity_value,
+            role=three_pc_role,
+        )
+
+        reason = _build_reason(
+            entry_status,
+            three_pc_role,
+            matched_reference,
+            similarity_value,
+            {
+                "anchor_label": "procedure" if matched_reference else None,
+                "anchor_text": matched_reference,
+                "note": downgrade_note,
+            },
+        )
+
         entry = {
             "speaker": speaker,
             "start": segment.get("start"),
             "end": segment.get("end"),
             "content": spoken_text,
-            "status": status,
+            "status": entry_status,
             "reference": matched_reference,
-            "similarity": round(best_score, 2),
+            "similarity": similarity_label,
+            "similarity_label": similarity_label,
+            "similarity_score": round(similarity_value, 2) if similarity_value is not None else None,
+            "reason": reason,
         }
 
         if three_pc_role == 'statement':
             entry["three_pc_role"] = "statement"
             entry["communication_type"] = segment.get("_communication_type")
+            statement_context[seg_idx] = {
+                "text": spoken_text,
+                "reference": matched_reference,
+                "similarity": similarity_value,
+            }
+            last_statement_idx = seg_idx
 
         summary_entries.append(entry)
     
@@ -2019,9 +2520,11 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
         margin = 36
         title_font_size = 16
         body_font_size = 10
+        compact_font_size = 9
         row_padding = 4
-        content_width_ratio = [0.15, 0.1, 0.1, 0.45, 0.2]
-        headers = ["Speaker", "Start", "End", "Content", "Status"]
+        content_width_ratio = [0.16, 0.18, 0.32, 0.14, 0.2]
+        headers = ["Speaker", "Time", "Content", "Status", "Reason"]
+        column_font_sizes = [body_font_size, compact_font_size, body_font_size, body_font_size, compact_font_size]
         
         status_colors = {
             "match": (0, 0.5, 0),
@@ -2044,7 +2547,16 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     fontsize=title_font_size,
                     fontname="helv",
                 )
-                y_pos += title_font_size + 8
+                y_pos += title_font_size + 4
+
+                legend_text = _similarity_legend()
+                page.insert_text(
+                    (margin, y_pos),
+                    legend_text,
+                    fontsize=compact_font_size,
+                    fontname="helv",
+                )
+                y_pos += compact_font_size + 8
 
                 content_width = width - 2 * margin
                 x = margin
@@ -2063,10 +2575,10 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             
             return page, y_pos, height
 
-        def _wrap_cell(text: str, max_width: float) -> List[str]:
+        def _wrap_cell(text: str, max_width: float, font_size: int) -> List[str]:
             if not text:
                 return [""]
-            approx_char_width = max(int(max_width / (body_font_size * 0.6)), 1)
+            approx_char_width = max(int(max_width / (font_size * 0.6)), 1)
             return textwrap.wrap(text, width=approx_char_width) or [""]
 
         def _draw_row(page, y_pos, page_height, values: List[str]):
@@ -2078,13 +2590,13 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
             # Calculate row height
             columns = []
             max_lines = 1
-            for value, ratio in zip(values, content_width_ratio):
+            for value, ratio, font_size in zip(values, content_width_ratio, column_font_sizes):
                 col_width = content_width * ratio
-                lines = _wrap_cell(value, col_width - (2 * row_padding))
-                columns.append((col_width, lines))
+                lines = _wrap_cell(value, col_width - (2 * row_padding), font_size)
+                columns.append((col_width, lines, font_size))
                 max_lines = max(max_lines, len(lines))
 
-            row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+            row_height = max_lines * (max(column_font_sizes) + 2) + (2 * row_padding)
 
             # CHECK: Do we need a new page?
             if y_pos + row_height > available_height:
@@ -2095,22 +2607,22 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 # Recalculate columns for new page
                 columns = []
                 max_lines = 1
-                for value, ratio in zip(values, content_width_ratio):
+                for value, ratio, font_size in zip(values, content_width_ratio, column_font_sizes):
                     col_width = content_width * ratio
-                    lines = _wrap_cell(value, col_width - (2 * row_padding))
-                    columns.append((col_width, lines))
+                    lines = _wrap_cell(value, col_width - (2 * row_padding), font_size)
+                    columns.append((col_width, lines, font_size))
                     max_lines = max(max_lines, len(lines))
-                row_height = max_lines * (body_font_size + 2) + (2 * row_padding)
+                row_height = max_lines * (max(column_font_sizes) + 2) + (2 * row_padding)
 
             # Draw the row
             x = margin
-            for idx, (col_width, lines) in enumerate(columns):
+            for idx, (col_width, lines, font_size) in enumerate(columns):
                 rect = fitz.Rect(x, y_pos, x + col_width, y_pos + row_height)
                 page.draw_rect(rect, color=(0.7, 0.7, 0.7))
 
-                text_y = y_pos + row_padding + body_font_size
+                text_y = y_pos + row_padding + font_size
                 color = (0, 0, 0)
-                
+
                 if headers[idx] == "Status":
                     status_key = values[idx].strip().lower()
                     base_status = status_key.split('(')[0].strip()
@@ -2120,11 +2632,11 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                     page.insert_text(
                         (x + row_padding, text_y),
                         line,
-                        fontsize=body_font_size,
+                        fontsize=font_size,
                         fontname="helv",
                         fill=color,
                     )
-                    text_y += body_font_size + 2
+                    text_y += font_size + 2
                 
                 x += col_width
 
@@ -2147,13 +2659,13 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
                 if entry.get("three_pc_role"):
                     role = entry["three_pc_role"]
                     status_text += f" (3PC: {role})"
-                
+
                 row_values = [
                     entry.get("speaker") or "Unknown",
-                    _format_timestamp(entry.get("start")),
-                    _format_timestamp(entry.get("end")),
+                    _format_time_range(entry.get("start"), entry.get("end")),
                     entry.get("content") or "",
                     status_text,
+                    entry.get("reason") or "-",
                 ]
                 
                 page, y_cursor, page_height = _draw_row(page, y_cursor, page_height, row_values)
@@ -2180,24 +2692,32 @@ def append_three_pc_summary_to_pdf(pdf_path: str, entries: Optional[List[Dict]])
 def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]]) -> None:
     """Append 3PC summary to DOCX with proper colors."""
     import docx
-    from docx.shared import RGBColor
+    from docx.shared import RGBColor, Pt, Inches
     
     document = docx.Document(docx_path)
     document.add_page_break()
     document.add_heading("Three-Part Communication (3PC) Summary", level=1)
+
+    legend_para = document.add_paragraph(_similarity_legend())
+    for run in legend_para.runs:
+        run.font.size = Pt(9)
+    legend_para.paragraph_format.space_after = Pt(6)
 
     if not entries:
         document.add_paragraph("No speaker diarization data available.")
         document.save(docx_path)
         return
 
-    headers = ["Speaker", "Start", "End", "Content", "Status"]
+    headers = ["Speaker", "Time", "Content", "Status", "Reason"]
     table = document.add_table(rows=1, cols=len(headers))
     try:
         table.style = "Light Grid Accent 1"
     except KeyError:
         table.style = "Light Grid"
-    
+
+    table.autofit = False
+    column_widths = [Inches(1.2), Inches(1.4), Inches(3.0), Inches(1.2), Inches(1.6)]
+
     for cell, title in zip(table.rows[0].cells, headers):
         cell.text = title
 
@@ -2209,22 +2729,31 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
         "mismatch": RGBColor(192, 0, 0),
     }
 
+    for col, width in zip(table.columns, column_widths):
+        for cell in col.cells:
+            cell.width = width
+
     for entry in entries:
         row = table.add_row()
         cells = row.cells
-        
+
         values = [
             entry.get("speaker") or "Unknown",
-            _format_timestamp(entry.get("start")),
-            _format_timestamp(entry.get("end")),
+            _format_time_range(entry.get("start"), entry.get("end")),
             entry.get("content") or "",
         ]
 
         for idx, value in enumerate(values):
             cells[idx].text = value
+            cells[idx].width = column_widths[idx]
+            if headers[idx] in {"Time"}:
+                for paragraph in cells[idx].paragraphs:
+                    for run in paragraph.runs:
+                        run.font.size = Pt(9)
 
         status = (entry.get("status") or "").lower()
-        status_cell = cells[len(headers) - 1]
+        status_cell = cells[len(headers) - 2]
+        status_cell.width = column_widths[len(headers) - 2]
         
         status_text = status.capitalize() if status else "-"
         if entry.get("three_pc_role"):
@@ -2232,11 +2761,18 @@ def append_three_pc_summary_to_docx(docx_path: str, entries: Optional[List[Dict]
             status_text += f" (3PC: {role})"
         
         status_cell.text = status_text
-        
+
         if status in status_colors:
             for paragraph in status_cell.paragraphs:
                 for run in paragraph.runs:
                     run.font.color.rgb = status_colors[status]
+
+        reason_cell = cells[len(headers) - 1]
+        reason_cell.width = column_widths[len(headers) - 1]
+        reason_cell.text = entry.get("reason") or "-"
+        for paragraph in reason_cell.paragraphs:
+            for run in paragraph.runs:
+                run.font.size = Pt(9)
 
     document.save(docx_path)
     logging.info(f"✓ 3PC DOCX saved: {len(entries)} entries")

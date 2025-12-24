@@ -1,7 +1,8 @@
 import os
 import json
 import logging
-from typing import Any, Dict
+import re
+from typing import Any, Dict, List, Tuple
 
 import requests
 from peercheck import settings as project_settings
@@ -9,59 +10,33 @@ from peercheck import settings as project_settings
 logger = logging.getLogger(__name__)
 
 
-def analyze_3pc_with_openai(transcript_text: str, procedure_text: str) -> Dict[str, Any]:
-    """
-    Analyze the transcript and procedure text using **Ollama with Llama 3.1**.
-
-    NO OpenAI cloud is used here. We call your local Ollama server at:
-      - LOCAL_LLM_BASE_URL (e.g. http://202.65.155.124:11434)
-
-    Uses Ollama's native `/api/chat` endpoint (not OpenAI-compatible).
-    On any connection/timeout error we log and return an empty analysis so the rest of
-    the pipeline can continue without crashing.
-    """
-    base_url = getattr(project_settings, "LOCAL_LLM_BASE_URL", "").rstrip("/")
-    model_name = getattr(
-        project_settings,
-        "LOCAL_LLM_MODEL",
-        "qwen2.5:latest",
-    )
-    api_key = getattr(project_settings, "LOCAL_LLM_API_KEY", "") or ""
-
-    # Ollama uses /api/chat endpoint, not /chat/completions
-    endpoint = f"{base_url}/api/chat"
-
-    logger.info(
-        "Connecting to Ollama at: %s (Model: %s)",
-        base_url,
-        model_name,
-    )
-
+def _build_prompts(transcript_text: str, procedure_text: str) -> Tuple[str, str]:
     system_prompt = """You are an expert industrial procedure auditor. Analyze the transcript and procedure document.
 
             CRITICAL: The highlight_start_quote and highlight_end_quote MUST be EXACT TEXT from the PROCEDURE DOCUMENT, NOT from the transcript!
 
             OBJECTIVES:
-            1. Find which section number (like "8.4") is being discussed in the transcript
-            2. Locate that section in the PROCEDURE DOCUMENT 
-            3. Copy the EXACT FIRST LINE of that section from the PROCEDURE DOCUMENT as highlight_start_quote
-            4. Copy the EXACT LAST LINE of that section from the PROCEDURE DOCUMENT as highlight_end_quote
-            5. Analyze 3PC (Statement/Readback/Acknowledgement) patterns
+            1. Identify which REAL section number from the procedure is being discussed in the transcript.
+            2. Locate that section in the PROCEDURE DOCUMENT.
+            3. Copy the EXACT FIRST LINE of that section from the PROCEDURE DOCUMENT as highlight_start_quote.
+            4. Copy the EXACT LAST LINE of that section from the PROCEDURE DOCUMENT as highlight_end_quote.
+            5. Analyze 3PC (Statement/Readback/Acknowledgement) patterns.
 
             IMPORTANT RULES:
             - highlight_start_quote = First line/sentence of the section FROM THE PROCEDURE DOCUMENT
             - highlight_end_quote = Last line/sentence of the section FROM THE PROCEDURE DOCUMENT
             - DO NOT use transcript text for quotes! Only procedure document text!
-            - Example: If section 8.4 starts with "ENSURE AL-V010 is open" and ends with "Record stroke time in data sheet", use those exact texts.
+            - Numbers in this prompt are EXAMPLES ONLY. Return the ACTUAL section number from the procedure that best matches the transcript context, never an example unless it truly exists in the document.
+            - If multiple sections are mentioned, pick the one whose wording best aligns with the transcript. Never default to a placeholder section number.
 
             3PC Classification:
             - "Match": Statement in procedure + Readback matches + Acknowledgement present
-            - "Partial Match": Statement in procedure + Readback does NOT match exactly  
+            - "Partial Match": Statement in procedure + Readback does NOT match exactly
             - "Mismatch": Statement NOT in procedure document
 
             Return ONLY valid JSON:
             {
-            "relevant_section_number": "8.4",
+            "relevant_section_number": "<actual section number from procedure>",
             "highlight_start_quote": "EXACT first line FROM PROCEDURE DOCUMENT",
             "highlight_end_quote": "EXACT last line FROM PROCEDURE DOCUMENT",
             "interactions": [
@@ -80,9 +55,9 @@ def analyze_3pc_with_openai(transcript_text: str, procedure_text: str) -> Dict[s
 
             TASK: Return a JSON object with this exact structure (fill in all fields with actual values, not null or empty):
 
-            Example:
+            Example (numbers shown here are placeholders—return the actual section number from the procedure that fits the transcript context):
             {{
-            "relevant_section_number": "8.4",
+            "relevant_section_number": "<matching section number>",
             "highlight_start_quote": "Exact first sentence or line from the section",
             "highlight_end_quote": "Exact last sentence or line from the section",
             "interactions": [
@@ -96,14 +71,109 @@ def analyze_3pc_with_openai(transcript_text: str, procedure_text: str) -> Dict[s
             }}
 
             INSTRUCTIONS:
-            1. Search the transcript for section numbers (like "8.4", "7.0", "3.1")
-            2. Find that section in the procedure document
-            3. Copy the EXACT first line/sentence as highlight_start_quote
-            4. Copy the EXACT last line/sentence as highlight_end_quote
-            5. List any Statement/Readback/Acknowledgement patterns from the transcript
+            1. Search the transcript for section numbers that appear in the procedure document. Never assume an example number.
+            2. Find that section in the procedure document (or pick the best matching section by wording when no explicit number is spoken).
+            3. Copy the EXACT first line/sentence as highlight_start_quote.
+            4. Copy the EXACT last line/sentence as highlight_end_quote.
+            5. List any Statement/Readback/Acknowledgement patterns from the transcript.
+            6. If no section number is spoken, infer the best-fitting section from context—do not output placeholder example numbers.
 
             Return your JSON analysis now:
         """
+
+    return system_prompt, user_prompt
+
+
+def _extract_section_positions(procedure_text: str) -> List[Tuple[str, int]]:
+    """Return a sorted list of (section_number, start_index) pairs found in the procedure text."""
+
+    section_matches = re.finditer(r"(?m)^(?P<num>\d+(?:\.\d+)*)(?:\s|[-:])", procedure_text)
+    sections: List[Tuple[str, int]] = []
+    for match in section_matches:
+        sections.append((match.group("num"), match.start()))
+    return sorted(sections, key=lambda item: item[1])
+
+
+def _find_section_for_quote(procedure_text: str, quote: str, sections: List[Tuple[str, int]]) -> str:
+    """Locate the section heading nearest to where a quote appears in the procedure text."""
+
+    if not quote:
+        return ""
+
+    idx = procedure_text.lower().find(quote.lower())
+    if idx == -1 or not sections:
+        return ""
+
+    prior_sections = [sec for sec in sections if sec[1] <= idx]
+    if prior_sections:
+        return prior_sections[-1][0]
+
+    # If quote occurs before the first heading, pick the earliest section number
+    return sections[0][0] if sections else ""
+
+
+def _ensure_real_section_number(parsed: Dict[str, Any], procedure_text: str) -> Dict[str, Any]:
+    """
+    Avoid placeholder section numbers (e.g., example values from prompts) by validating against
+    headings found in the procedure document or inferring from the quote locations.
+    """
+
+    sections = _extract_section_positions(procedure_text)
+    provided = (parsed.get("relevant_section_number") or "").strip()
+
+    # Prefer a section that actually exists in the procedure document
+    for num, _pos in sections:
+        if provided and (num == provided or provided.startswith(num) or num.startswith(provided)):
+            parsed["relevant_section_number"] = num
+            return parsed
+
+    # Try to infer section by locating the start/end quotes inside the procedure text
+    inferred = _find_section_for_quote(procedure_text, parsed.get("highlight_start_quote", ""), sections)
+    if not inferred:
+        inferred = _find_section_for_quote(procedure_text, parsed.get("highlight_end_quote", ""), sections)
+
+    if inferred:
+        parsed["relevant_section_number"] = inferred
+    elif not provided:
+        # If nothing is provided and we have only one candidate, use it instead of placeholders
+        parsed["relevant_section_number"] = sections[0][0] if len(sections) == 1 else ""
+    else:
+        # Retain the provided value for logging even if it was a placeholder
+        parsed["relevant_section_number"] = provided
+
+    return parsed
+
+
+def analyze_3pc_with_ollama(transcript_text: str, procedure_text: str) -> Dict[str, Any]:
+    """
+    Analyze the transcript and procedure text using a local Ollama-compatible model.
+
+    NO OpenAI cloud is used here. We call your local Ollama server at:
+      - LOCAL_LLM_BASE_URL (e.g. http://202.65.155.124:11434)
+
+    Uses Ollama's native `/api/chat` endpoint (not OpenAI-compatible).
+    On any connection/timeout error we log and return an empty analysis so the rest of
+    the pipeline can continue without crashing.
+    """
+    base_url = (
+        getattr(project_settings, "LOCAL_LLM_BASE_URL", "")
+        or getattr(project_settings, "LOCAL_LLM_API_BASE", "")
+        or getattr(project_settings, "OLLAMA_API_BASE", "")
+        or ""
+    ).rstrip("/")
+    model_name = getattr(project_settings, "LOCAL_LLM_MODEL", "qwen2.5:latest")
+    api_key = getattr(project_settings, "LOCAL_LLM_API_KEY", "") or ""
+
+    # Ollama uses /api/chat endpoint, not /chat/completions
+    endpoint = f"{base_url}/api/chat"
+
+    logger.info(
+        "Connecting to Ollama at: %s (Model: %s)",
+        base_url,
+        model_name,
+    )
+
+    system_prompt, user_prompt = _build_prompts(transcript_text, procedure_text)
 
     logger.info("--- LOCAL LLM REQUEST START ---")
     logger.info(f"System Prompt: {system_prompt}")
@@ -143,23 +213,23 @@ def analyze_3pc_with_openai(transcript_text: str, procedure_text: str) -> Dict[s
         logger.info(f"Payload: {json.dumps(payload_log, indent=2)}")
 
         resp = requests.post(endpoint, json=payload, headers=headers, timeout=120)
-        
+
         # Log response status and headers
         logger.info("--- OLLAMA RESPONSE STATUS ---")
         logger.info(f"Status Code: {resp.status_code}")
         logger.info(f"Response Headers: {dict(resp.headers)}")
-        
+
         resp.raise_for_status()
 
         data = resp.json()
-        
+
         # Log the FULL response from Ollama
         logger.info("--- FULL OLLAMA RESPONSE ---")
         logger.info(json.dumps(data, indent=2))
-        
+
         # Ollama response format: {"message": {"role": "assistant", "content": "..."}, "done": true}
         content = data.get("message", {}).get("content", "")
-        
+
         # Check if content is empty
         if not content or not content.strip():
             logger.warning("Ollama returned empty or whitespace-only content!")
@@ -191,6 +261,8 @@ def analyze_3pc_with_openai(transcript_text: str, procedure_text: str) -> Dict[s
             parsed.setdefault("highlight_end_quote", "")
             parsed.setdefault("interactions", [])
 
+            parsed = _ensure_real_section_number(parsed, procedure_text)
+
             # Log the final keys for debugging
             logger.info("Final parsed keys: %s", list(parsed.keys()))
             logger.info("--- LOCAL LLM RESPONSE END ---")
@@ -204,3 +276,108 @@ def analyze_3pc_with_openai(transcript_text: str, procedure_text: str) -> Dict[s
         logger.error("Local LLM Analysis Failed (network/timeout): %s", e)
         # Fail soft: let the rest of the pipeline continue without LLM-driven sectioning
         return {}
+
+
+def analyze_3pc_with_openai_api(transcript_text: str, procedure_text: str) -> Dict[str, Any]:
+    """Analyze 3PC using an OpenAI-compatible endpoint."""
+
+    api_key = getattr(project_settings, "OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
+    base_url = getattr(project_settings, "OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+    model_name = getattr(project_settings, "OPENAI_MODEL", "gpt-4.1")
+
+    if not api_key:
+        logger.warning("OpenAI API key not configured; skipping OpenAI 3PC analysis")
+        return {}
+
+    endpoint = f"{base_url}/chat/completions"
+    system_prompt, user_prompt = _build_prompts(transcript_text, procedure_text)
+
+    payload = {
+        "model": model_name,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "temperature": 0.2,
+        "response_format": {"type": "json_object"},
+    }
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        logger.info("--- OPENAI REQUEST START ---")
+        logger.info(f"Endpoint: {endpoint}")
+        logger.info(f"Model: {model_name}")
+        logger.info(f"System Prompt: {system_prompt}")
+        logger.info(f"User Prompt (first 500 chars): {user_prompt[:500]}...")
+        logger.info("--- OPENAI REQUEST END ---")
+
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=120)
+        resp.raise_for_status()
+
+        data = resp.json()
+        logger.info("--- OPENAI RAW RESPONSE ---")
+        logger.info(json.dumps(data, indent=2))
+
+        content = (
+            (data.get("choices") or [{}])[0]
+            .get("message", {})
+            .get("content", "")
+        )
+
+        if not content:
+            logger.warning("OpenAI returned empty content for 3PC analysis")
+            return {}
+
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            logger.error("OpenAI response was not valid JSON: %s", content[:500])
+            return {}
+
+        if "section_number" in parsed and "relevant_section_number" not in parsed:
+            parsed["relevant_section_number"] = parsed.pop("section_number")
+            logger.info("Normalised field: section_number -> relevant_section_number")
+
+        if "3PC_interactions" in parsed and "interactions" not in parsed:
+            parsed["interactions"] = parsed.pop("3PC_interactions")
+            logger.info("Normalised field: 3PC_interactions -> interactions")
+
+        parsed.setdefault("relevant_section_number", "")
+        parsed.setdefault("highlight_start_quote", "")
+        parsed.setdefault("highlight_end_quote", "")
+        parsed.setdefault("interactions", [])
+
+        parsed = _ensure_real_section_number(parsed, procedure_text)
+
+        return parsed
+    except requests.RequestException as exc:
+        logger.error("OpenAI Analysis Failed: %s", exc)
+        return {}
+
+
+def analyze_3pc(transcript_text: str, procedure_text: str, provider: str = "ollama") -> Dict[str, Any]:
+    """Dispatch 3PC analysis to the selected provider."""
+
+    provider_normalized = (provider or "ollama").lower()
+    if provider_normalized == "openai":
+        return analyze_3pc_with_openai_api(transcript_text, procedure_text)
+
+    # Default to Ollama/local provider
+    return analyze_3pc_with_ollama(transcript_text, procedure_text)
+
+
+def analyze_3pc_with_openai(transcript_text: str, procedure_text: str, provider: str = None) -> Dict[str, Any]:
+    """
+    Backwards-compatible wrapper that now dispatches based on provider.
+    Defaults to the local/Ollama pipeline.
+    """
+
+    return analyze_3pc(
+        transcript_text,
+        procedure_text,
+        provider=provider or "ollama",
+    )
