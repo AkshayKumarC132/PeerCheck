@@ -92,12 +92,13 @@ def analyze_3pc_with_ollama(transcript_text: str, procedure_text: str) -> Dict[s
     On any connection/timeout error we log and return an empty analysis so the rest of
     the pipeline can continue without crashing.
     """
-    base_url = getattr(project_settings, "LOCAL_LLM_BASE_URL", "").rstrip("/")
-    model_name = getattr(
-        project_settings,
-        "LOCAL_LLM_MODEL",
-        "qwen2.5:latest",
-    )
+    base_url = (
+        getattr(project_settings, "LOCAL_LLM_BASE_URL", "")
+        or getattr(project_settings, "LOCAL_LLM_API_BASE", "")
+        or getattr(project_settings, "OLLAMA_API_BASE", "")
+        or ""
+    ).rstrip("/")
+    model_name = getattr(project_settings, "LOCAL_LLM_MODEL", "qwen2.5:latest")
     api_key = getattr(project_settings, "LOCAL_LLM_API_KEY", "") or ""
 
     # Ollama uses /api/chat endpoint, not /chat/completions
@@ -217,7 +218,7 @@ def analyze_3pc_with_openai_api(transcript_text: str, procedure_text: str) -> Di
 
     api_key = getattr(project_settings, "OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
     base_url = getattr(project_settings, "OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
-    model_name = getattr(project_settings, "OPENAI_MODEL", "gpt-4o-mini")
+    model_name = getattr(project_settings, "OPENAI_MODEL", "gpt-4.1")
 
     if not api_key:
         logger.warning("OpenAI API key not configured; skipping OpenAI 3PC analysis")
