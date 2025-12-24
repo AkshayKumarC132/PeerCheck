@@ -239,14 +239,29 @@ ALLOWED_AUDIO_EXTENSIONS = {'mp3', 'wav', 'm4a', 'mpeg', 'mp4'}
 # Hugging Face Token
 HF_TOKEN =''
 
-CELERY_BROKER_URL = 'redis://localhost:6379/0'
-CELERY_RESULT_BACKEND = 'redis://localhost:6379/0'
-CELERY_BEAT_SCHEDULE = {
-    'process-missing-diarizations-every-15-mins': {
-        'task': 'api.tasks.process_missing_diarizations',
-        'schedule': 900,  # 900 seconds = 15 minutes
-    },
-}
+# DGX / GPU Settings
+USE_DGX = os.getenv("USE_DGX", "False").lower() == "true"
+OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
+
+# Local LLM Configuration (Llama 3.1 on DGX or similar)
+# Prefer LOCAL_LLM_BASE_URL as per implementation_plan.md, but fall back to legacy env var.
+LOCAL_LLM_BASE_URL = os.getenv(
+    "LOCAL_LLM_BASE_URL",
+    os.getenv("LOCAL_LLM_API_BASE", "https://ollama.com/"),
+)
+
+# Backwards-compat alias for any existing references
+LOCAL_LLM_API_BASE = LOCAL_LLM_BASE_URL
+
+LOCAL_LLM_API_KEY = os.getenv(
+    "LOCAL_LLM_API_KEY",
+    "",  # Often "EMPTY" for local non-gated models
+)
+LOCAL_LLM_MODEL = os.getenv(
+    "LOCAL_LLM_MODEL",
+    "gpt-oss:120b",  # Or "llama3.1" depending on server
+)
+
 
 if DATABASES['default']['ENGINE'] == 'django.db.backends.sqlite3':
     RAGITIFY_BASE_URL = os.getenv("RAGITIFY_BASE_URL", "http://localhost:5000/").rstrip("/")

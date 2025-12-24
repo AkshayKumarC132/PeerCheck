@@ -733,8 +733,7 @@ def create_highlighted_pdf_document(
     three_pc_entries: Optional[List[Dict]] = None,
 ):
     """
-    Orchestrates the generation of a highlighted PDF using the new logic and optionally
-    appends Three-Part Communication (3PC) summary pages.
+    Orchestrates the generation of a highlighted PDF using LLM analysis.
     """
     output_filename = f"processed/{uuid.uuid4()}_highlighted_report.pdf"
 
@@ -747,15 +746,34 @@ def create_highlighted_pdf_document(
         with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_file:
             temp_output_path = temp_file.name
 
-        generate_highlighted_pdf(
+        # generate_highlighted_pdf(
+        #     temp_input_path,
+        #     transcript,
+        #     temp_output_path,
+        #     require_transcript_match=require_transcript_match,
+        # )
+
+        # if three_pc_entries is not None:
+        #     append_three_pc_summary_to_pdf(temp_output_path, three_pc_entries)
+
+        # --- KEY CHANGE: LLM does the analysis inside generate_highlighted_pdf ---
+        # It returns the structured analysis (including interactions)
+        llm_analysis = generate_highlighted_pdf_with_llm(
             temp_input_path,
             transcript,
-            temp_output_path,
-            require_transcript_match=require_transcript_match,
+            temp_output_path
         )
 
-        if three_pc_entries is not None:
-            append_three_pc_summary_to_pdf(temp_output_path, three_pc_entries)
+        # Use LLM-detected interactions if available, otherwise fallback (or empty)
+        interactions = llm_analysis.get("interactions", []) if llm_analysis else []
+        
+        # If user explicitly passed entries (rare now), use them, else use LLM's
+        final_entries = three_pc_entries if three_pc_entries else interactions
+
+        if final_entries:
+            # Map LLM "interactions" to the format expected by summary table if needed
+            # The LLM output keys (speaker, text, role, status) match our needs
+            append_three_pc_summary_to_pdf(temp_output_path, final_entries)
 
         with open(temp_output_path, 'rb') as f_out:
             output_s3_url = upload_file_to_s3(f_out, output_filename)
@@ -771,6 +789,182 @@ def create_highlighted_pdf_document(
                     os.unlink(path)
             except PermissionError:
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
+
+def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path):
+    """
+    Use the Local LLM to analyze the transcript + document and:
+      1. Identify the relevant section (e.g., \"8.4\") and its start/end quotes.
+      2. Within that *Active Region* only, apply word-level Green/Red highlighting:
+         - Green: word appears in the transcript (spoken).
+         - Red:   word does not appear in the transcript (missed/skipped).
+      3. Leave all text outside the Active Region uncolored.
+    """
+    from .llm_service import analyze_3pc_with_openai
+    import fitz
+
+    # 1. Load PDF and Extract Text
+    try:
+        doc = fitz.open(doc_path)
+    except Exception as e:
+        raise ValueError(f"Failed to open PDF: {e}")
+
+    full_pdf_text = ""
+    for page in doc:
+        full_pdf_text += page.get_text()
+
+    # 2. Analyze with Local LLM
+    logging.info("Sending Transcript + Procedure to Local LLM for analysis (3PC + section detection)...")
+    analysis = analyze_3pc_with_openai(transcript_text, full_pdf_text)
+    
+    start_quote = (analysis.get("highlight_start_quote") or "").strip()
+    end_quote = (analysis.get("highlight_end_quote") or "").strip()
+    section_id = analysis.get("relevant_section_number", "Unknown")
+
+    logging.info("LLM identified Section %s", section_id)
+    logging.info("Highlighting region from '%s' to '%s'", start_quote, end_quote)
+
+    # Pre-compute normalized transcript word set for Green/Red logic
+    def _norm_word(w: str) -> str:
+        return re.sub(r"[^A-Za-z0-9]", "", w).lower()
+
+    transcript_word_set = {
+        _norm_word(w) for w in transcript_text.split() if _norm_word(w)
+    }
+
+    # 3. Define Active Region using start/end quotes
+    if start_quote and end_quote:
+        start_loc = None
+        end_loc = None
+        
+        for p_idx, page in enumerate(doc):
+            s_hits = page.search_for(start_quote)
+            if s_hits and not start_loc:
+                # First occurrence of start quote
+                start_loc = (p_idx, s_hits[0])
+            e_hits = page.search_for(end_quote)
+            if e_hits:
+                # Use the last occurrence of end quote on the farthest page we see it
+                end_loc = (p_idx, e_hits[-1])
+        
+        if start_loc and end_loc:
+            start_page, start_rect = start_loc
+            end_page, end_rect = end_loc
+
+            GREEN = (0.6, 1.0, 0.6)
+            RED = (1.0, 0.6, 0.6)
+
+            # --- LOAD ACRONYM MAPPINGS ---
+            # Maps acronym (uppercase) -> list of spoken words (lowercase)
+            # e.g., "AL" -> ["alpha", "lima"]
+            acronym_to_spoken = {}
+            try:
+                import csv
+                csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        abbr = row.get("Abbreviation", "").strip().upper()
+                        meaning = row.get("Meaning", "").strip()
+                        if abbr and meaning:
+                            # Convert meaning to individual words (lowercase)
+                            spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
+                            if spoken_words:
+                                acronym_to_spoken[abbr] = spoken_words
+                logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
+            except Exception as e:
+                logging.warning(f"Could not load Acronyms1.csv: {e}")
+
+            def word_matches_transcript(pdf_word: str) -> bool:
+                """
+                Returns True if the PDF word appears in the transcript OR
+                if any word from the acronym's expansion appears in transcript.
+                """
+                norm = _norm_word(pdf_word)
+                if not norm:
+                    return False
+                
+                # Direct match
+                if norm in transcript_word_set:
+                    return True
+                
+                # Acronym expansion match
+                # Check if the PDF word (uppercase) is an acronym
+                upper_word = pdf_word.strip().upper()
+                if upper_word in acronym_to_spoken:
+                    # Check if ANY of the spoken expansion words appear in transcript
+                    spoken_words = acronym_to_spoken[upper_word]
+                    for spoken_w in spoken_words:
+                        if spoken_w in transcript_word_set:
+                            return True
+                
+                return False
+
+            for p_idx in range(start_page, end_page + 1):
+                page = doc[p_idx]
+                page_rect = page.rect
+
+                # Compute the Active Region rectangle for this page
+                if start_page == end_page:
+                    # Start & end on the same page: bound vertically between them
+                    active_rect = fitz.Rect(
+                        page_rect.x0,
+                        start_rect.y0,
+                        page_rect.x1,
+                        end_rect.y1,
+                    )
+                elif p_idx == start_page:
+                    active_rect = fitz.Rect(
+                        page_rect.x0,
+                        start_rect.y0,
+                        page_rect.x1,
+                        page_rect.y1,
+                    )
+                elif p_idx == end_page:
+                    active_rect = fitz.Rect(
+                        page_rect.x0,
+                        page_rect.y0,
+                        page_rect.x1,
+                        end_rect.y1,
+                    )
+                else:
+                    # Intermediate page: full page is inside the section
+                    active_rect = page_rect
+
+                # 4. Word-level highlighting inside Active Region only
+                words_on_page = page.get_text("words")
+                for w in words_on_page:
+                    x0, y0, x1, y1, word_text, *_ = w
+                    rect = fitz.Rect(x0, y0, x1, y1)
+
+                    # Skip words outside the Active Region
+                    if not active_rect.intersects(rect):
+                        continue
+
+                    norm = _norm_word(word_text)
+                    if not norm:
+                        continue
+
+                    # Use acronym-aware matching
+                    color = GREEN if word_matches_transcript(word_text) else RED
+
+                    annot = page.add_highlight_annot(rect)
+                    annot.set_colors(stroke=color)
+                    annot.set_opacity(0.3)
+                    annot.update()
+        else:
+            logging.warning(
+                "LLM did not return both start and end quotes. Skipping section-scoped highlighting."
+            )
+
+    # Save
+    doc.save(output_path)
+    doc.close()
+    
+    return analysis
+
+# --- RETAIN OLD FUNCTION NAME alias for safety if needed, or replace usage ---
+generate_highlighted_pdf = generate_highlighted_pdf_with_llm
+
 
 
 def create_highlighted_docx_from_s3(
@@ -1192,18 +1386,17 @@ def _format_timestamp(seconds: Optional[float]) -> str:
 
 # Verification/Acknowledgment phrases (case-insensitive)
 VERIFICATION_PHRASES = {
-    "that's correct", "that's right", "correct", "affirmative", "yes that's right",
-    "that is correct", "roger that", "confirmed", "acknowledged", "understand",
-    "got it", "copy that", "10-4", "i confirm", "verified", "check", "okay correct",
-    "yes correct", "exactly", "precisely", "absolutely", "that's accurate",
-    "agreed", "concur", "affirm", "i agree", "sounds good", "will do", "understood",
-    "roger", "wilco", "yes sir", "yes ma'am", "aye", "yep", "yup", "okay"
+    "that's correct", "that's right", "correct","it is correct", "yes that's right",
+    "that is correct", "yes that's correct", "yes correct", "you are correct",
 }
 
 READBACK_PHRASES = {
     "and you're", "you are", "so you", "you're ready", "proceed to", "moving to",
     "next step", "understand you", "i understand", "copy that", "you're done",
-    "and you", "so you're", "you have", "you've", "you completed", "you are ready"
+    "and you", "so you're", "you have", "you've", "you completed", "you are ready",
+    "understand you", "understand it", "understand it's", "understand remove","understand section", "understand tube", "understand going", "understand we're",
+    "understand we are", "understand the", "understand you're", "understand you are",
+    "understand you want", "understand you need", "understand you need to",
 }
 
 
