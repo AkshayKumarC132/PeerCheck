@@ -1048,7 +1048,12 @@ def _is_other_speaker(name: Optional[str]) -> bool:
 
 
 def _drop_overlapping_duplicates(segments: List[Dict], min_overlap: float = 0.25) -> List[Dict]:
-    """Remove overlapping diarization segments that are likely duplicates."""
+    """Remove overlapping diarization segments that are likely duplicates.
+
+    The filter is conservative: it keeps longer, higher-content segments and
+    prefers non-placeholder speakers when two segments substantially overlap or
+    touch with nearly identical text.
+    """
     if not segments:
         return []
 
@@ -1071,14 +1076,26 @@ def _drop_overlapping_duplicates(segments: List[Dict], min_overlap: float = 0.25
 
         prev = cleaned[-1]
         try:
-            overlap_start = max(float(prev.get("start")), float(seg.get("start")))
-            overlap_end = min(float(prev.get("end")), float(seg.get("end")))
+            prev_start = float(prev.get("start"))
+            prev_end = float(prev.get("end"))
+            seg_start = float(seg.get("start"))
+            seg_end = float(seg.get("end"))
         except Exception:
             cleaned.append(seg)
             continue
 
-        overlap = overlap_end - overlap_start
-        if overlap < min_overlap:
+        overlap_start = max(prev_start, seg_start)
+        overlap_end = min(prev_end, seg_end)
+        overlap = max(0.0, overlap_end - overlap_start)
+
+        # Consider segments that overlap *or* directly touch with near-identical
+        # text as duplicates to avoid repeated rows in downstream reports.
+        touching = 0 <= (seg_start - prev_end) <= 0.25
+        text_similarity = SequenceMatcher(
+            None, (prev.get("text") or "").lower(), (seg.get("text") or "").lower()
+        ).ratio()
+
+        if not touching and overlap < min_overlap and text_similarity < 0.9:
             cleaned.append(seg)
             continue
 
@@ -1100,7 +1117,7 @@ def _drop_overlapping_duplicates(segments: List[Dict], min_overlap: float = 0.25
             cleaned[-1] = seg
             continue
 
-        if prev_text and prev_text == seg_text:
+        if prev_text and (prev_text == seg_text or text_similarity >= 0.9):
             prev["end"] = max(prev.get("end", overlap_end), seg.get("end", overlap_end))
             try:
                 prev["duration"] = round(float(prev["end"]) - float(prev.get("start", 0.0)), 2)

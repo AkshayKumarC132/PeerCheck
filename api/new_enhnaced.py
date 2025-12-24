@@ -42,6 +42,7 @@ from .new_utils import (
     create_highlighted_pdf_document,
     build_three_part_communication_summary,
     get_media_duration,
+    _drop_overlapping_duplicates,
 )
 from .authentication import token_verification
 from .new_serializers import (
@@ -1117,6 +1118,8 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                 diarization_segments = diarization_payload.get('segments', [])
             else:
                 diarization_segments = diarization_payload
+
+            diarization_segments = _drop_overlapping_duplicates(diarization_segments)
 
             reference_text = reference_doc.extracted_text or ''
             if not reference_text and reference_doc.file_path:
