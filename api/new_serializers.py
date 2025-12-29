@@ -98,6 +98,17 @@ class ProcessingResultSerializer(serializers.Serializer):
 
 class DownloadRequestSerializer(serializers.Serializer):
     session_id = serializers.CharField(help_text="Processing session ID received from upload response")
+    use_llm = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="Toggle LLM-assisted highlighting and 3PC analysis.",
+    )
+    llm_provider = serializers.ChoiceField(
+        choices=("ollama", "openai"),
+        required=False,
+        default="ollama",
+        help_text="LLM provider to use when use_llm is enabled.",
+    )
 
 class ReferenceDocumentDetailSerializer(serializers.ModelSerializer):
     class Meta:

@@ -241,17 +241,19 @@ HF_TOKEN =''
 
 # DGX / GPU Settings
 USE_DGX = os.getenv("USE_DGX", "False").lower() == "true"
-OLLAMA_API_BASE = os.getenv("OLLAMA_API_BASE", "http://localhost:11434")
 
-# Local LLM Configuration (Llama 3.1 on DGX or similar)
-# Prefer LOCAL_LLM_BASE_URL as per implementation_plan.md, but fall back to legacy env var.
-LOCAL_LLM_BASE_URL = os.getenv(
-    "LOCAL_LLM_BASE_URL",
-    os.getenv("LOCAL_LLM_API_BASE", "https://ollama.com/"),
-)
+# Local LLM Configuration (Ollama-compatible)
+# Prefer a single base URL and keep backwards-compatible aliases for existing code paths.
+LOCAL_LLM_BASE_URL = (
+    os.getenv("LOCAL_LLM_BASE_URL")
+    or os.getenv("LOCAL_LLM_API_BASE")
+    or os.getenv("OLLAMA_API_BASE")
+    or "http://localhost:11434"
+).rstrip("/")
 
-# Backwards-compat alias for any existing references
+# Backwards-compat aliases for any existing references
 LOCAL_LLM_API_BASE = LOCAL_LLM_BASE_URL
+OLLAMA_API_BASE = LOCAL_LLM_BASE_URL
 
 LOCAL_LLM_API_KEY = os.getenv(
     "LOCAL_LLM_API_KEY",
@@ -259,8 +261,13 @@ LOCAL_LLM_API_KEY = os.getenv(
 )
 LOCAL_LLM_MODEL = os.getenv(
     "LOCAL_LLM_MODEL",
-    "gpt-oss:120b",  # Or "llama3.1" depending on server
+    "qwen2.5:latest",  # Default local/Ollama model
 )
+
+# OpenAI defaults
+OPENAI_API_BASE = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 
 if DATABASES['default']['ENGINE'] == 'django.db.backends.sqlite3':
