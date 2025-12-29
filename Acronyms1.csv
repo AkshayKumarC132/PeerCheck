@@ -3,11 +3,13 @@ Abbreviation,Meaning
 A/C ,Air Conditioning
 A/E ,Architect/Engineer
 AAC ,Alternate Alternating Current
+AB , Alpha Bravo
 AC ,Administrative Coordinator
 AC ,Alternating Current
 ACA ,Apparent Cause Analysis
 ACAD ,Automated Card Access Device
 ACCUM ,Accumulator
+ACC ,Accumulator
 ACE ,Actuator Capability Evaluation
 ACE ,Apparent Cause Evaluation
 ACI ,American Concrete Institute
@@ -29,6 +31,17 @@ AFAS ,Auxiliary Feedwater Actuation Signal
 AFD ,Axial Flux Difference
 AFI ,Area For Improvement
 AFS ,Auxiliary Feedwater System
+AFW, ox feed water
+AFW  ,Auxiliary Feed Water
+AFWP, ox feed water pump
+AFWP ,Auxiliary Feed Water Pump
+AFP,Aux Feedwater Pump
+AFP,Aux Feed Pump
+AFP,ox Feedwater Pump
+AFP,ox Feed Pump
+AFW  ,ox Feed Water
+AFWP ,ox Feed Water Pump
+
 AFW ,Auxiliary Feedwater
 AI ,Administrative Instruction
 AI ,Authorized Inspector
@@ -37,6 +50,8 @@ AISC ,American Institute of Steel Construction
 AIT ,Augmented Inspection Team
 AITTS ,Action Item Tracking and Trending System
 ALARA ,As Low as Reasonably Achievable
+AL , Alpha Lima
+
 ALI ,Annual Limit of Intake
 ALR ,Alarm Response Procedures
 AMP ,Access Management Program
@@ -68,6 +83,7 @@ ARACS ,Automated Radiological Access Control System
 ARDV ,Air Relay Dump Valve
 ARM ,Area Radiation Monitor
 A-R-M ,"Alert, Record and Monitor"
+ATMOS , atmospheric
 ARV ,Atmospheric Relief Valve
 ARW (from USAR)  ,Chemical Waste
 ASCE ,American Society of Civil Engineers
@@ -85,6 +101,8 @@ ATWS ,Anticipated Transients Without Scram
 ATWT ,Anticipated Transients Without Trip
 AUG ,Air Operated Valve Users� Group
 AUX ,Auxiliary
+AUX, ox
+Aux , OX
 AV ,Allowable Value
 AVT ,All Volatile Treatment
 AWG ,American Wire Gauge
@@ -242,6 +260,7 @@ Cr ,Chromium
 CR ,Condition Report
 CR ,Control Receiver
 CR ,Control Room
+CTRL. , Control
 "CR, CTRL RM ",Control Room
 CRA ,Control Rod Assembly
 CRD ,Control Rod Drive
@@ -353,6 +372,7 @@ DPR ,Daily Plant Report
 DRAA ,Division of Risk Analysis and Application (NRC)
 DRIFT ,"Diversification, Redundancy, Independence, Fail safe, and Testability"
 DRM ,Daily Report Module
+DRN , drain
 DRP ,Discrete Radioactive Particles
 DRP ,Division of Reactor Projects
 DRPI ,Digital Rod Position Indication
@@ -455,6 +475,12 @@ ERT ,Event Response Team
 ESF ,Engineered Safeguards Features
 ESF ,Engineered Safety Features
 ESF ,Engineering Support Fundamentals
+SA066Y , SA066Y
+SA066Y , your alpha 66 yankee
+SFAS ,Safety Feature Actuation System
+SFAS ,SFAS
+SFAS Panel ,Safety Feature Actuation System Panel
+SFAS Panel ,SFAS Panel
 ESFAS ,Engineered Safety Feature Actuation System
 ESFAS Panel ,Engineered Safety Features Actuation Status Panel
 ESFS ,Engineered Safety Feature System
@@ -531,8 +557,9 @@ FT ,flow transmitter
 FTA ,Fault Tree Analysis
 FTC ,Failed to Closed
 FTE ,First Time Evolution
-FTO ,Failed to Open
+FTO ,Failed to Open 
 FW ,Feedwater
+FW , feed water
 FWCV ,Feedwater Control Valve
 FWIS ,Feedwater Isolation Signal
 FWIV ,Feedwater Isolation Valve
@@ -566,6 +593,7 @@ HCP ,Hexagonal Close Packed
 HCS ,Hydrogen Control System
 hdr ,header
 HDR ,High Density Rack
+HDR , header
 HE ,Human Error
 HEIA ,Human Error Inappropriate Action
 HELB ,High Energy Line Break
@@ -579,6 +607,7 @@ Hga ,Inches of Mercury Absolute
 "hi, Hi ",high
 HIC ,High Energy Container
 HIT ,High Impact Team
+HK-10A , HK 10 alpha
 HOH ,Hydrogen-Hydroxide
 HOO ,Headquarters Operations Office
 HP ,High Pressure
@@ -667,6 +696,9 @@ JRB ,Job Review Board
 JRR ,John Redmond Reservoir
 JTA ,Job-Task-Analysis
 K&S ,Knowledge & Skills
+KA , Kilo Alpha
+KA-C1482 , Kilo Alpha Charlie 1482
+KA-C1481 , Kilo Alpha Charlie 1481
 KB ,Knowledge Based
 KDEM ,Kansas Department of Emergency Management
 KDHE ,Kansas Department of Health and Environment
@@ -1115,9 +1147,11 @@ RDMG ,Rod Drive Motor Generator
 recirc ,Recirculation
 REED ,Request to Exercise Enforcement Discretion
 REF ,Reportability Evaluation Form
-reg ,regulating
-regen ,regenerative
+REG ,regulating
+REG ,reg
+REGEN ,regenerative
 REM ,Roentgen Equivalent Man
+REMOVED/CAP , remove cap
 REMP ,Radiological Environmental Monitoring Program
 RER  ,Reportability Evaluation Request
 RER ,Reportable Event Request
@@ -1255,6 +1289,10 @@ SFR ,Start Failure Relay
 SFSF ,Spent Fuel Storage Facility
 SFT ,Superintendent FIN Team
 SGB ,Steam Generator Blowdown
+SGB ,Steam Generator Bravo
+B, Bravo
+SG B ,Steam Generator Bravo
+SG B ,Steam Generator Blowdown
 SGBIS ,Steam Generator Blowdown Isolation System/Signal
 SGBS ,Steam Generator Blowdown System
 SGBSIS ,Steam Generator Blowdown Sample Isolation System/Signal
@@ -1396,6 +1434,7 @@ TEM ,Tool and Equipment Monitor
 TEMA ,Tubular Exchanger Manufacturers Association
 temp ,temperature
 TEMP ,Thermal Expansion Monitoring Program
+TEST/PIT, test pit
 TG  ,Turbine Generator
 TGOP ,Turning Gear Oil Pump
 TGSS ,Turbine Gland Sealing System
@@ -1523,13 +1562,17 @@ ZERO ,Zero Environmental Release Options
 ZPA ,Zero Period Acceleration
 STROKE,stroke
 RELIEF,relief
+ATMOS ,atmospheric
 ATMOS,atmos
 ISO,iso
 AIR,air
 BLEED-OFF,bleed-off
+BLEED-OFF ,bleed off
 CLOSED,closed
 CIRCLE,circle
 CTRL/MAIN,ctrl/main
+CTRL/MAIN , control main
+CTRL/MAIN , control slash main
 INDICATING,indicating
 VERIFICATION,verification
 CONTINUING,continuing

@@ -248,7 +248,7 @@ LOCAL_LLM_BASE_URL = (
     os.getenv("LOCAL_LLM_BASE_URL")
     or os.getenv("LOCAL_LLM_API_BASE")
     or os.getenv("OLLAMA_API_BASE")
-    or "http://localhost:11434"
+    or "http://202.65.155.124:11434"
 ).rstrip("/")
 
 # Backwards-compat aliases for any existing references

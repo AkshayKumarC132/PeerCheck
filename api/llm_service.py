@@ -197,7 +197,7 @@ def analyze_3pc_with_ollama(transcript_text: str, procedure_text: str) -> Dict[s
             "format": "json",  # Ollama's JSON mode (forces JSON output)
             "options": {
                 "temperature": 0.2,  # Slightly higher for more creative analysis
-                "num_predict": 2000,  # Allow longer responses
+                "num_predict": 16000,  # CRITICAL: Increase output limit to prevent JSON truncation
                 "num_ctx": 32768,  # CRITICAL: Increase context window to fit the full 36-page document
             },
         }

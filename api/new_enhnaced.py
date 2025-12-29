@@ -629,7 +629,7 @@ class SpeakerProfileMappingView(CreateAPIView):
         audio_file.save(update_fields=['diarization'])
         AuditLog.objects.create(
             action='speaker_profile_create' if created_profile else 'speaker_profile_update',
-            user=user,
+            user=auth_result['user'],
             object_id=str(profile.id),
             object_type='SpeakerProfile',
             details={
@@ -813,11 +813,26 @@ class DownloadProcessedDocumentView(GenericAPIView):
         print(f"User: {user.username}, Session ID: {session_id}")
 
         try:
-            serializer = self.get_serializer(
-                data={"session_id": session_id, **request.query_params}
-            )
+            # Properly extract query parameters (QueryDict values can be lists)
+            query_data = {"session_id": session_id}
+            for key, value in request.query_params.items():
+                # Get the first value if it's a list, otherwise use the value directly
+                param_value = value[0] if isinstance(value, list) else value
+                # Explicitly handle boolean conversion for use_llm BEFORE serializer
+                if key == "use_llm":
+                    # Convert string to boolean explicitly
+                    if isinstance(param_value, str):
+                        param_value = param_value.lower() in ("true", "1", "yes")
+                    else:
+                        param_value = bool(param_value)
+                    logging.debug("Extracted use_llm from query params: %s (original: %s)", param_value, value)
+                query_data[key] = param_value
+            
+            logging.debug("Query data before serializer: %s", query_data)
+            serializer = self.get_serializer(data=query_data)
             serializer.is_valid(raise_exception=True)
             validated = serializer.validated_data
+            logging.debug("Validated data after serializer: %s", validated)
 
             # Get processing session
             session = ProcessingSession.objects.get(
@@ -924,10 +939,30 @@ class DownloadProcessedDocumentView(GenericAPIView):
                         .lower()
                         == "true"
                     )
-                    use_llm = validated.get("use_llm", True)
+                    # Get use_llm - prioritize query params directly to bypass serializer default
+                    use_llm_str = request.query_params.get("use_llm")
+                    if use_llm_str is not None:
+                        # Query param exists, parse it directly
+                        use_llm_str = use_llm_str.lower() if isinstance(use_llm_str, str) else str(use_llm_str).lower()
+                        use_llm = use_llm_str in ("true", "1", "yes")
+                        logging.debug("use_llm from query params: %s -> %s", use_llm_str, use_llm)
+                    elif "use_llm" in validated:
+                        # Fallback to validated data if query param not present
+                        use_llm = validated["use_llm"]
+                        if isinstance(use_llm, str):
+                            use_llm = use_llm.lower() in ("true", "1", "yes")
+                        else:
+                            use_llm = bool(use_llm)
+                        logging.debug("use_llm from validated data: %s", use_llm)
+                    else:
+                        # Default to True only if not specified at all
+                        use_llm = True
+                        logging.debug("use_llm defaulting to True (not specified)")
                     llm_provider = validated.get("llm_provider", "ollama")
                     logging.info(
-                        "validate_abbreviations=%s in DownloadProcessedDocumentView",
+                        "use_llm=%s, llm_provider=%s, validate_abbreviations=%s in DownloadProcessedDocumentView",
+                        use_llm,
+                        llm_provider,
                         use_transcript,
                     )
                     if file_ext not in ('pdf', 'docx'):
@@ -1041,11 +1076,26 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
         print(f"User: {user.username}, Session ID: {session_id}")
 
         try:
-            serializer = self.get_serializer(
-                data={"session_id": session_id, **request.query_params}
-            )
+            # Properly extract query parameters (QueryDict values can be lists)
+            query_data = {"session_id": session_id}
+            for key, value in request.query_params.items():
+                # Get the first value if it's a list, otherwise use the value directly
+                param_value = value[0] if isinstance(value, list) else value
+                # Explicitly handle boolean conversion for use_llm BEFORE serializer
+                if key == "use_llm":
+                    # Convert string to boolean explicitly
+                    if isinstance(param_value, str):
+                        param_value = param_value.lower() in ("true", "1", "yes")
+                    else:
+                        param_value = bool(param_value)
+                    logging.debug("Extracted use_llm from query params: %s (original: %s)", param_value, value)
+                query_data[key] = param_value
+            
+            logging.debug("Query data before serializer: %s", query_data)
+            serializer = self.serializer_class(data=query_data)
             serializer.is_valid(raise_exception=True)
             validated = serializer.validated_data
+            logging.debug("Validated data after serializer: %s", validated)
 
             session = ProcessingSession.objects.get(id=session_id)
 
@@ -1150,8 +1200,32 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
 
             three_pc_entries = build_three_part_communication_summary(reference_text, diarization_segments)
 
-            use_llm = validated.get("use_llm", True)
+            # Get use_llm - prioritize query params directly to bypass serializer default
+            use_llm_str = request.query_params.get("use_llm")
+            if use_llm_str is not None:
+                # Query param exists, parse it directly
+                use_llm_str = use_llm_str.lower() if isinstance(use_llm_str, str) else str(use_llm_str).lower()
+                use_llm = use_llm_str in ("true", "1", "yes")
+                logging.debug("use_llm from query params: %s -> %s", use_llm_str, use_llm)
+            elif "use_llm" in validated:
+                # Fallback to validated data if query param not present
+                use_llm = validated["use_llm"]
+                if isinstance(use_llm, str):
+                    use_llm = use_llm.lower() in ("true", "1", "yes")
+                else:
+                    use_llm = bool(use_llm)
+                logging.debug("use_llm from validated data: %s", use_llm)
+            else:
+                # Default to True only if not specified at all
+                use_llm = True
+                logging.debug("use_llm defaulting to True (not specified)")
             llm_provider = validated.get("llm_provider", "ollama")
+            
+            logging.info(
+                "use_llm=%s, llm_provider=%s in DownloadProcessedDocumentWithDiarizationView",
+                use_llm,
+                llm_provider,
+            )
 
             try:
                 previous_url = session.processed_docx_with_diarization_path
@@ -1161,6 +1235,7 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                     else None
                 )
 
+                # Only regenerate if document doesn't exist or parameters changed
                 if True:
                     processed_s3_url = create_highlighted_pdf_document(
                         reference_doc.file_path,
@@ -1169,6 +1244,9 @@ class DownloadProcessedDocumentWithDiarizationView(GenericAPIView):
                         use_llm=use_llm,
                         llm_provider=llm_provider,
                     )
+                else:
+                    processed_s3_url = reusable_url
+                    logging.info("Using existing processed document with diarization: %s", processed_s3_url)
 
                 if previous_url and previous_url != processed_s3_url:
                     try:

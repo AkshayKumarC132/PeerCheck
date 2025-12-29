@@ -25,7 +25,7 @@ from docx.shared import RGBColor
 from docx.oxml.ns import qn
 import docx.oxml
 import uuid
-from collections import Counter, defaultdict
+from collections import Counter
 from sentence_transformers import SentenceTransformer, util
 # Add at top (after existing ML imports like whisper/pyannote)
 import torch  # If not present, add to requirements
@@ -753,6 +753,10 @@ def create_highlighted_pdf_document(
         if use_llm:
             # --- KEY CHANGE: LLM does the analysis inside generate_highlighted_pdf ---
             # It returns the structured analysis (including interactions)
+            logging.info(
+                "Using LLM for document highlighting (provider: %s)",
+                llm_provider,
+            )
             llm_analysis = generate_highlighted_pdf_with_llm(
                 temp_input_path,
                 transcript,
@@ -764,6 +768,10 @@ def create_highlighted_pdf_document(
             interactions = llm_analysis.get("interactions", []) if llm_analysis else []
         else:
             # Use semantic/keyword highlighting without an LLM
+            logging.info(
+                "Using non-LLM semantic/keyword highlighting (use_llm=False, require_transcript_match=%s)",
+                require_transcript_match,
+            )
             generate_highlighted_pdf(
                 temp_input_path,
                 transcript,
@@ -794,27 +802,10 @@ def create_highlighted_pdf_document(
             except PermissionError:
                 logging.warning(f"Temp file in use, skipping deletion: {path}")
 
-def _locate_quote(doc, quote: str, search_last: bool = False):
-    if not quote:
-        return None
-
-    found = None
-    for p_idx, page in enumerate(doc):
-        hits = page.search_for(quote)
-        if not hits:
-            continue
-        if search_last:
-            found = (p_idx, hits[-1])
-        else:
-            return (p_idx, hits[0])
-
-    return found
-
-
 def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, provider: str = "ollama"):
     """
     Use the Local LLM to analyze the transcript + document and:
-      1. Identify the relevant section number from the procedure and its start/end quotes.
+      1. Identify the relevant section (e.g., \"8.4\") and its start/end quotes.
       2. Within that *Active Region* only, apply word-level Green/Red highlighting:
          - Green: word appears in the transcript (spoken).
          - Red:   word does not appear in the transcript (missed/skipped).
@@ -839,7 +830,7 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
     
     start_quote = (analysis.get("highlight_start_quote") or "").strip()
     end_quote = (analysis.get("highlight_end_quote") or "").strip()
-    section_id = (analysis.get("relevant_section_number") or "").strip() or "Unknown"
+    section_id = analysis.get("relevant_section_number", "Unknown")
 
     logging.info("LLM identified Section %s", section_id)
     logging.info("Highlighting region from '%s' to '%s'", start_quote, end_quote)
@@ -852,164 +843,489 @@ def generate_highlighted_pdf_with_llm(doc_path, transcript_text, output_path, pr
         _norm_word(w) for w in transcript_text.split() if _norm_word(w)
     }
 
-    # 3. Define Active Region using section-aware ranges (supports multiple mentions)
-    GREEN = (0.6, 1.0, 0.6)
-    RED = (1.0, 0.6, 0.6)
-
-    # --- LOAD ACRONYM MAPPINGS ---
-    # Maps acronym (uppercase) -> list of spoken words (lowercase)
-    # e.g., "AL" -> ["alpha", "lima"]
-    acronym_to_spoken = {}
-    try:
-        import csv
-        csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
-        with open(csv_path, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                abbr = row.get("Abbreviation", "").strip().upper()
-                meaning = row.get("Meaning", "").strip()
-                if abbr and meaning:
-                    # Convert meaning to individual words (lowercase)
-                    spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
-                    if spoken_words:
-                        acronym_to_spoken[abbr] = spoken_words
-        logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
-    except Exception as e:
-        logging.warning(f"Could not load Acronyms1.csv: {e}")
-
-    def word_matches_transcript(pdf_word: str) -> bool:
-        """
-        Returns True if the PDF word appears in the transcript OR
-        if any word from the acronym's expansion appears in transcript.
-        """
-        norm = _norm_word(pdf_word)
-        if not norm:
-            return False
-
-        # Direct match
-        if norm in transcript_word_set:
-            return True
-
-        # Acronym expansion match
-        # Check if the PDF word (uppercase) is an acronym
-        upper_word = pdf_word.strip().upper()
-        if upper_word in acronym_to_spoken:
-            # Check if ANY of the spoken expansion words appear in transcript
-            spoken_words = acronym_to_spoken[upper_word]
-            for spoken_w in spoken_words:
-                if spoken_w in transcript_word_set:
+    # 3. Define Active Region using start/end quotes
+    if start_quote and end_quote:
+        start_loc = None
+        end_loc = None
+        
+        def _find_section_boundaries_by_number(section_num: str, doc_obj, start_quote_hint: str = None):
+            """
+            For top-level sections (e.g., "8.2"), find the actual end by locating
+            the next sibling section (e.g., "8.3"). Returns (start_page, start_rect, end_page, end_rect) or None.
+            
+            Uses start_quote_hint to avoid matching section numbers in the index/table of contents.
+            """
+            if not section_num or section_num == "Unknown":
+                return None
+            
+            # Check if this is a top-level section (e.g., "8.2" has only one dot after the first number)
+            parts = section_num.split('.')
+            if len(parts) < 2:
+                return None  # Not a numbered section like "8.2"
+            
+            # Extract the major section number (e.g., "8.2" from "8.2" or "8.2.8")
+            major_section = parts[0] + '.' + parts[1]
+            
+            # If the section number is deeper than major (e.g., "8.2.8"), don't auto-extend
+            if len(parts) > 2:
+                return None
+            
+            # Find the next sibling section (e.g., if section is "8.2", find "8.3")
+            try:
+                next_major_num = int(parts[1]) + 1
+                next_section_pattern = f"{parts[0]}.{next_major_num}"
+            except (ValueError, IndexError):
+                return None
+            
+            logging.info(f"Detected top-level section {section_num}, searching for next sibling {next_section_pattern} as end boundary")
+            
+            # First, try to find where the start_quote appears to locate the actual section
+            quote_page_hint = None
+            quote_y_hint = None
+            if start_quote_hint:
+                # Search for the start quote to get a hint about where the section actually is
+                quote_words = start_quote_hint.split()[:5]  # First few words of the quote
+                if quote_words:
+                    search_text = " ".join(quote_words)
+                    for p_idx, page in enumerate(doc_obj):
+                        hits = page.search_for(search_text)
+                        if hits:
+                            # Found the quote - use this page and approximate Y position
+                            quote_page_hint = p_idx
+                            quote_y_hint = hits[0].y0  # Top of the first match
+                            logging.info(f"Found start_quote hint on page {p_idx + 1} at Y={quote_y_hint:.1f}")
+                            break
+            
+            def _is_likely_index_entry(page_idx, word_idx, words, word_rect):
+                """
+                Heuristics to detect if a section number match is likely in an index/TOC.
+                Returns True if it looks like an index entry.
+                """
+                # Index entries are usually:
+                # 1. On early pages (first 3 pages often contain TOC)
+                if page_idx < 3:
+                    # Check if there's a page number nearby (index entries have page numbers)
+                    for j in range(max(0, word_idx - 5), min(len(words), word_idx + 10)):
+                        other_word = words[j][4].strip()
+                        # Page numbers in index are usually at the end of line
+                        if other_word.isdigit() and len(other_word) <= 3:
+                            # Check if it's positioned to the right (typical for TOC)
+                            other_x0 = words[j][0]
+                            if other_x0 > word_rect.x1 + 50:  # Page number is far to the right
+                                return True
+                
+                # 2. Check if surrounding text looks like TOC (short phrases, dots/leaders)
+                context_words = []
+                for j in range(max(0, word_idx - 3), min(len(words), word_idx + 8)):
+                    context_words.append(words[j][4].strip().lower())
+                context_text = " ".join(context_words)
+                
+                # TOC entries often have "..." or are very short
+                if "..." in context_text or len(context_text) < 20:
                     return True
+                
+                # 3. Check vertical position - TOC is usually at top of page
+                page = doc_obj[page_idx]
+                page_height = page.rect.height
+                if word_rect.y0 < page_height * 0.15:  # Top 15% of page
+                    return True
+                
+                return False
+            
+            # Search for section headings directly in PDF words
+            section_start_loc = None
+            section_end_loc = None
+            all_start_matches = []  # Collect all matches to pick the best one
+            
+            # First pass: find ALL matches for the start section
+            for p_idx, page in enumerate(doc_obj):
+                words = page.get_text("words")
+                
+                for i, w in enumerate(words):
+                    x0, y0, x1, y1, word_text, *_ = w
+                    word_clean = word_text.strip()
+                    # Check if word matches the section number exactly
+                    if word_clean == major_section or (word_clean.startswith(major_section) and len(word_clean) <= len(major_section) + 2):
+                        # Make sure it's not part of a larger number like "8.25"
+                        is_valid = True
+                        if i + 1 < len(words):
+                            next_word = words[i + 1][4].strip()
+                            if next_word.isdigit() and len(next_word) == 1:
+                                is_valid = False
+                        
+                        if is_valid:
+                            word_rect = fitz.Rect(x0, y0, x1, y1)
+                            # Skip index entries
+                            if not _is_likely_index_entry(p_idx, i, words, word_rect):
+                                all_start_matches.append((p_idx, word_rect, word_rect.y0))
+            
+            # Pick the best match: prefer one near the start_quote hint, or the one that's not in index
+            if all_start_matches:
+                if quote_page_hint is not None and quote_y_hint is not None:
+                    # Prefer matches on the same page as the quote, or close to the quote's Y position
+                    best_match = None
+                    best_score = float('inf')
+                    for p_idx, rect, y_pos in all_start_matches:
+                        score = abs(p_idx - quote_page_hint) * 1000  # Page distance
+                        if p_idx == quote_page_hint:
+                            score += abs(y_pos - quote_y_hint)  # Y distance on same page
+                        if score < best_score:
+                            best_score = score
+                            best_match = (p_idx, rect)
+                    if best_match:
+                        section_start_loc = best_match
+                        logging.info(f"Selected section start '{major_section}' on page {best_match[0] + 1} (near start_quote)")
+                else:
+                    # No quote hint, use the first non-index match (should be the actual section)
+                    section_start_loc = (all_start_matches[0][0], all_start_matches[0][1])
+                    logging.info(f"Selected section start '{major_section}' on page {all_start_matches[0][0] + 1} (first non-index match)")
+            
+            # Second pass: find the end section (next sibling) - only search after start
+            # When we find the next section, we want to use the area JUST BEFORE it as the end boundary
+            if section_start_loc:
+                start_page_found = section_start_loc[0]
+                next_section_heading_loc = None
+                
+                for p_idx, page in enumerate(doc_obj):
+                    # Only search from the start page onwards
+                    if p_idx < start_page_found:
+                        continue
+                    
+                    words = page.get_text("words")
+                    
+                    for i, w in enumerate(words):
+                        x0, y0, x1, y1, word_text, *_ = w
+                        word_clean = word_text.strip()
+                        # Check if word matches the next section number
+                        if word_clean == next_section_pattern or (word_clean.startswith(next_section_pattern) and len(word_clean) <= len(next_section_pattern) + 2):
+                            # Make sure it's not part of a larger number
+                            is_valid = True
+                            if i + 1 < len(words):
+                                next_word = words[i + 1][4].strip()
+                                if next_word.isdigit() and len(next_word) == 1:
+                                    is_valid = False
+                            
+                            if is_valid:
+                                word_rect = fitz.Rect(x0, y0, x1, y1)
+                                # Skip index entries
+                                if not _is_likely_index_entry(p_idx, i, words, word_rect):
+                                    next_section_heading_loc = (p_idx, word_rect, i)
+                                    logging.info(f"Found next section '{next_section_pattern}' on page {p_idx + 1} at position ({x0:.1f}, {y0:.1f})")
+                                    break
+                    
+                    if next_section_heading_loc:
+                        break
+                
+                # Now find the last word of section 8.2 (just before section 8.3 starts)
+                if next_section_heading_loc:
+                    next_page_idx, next_section_rect, next_word_idx = next_section_heading_loc
+                    next_page = doc_obj[next_page_idx]
+                    words = next_page.get_text("words")
+                    
+                    # Find the last line of section 8.2 by looking backwards from the next section heading
+                    # Group words by their Y coordinate (line) to find the last complete line
+                    last_line_bottom = None
+                    if next_word_idx > 0:
+                        # Look backwards to find words on the last line before the next section
+                        # Words on the same line will have similar Y coordinates (within ~2 points)
+                        lines_found = {}  # y0 -> list of words on that line
+                        
+                        for i in range(next_word_idx - 1, -1, -1):
+                            prev_word = words[i]
+                            x0, y0, x1, y1 = prev_word[0], prev_word[1], prev_word[2], prev_word[3]
+                            word_text = prev_word[4].strip()
+                            
+                            # Skip very small words or punctuation-only words
+                            if len(word_text) > 0 and not all(c in '.,;:!?()[]{}' for c in word_text):
+                                # Group by Y coordinate (round to nearest 2 points to handle slight variations)
+                                line_key = round(y0 / 2.0) * 2.0
+                                if line_key not in lines_found:
+                                    lines_found[line_key] = []
+                                lines_found[line_key].append((y0, y1, word_text))
+                        
+                        # Find the last line (highest Y coordinate) and use its bottom
+                        if lines_found:
+                            last_line_y = max(lines_found.keys())
+                            last_line_words = lines_found[last_line_y]
+                            # Get the maximum y1 (bottom) of words on this line
+                            last_line_bottom = max(y1 for _, y1, _ in last_line_words)
+                            logging.info(f"Found last line of section 8.2 at Y={last_line_y:.1f}, bottom at Y={last_line_bottom:.1f}")
+                        
+                        # Use the bottom of the last line, or if not found, use the top of next section
+                        # Add a small buffer (1 point) to ensure we don't include the next section
+                        boundary_y = last_line_bottom if last_line_bottom else next_section_rect.y0
+                        # Ensure boundary is at least 1 point above the next section
+                        if boundary_y >= next_section_rect.y0:
+                            boundary_y = next_section_rect.y0 - 1.0
+                        
+                        end_boundary_rect = fitz.Rect(
+                            next_page.rect.x0,
+                            boundary_y,
+                            next_page.rect.x1,
+                            boundary_y
+                        )
+                        section_end_loc = (next_page_idx, end_boundary_rect)
+                        logging.info(f"Set section end boundary at Y={boundary_y:.1f} (next section starts at Y={next_section_rect.y0:.1f})")
+                    else:
+                        # If next section is at the start of the page, use the previous page's bottom
+                        if next_page_idx > 0:
+                            prev_page = doc_obj[next_page_idx - 1]
+                            prev_page_words = prev_page.get_text("words")
+                            # Find the last word on the previous page
+                            if prev_page_words:
+                                last_prev_word = prev_page_words[-1]
+                                x0, y0, x1, y1 = last_prev_word[0], last_prev_word[1], last_prev_word[2], last_prev_word[3]
+                                prev_page_rect = prev_page.rect
+                                end_boundary_rect = fitz.Rect(
+                                    prev_page_rect.x0,
+                                    y1,  # Bottom of last word
+                                    prev_page_rect.x1,
+                                    y1
+                                )
+                                section_end_loc = (next_page_idx - 1, end_boundary_rect)
+                                logging.info(f"Set section end boundary at end of page {next_page_idx} (last word)")
+                            else:
+                                prev_page_rect = prev_page.rect
+                                end_boundary_rect = fitz.Rect(
+                                    prev_page_rect.x0,
+                                    prev_page_rect.y1,
+                                    prev_page_rect.x1,
+                                    prev_page_rect.y1
+                                )
+                                section_end_loc = (next_page_idx - 1, end_boundary_rect)
+                        else:
+                            # Fallback: use the top of next section
+                            end_boundary_rect = fitz.Rect(
+                                next_page.rect.x0,
+                                max(0, next_section_rect.y0 - 5),
+                                next_page.rect.x1,
+                                max(0, next_section_rect.y0 - 5)
+                            )
+                            section_end_loc = (next_page_idx, end_boundary_rect)
+            
+            if section_start_loc and section_end_loc:
+                return (section_start_loc[0], section_start_loc[1], section_end_loc[0], section_end_loc[1])
+            elif section_start_loc:
+                logging.warning(f"Found section start '{major_section}' but could not find next section '{next_section_pattern}'")
+            return None
+        
+        def _search_quote_fuzzy(page_obj, quote_text, is_end_quote=False):
+            """
+            Search for quote with multiple fallback strategies:
+            1. Exact match
+            2. Normalized whitespace (newlines -> spaces)
+            3. Partial match (First/Last N chars)
+            """
+            if not quote_text or len(quote_text.strip()) < 5:
+                return []
+            
+            # Helper to normalize and search
+            def _try_search(q):
+                # 1. Exact
+                h = page_obj.search_for(q)
+                if h: return h
+                # 2. Norm (newlines -> spaces)
+                h = page_obj.search_for(q.replace('\n', ' '))
+                if h: return h
+                # 3. Norm (collapse spaces)
+                h = page_obj.search_for(" ".join(q.split()))
+                if h: return h
+                return []
 
-        return False
+            # Strategy A: Full quote
+            hits = _try_search(quote_text)
+            if hits: return hits
+            
+            # Strategy B: Partial match (substring)
+            # If quote is long enough, try matching just the unique start or end portion
+            if len(quote_text) > 50:
+                if is_end_quote:
+                    # For end quote, search for the LAST part
+                    # We need the bottom of the section, so finding the last 60 chars is good
+                    sub_q = quote_text[-60:]
+                    hits = _try_search(sub_q)
+                    if hits: return hits
+                else:
+                    # For start quote, search for the FIRST part
+                    sub_q = quote_text[:60]
+                    hits = _try_search(sub_q)
+                    if hits: return hits
+            
+            return []
 
-    def _single_region(start_loc, end_loc):
-        """Build a single active region spanning from start to end across pages."""
-
-        if not start_loc:
-            return {}
-
-        # Default the end to the final page if the quote is missing
-        if not end_loc:
-            end_page = doc.page_count - 1
-            end_rect = doc[end_page].rect
-            end_loc = (end_page, end_rect)
-
-        start_page, start_rect = start_loc
-        end_page, end_rect = end_loc
-
-        if start_page > end_page:
-            end_page = start_page
-            end_rect = start_rect
-
-        regions: Dict[int, List[fitz.Rect]] = defaultdict(list)
-
-        for p_idx in range(start_page, end_page + 1):
-            page = doc[p_idx]
-            page_rect = page.rect
-
-            if start_page == end_page:
-                active_rect = fitz.Rect(
-                    page_rect.x0,
-                    start_rect.y0,
-                    page_rect.x1,
-                    end_rect.y1,
-                )
-            elif p_idx == start_page:
-                active_rect = fitz.Rect(
-                    page_rect.x0,
-                    start_rect.y0,
-                    page_rect.x1,
-                    page_rect.y1,
-                )
-            elif p_idx == end_page:
-                active_rect = fitz.Rect(
-                    page_rect.x0,
-                    page_rect.y0,
-                    page_rect.x1,
-                    end_rect.y1,
-                )
-            else:
-                active_rect = page_rect
-
-            regions[p_idx].append(active_rect)
-
-        return regions
-
-    # Locate the active region using the available anchors (single section only)
-    page_regions: Dict[int, List[fitz.Rect]] = defaultdict(list)
-
-    if start_quote or end_quote or section_id != "Unknown":
-        start_loc = _locate_quote(doc, start_quote or section_id)
-
-        if not start_loc and section_id and section_id != "Unknown":
-            start_loc = _locate_quote(doc, section_id)
-
-        end_loc = _locate_quote(doc, end_quote or start_quote or section_id, search_last=True)
-
-        if not start_loc:
-            logging.warning(
-                "Unable to locate highlight anchors (start='%s', section='%s'). Skipping section-scoped highlighting.",
-                start_quote,
-                section_id,
-            )
+        # Try to find section boundaries by section number first (for top-level sections)
+        section_boundaries = _find_section_boundaries_by_number(section_id, doc, start_quote_hint=start_quote)
+        if section_boundaries:
+            start_page_num, start_rect_found, end_page_num, end_rect_found = section_boundaries
+            logging.info(f"Found section boundaries by number: page {start_page_num} to page {end_page_num}")
+            start_loc = (start_page_num, start_rect_found)
+            end_loc = (end_page_num, end_rect_found)
         else:
-            if not end_loc:
-                logging.warning(
-                    "LLM returned incomplete highlight anchors (start='%s', end='%s'). Using available text for a single-region highlighting.",
-                    start_quote,
-                    end_quote,
-                )
+            # Fallback to quote-based search
+            # Store (page_idx, rect) for all hits
+            all_start_hits = []
+            all_end_hits = []
 
-            for p_idx, rects in _single_region(start_loc, end_loc).items():
-                page_regions[p_idx].extend(rects)
-    else:
-        logging.warning(
-            "LLM did not return highlight anchors. Skipping section-scoped highlighting."
-        )
+            for p_idx, page in enumerate(doc):
+                # Search for Start Quote (fuzzy)
+                s_hits = _search_quote_fuzzy(page, start_quote, is_end_quote=False)
+                for h in s_hits:
+                    all_start_hits.append((p_idx, h))
+                
+                # Search for End Quote (fuzzy)
+                e_hits = _search_quote_fuzzy(page, end_quote, is_end_quote=True)
+                for h in e_hits:
+                    all_end_hits.append((p_idx, h))
+            
+            if all_start_hits and all_end_hits:
+                # 1. Pick the FIRST occurrence of the start quote
+                # (Assuming the procedure flows linearly and the user means the first time this section starts)
+                start_loc = all_start_hits[0]
+                start_page, start_rect = start_loc
+                
+                # 2. Pick the FIRST end quote that appears AFTER the start quote
+                # This prevents grabbing the footer of the NEXT section (8.5) if it shares the same text
+                valid_end_loc = None
+                for p_idx, rect in all_end_hits:
+                    if p_idx > start_page:
+                        valid_end_loc = (p_idx, rect)
+                        break
+                    elif p_idx == start_page:
+                        # On the same page, end quote must be visually below the start quote
+                        # Use y0 (top of end quote) >= y0 (top of start) as a loose constraint
+                        # or y0 >= start_rect.y1 (strictly below)
+                        if rect.y0 >= start_rect.y0: 
+                            valid_end_loc = (p_idx, rect)
+                            break
+                
+                if valid_end_loc:
+                    end_loc = valid_end_loc
+                    start_page, start_rect = start_loc
+                    end_page, end_rect = end_loc
+                else:
+                    logging.warning("Found start quote but no end quote appears *after* it.")
+        
+        if start_loc and end_loc:
+            start_page, start_rect = start_loc
+            end_page, end_rect = end_loc
 
-    if page_regions:
-        for p_idx, regions in page_regions.items():
-            page = doc[p_idx]
-            words_on_page = page.get_text("words")
+            GREEN = (0.6, 1.0, 0.6)
+            RED = (1.0, 0.6, 0.6)
 
-            for w in words_on_page:
-                x0, y0, x1, y1, word_text, *_ = w
-                rect = fitz.Rect(x0, y0, x1, y1)
+            # --- LOAD ACRONYM MAPPINGS ---
+            # Maps acronym (uppercase) -> list of spoken words (lowercase)
+            # e.g., "AL" -> ["alpha", "lima"]
+            acronym_to_spoken = {}
+            try:
+                import csv
+                csv_path = os.path.join(settings.BASE_DIR, "Acronyms1.csv")
+                with open(csv_path, "r", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        abbr = row.get("Abbreviation", "").strip().upper()
+                        meaning = row.get("Meaning", "").strip()
+                        if abbr and meaning:
+                            # Convert meaning to individual words (lowercase)
+                            spoken_words = [_norm_word(w) for w in meaning.split() if _norm_word(w)]
+                            if spoken_words:
+                                acronym_to_spoken[abbr] = spoken_words
+                logging.info(f"Loaded {len(acronym_to_spoken)} acronym mappings for word matching")
+            except Exception as e:
+                logging.warning(f"Could not load Acronyms1.csv: {e}")
 
-                if not any(region.intersects(rect) for region in regions):
-                    continue
-
-                norm = _norm_word(word_text)
-
+            def word_matches_transcript(pdf_word: str) -> bool:
+                """
+                Returns True if the PDF word appears in the transcript OR
+                if any word from the acronym's expansion appears in transcript.
+                """
+                norm = _norm_word(pdf_word)
                 if not norm:
-                    continue
+                    return False
+                
+                # Direct match
+                if norm in transcript_word_set:
+                    return True
+                
+                # Acronym expansion match
+                # Check if the PDF word (uppercase) is an acronym
+                upper_word = pdf_word.strip().upper()
+                if upper_word in acronym_to_spoken:
+                    # Check if ANY of the spoken expansion words appear in transcript
+                    spoken_words = acronym_to_spoken[upper_word]
+                    for spoken_w in spoken_words:
+                        if spoken_w in transcript_word_set:
+                            return True
+                
+                return False
 
-                color = GREEN if word_matches_transcript(word_text) else RED
+            for p_idx in range(start_page, end_page + 1):
+                page = doc[p_idx]
+                page_rect = page.rect
 
-                annot = page.add_highlight_annot(rect)
-                annot.set_colors(stroke=color)
-                annot.set_opacity(0.3)
-                annot.update()
+                # Compute the Active Region rectangle for this page
+                if start_page == end_page:
+                    # Start & end on the same page: bound vertically between them
+                    active_rect = fitz.Rect(
+                        page_rect.x0,
+                        start_rect.y0,
+                        page_rect.x1,
+                        end_rect.y1,
+                    )
+                elif p_idx == start_page:
+                    active_rect = fitz.Rect(
+                        page_rect.x0,
+                        start_rect.y0,
+                        page_rect.x1,
+                        page_rect.y1,
+                    )
+                elif p_idx == end_page:
+                    active_rect = fitz.Rect(
+                        page_rect.x0,
+                        page_rect.y0,
+                        page_rect.x1,
+                        end_rect.y1,
+                    )
+                else:
+                    # Intermediate page: full page is inside the section
+                    active_rect = page_rect
+
+                # 4. Word-level highlighting inside Active Region only
+                words_on_page = page.get_text("words")
+                for w in words_on_page:
+                    x0, y0, x1, y1, word_text, *_ = w
+                    rect = fitz.Rect(x0, y0, x1, y1)
+
+                    # Skip words outside the Active Region
+                    if not active_rect.intersects(rect):
+                        continue
+                    
+                    # On the end page, explicitly exclude words that start at or above the end boundary
+                    # This ensures we don't include the first few lines of the next section
+                    if p_idx == end_page:
+                        # end_rect.y0 is our boundary (bottom of last line of section 8.2, or top of next section)
+                        # Exclude words whose top (y0) is at or above this boundary
+                        # Use strict comparison: any word starting at or above the boundary is excluded
+                        boundary_y = end_rect.y0
+                        if y0 >= boundary_y:
+                            continue
+
+                    norm = _norm_word(word_text)
+                    if not norm:
+                        continue
+
+                    # Use acronym-aware matching
+                    color = GREEN if word_matches_transcript(word_text) else RED
+
+                    annot = page.add_highlight_annot(rect)
+                    annot.set_colors(stroke=color)
+                    annot.set_opacity(0.3)
+                    annot.update()
+        else:
+            logging.warning(
+                "Start/End quote not found in document (after robust search). "
+                f"Start: '{start_quote[:50]}...', End: '{end_quote[:50]}...'. Skipping section-scoped highlighting."
+            )
+
     # Save
     doc.save(output_path)
     doc.close()
